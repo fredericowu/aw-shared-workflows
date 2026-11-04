@@ -108,16 +108,71 @@ name: Code Review (reusable)
 # re-runs. The gate reads them LIVE via `gh api` — never from the event
 # payload, whose `issue_comment` form carries a stale label snapshot.
 #
+# Round 2 is entered AUTOMATICALLY, on `pull_request: synchronize` — i.e. the
+# coder's fix push — and only then. A `synchronize` on a PR that is not
+# already carrying `devteam:awaiting-fixes` is refused by the gate after one
+# label read, before any paid judge run: a full deep review costs real
+# subscription budget and PR-Agent already reviews every push, so "review
+# every push" was never the ask. `/aw-review` survives untouched as the
+# manual override — for a round 1 re-run, for a retry after a mechanical
+# failure, and as the recovery path when an event is lost.
+#
 # Each caller repo must have both labels and both reviewer/merge secrets; see
 # the "Caller checklist" comment at the bottom of this file.
 #
+# ── THE MERGE IS EVENT-DRIVEN, NOT POLLED (v1.3.0) ────────────────────────
+# Through v1.2.1 the merge waited for the caller's CI by polling `gh pr
+# checks` in a 20-minute loop inside the review job. That shape produced two
+# distinct production bugs on its own (a masking empty-read on AP-MT PR #7, a
+# missing `actions: read` on PR #9), burned a 20-minute window on every PR
+# whose CI finished after the verdict, and capped the whole loop at 20
+# minutes: a repo whose suite is slower than that could never merge at all.
+#
+# It is replaced by a commit status plus a real event:
+#
+#   1. The review job writes `devteam/merge-eligible` (state=success) on the
+#      PR head SHA at the exact moment it computes `eligible=true`, and never
+#      otherwise. That is the single place eligibility is decided — round
+#      rule, `blocks_merge` rule, draft rule, all unchanged.
+#   2. A `merge-attempt` job reads that status LIVE and merges. It has two
+#      entry points running ONE script:
+#        (a) same run, `needs: [gate, code-review]` — today's happy path,
+#            where CI was already green before the verdict landed;
+#        (b) a `workflow_run: types: [completed]` event on the CALLER's own
+#            CI workflow, forwarded by the caller — the case the poll
+#            existed for. CI finishing an hour after the verdict now merges
+#            an hour after the verdict, instead of never.
+#
+# A commit status and not a label, because eligibility is a property of a
+# SHA. A label is PR-scoped and survives the push that invalidates the review
+# that set it, so a label would hand a brand-new, unreviewed head the
+# eligibility its predecessor earned. The per-SHA status also IS the
+# head-moved guard: the job re-reads the PR's live head before merging, and a
+# head that moved simply has no status on it.
+#
+# What this costs, stated plainly so nobody rediscovers it as a bug:
+#   - No poll means no self-healing window. A dropped `workflow_run`
+#     delivery, or a merge-attempt that fails mechanically, is not retried by
+#     anything — a human (or the coder) runs `/aw-review`, or pushes.
+#   - Every completion of the named CI workflow on ANY branch spawns a
+#     few-second merge-attempt job, which exits neutral when no open PR owns
+#     that SHA. On a self-hosted caller that is real (small) runner noise.
+#   - RENAMING THE CALLER'S CI WORKFLOW SILENTLY KILLS THE EVENT PATH. The
+#     caller names it as a literal string in `on: workflow_run: workflows:`.
+#     Nothing fails; merges just stop happening on the slow-CI path and
+#     degrade to manual `/aw-review`. It never merges red — the merge-attempt
+#     still reads the checks itself.
+#
 # ── ONE TRAP, IF YOU ARE EDITING A CALLER'S OWN code-review.yml IN A PR ───
-# `pull_request` runs the caller's PR copy (round 1 sees your edits live);
-# `issue_comment` (`/aw-review`, round 2) always runs the caller's DEFAULT
-# BRANCH copy. A PR that modifies the caller's `code-review.yml` cannot
-# exercise its own round 2 — verify round 2 on the NEXT PR after merge rather
-# than burning time "debugging" it. (A PR that only bumps the `@vX.Y.Z` pin
-# here is exactly that case.)
+# `pull_request` runs the caller's PR copy (round 1 and round 2 both see your
+# edits live). `issue_comment` (`/aw-review`) and `workflow_run` BOTH always
+# run the caller's DEFAULT BRANCH copy. A PR that modifies the caller's
+# `code-review.yml` therefore cannot exercise its own comment path or its own
+# workflow_run path — verify those on the NEXT PR after merge rather than
+# burning time "debugging" them. (A PR that only bumps the `@vX.Y.Z` pin here
+# is exactly that case, and so is the PR that first ADDS the `workflow_run`
+# trigger: the event cannot fire for a trigger definition that is not yet on
+# the default branch, which is why the v1.3.0 canary took two PRs.)
 
 on:
   workflow_call:
@@ -203,8 +258,8 @@ permissions:
   pull-requests: write
   issues: write
   statuses: write
-  # Required for `gh pr checks` in the ci_gate step to see check-runs at all
-  # on a PRIVATE caller. See the long note in the CALLER CHECKLIST below.
+  # Required for `gh pr checks` in the merge-attempt job to see check-runs at
+  # all on a PRIVATE caller. See the long note in the CALLER CHECKLIST below.
   checks: read
   # SEPARATE from checks: read, and additionally required. gh CLI's `gh pr
   # checks` always builds a GraphQL query that embeds
@@ -214,8 +269,8 @@ permissions:
   # not a Checks-API read, so checks: read alone does not cover it. On a
   # PRIVATE caller, missing this is a deterministic
   # "Resource not accessible by integration (...checkSuite.workflowRun)"
-  # GraphQL error on every single poll — not transient, so the ci_gate retry
-  # loop can never succeed. See the long note in the CALLER CHECKLIST below.
+  # GraphQL error on every read — not transient, so no number of retries can
+  # ever succeed. See the long note in the CALLER CHECKLIST below.
   actions: read
 
 jobs:
@@ -380,9 +435,31 @@ jobs:
           echo "round=$round" >> "$GITHUB_OUTPUT"
           # Draft state gates the MERGE, not the review: reviewing a WIP draft
           # early is the point, un-drafting and merging it is not. See the
-          # eligibility step and the merge step's own live re-check.
+          # eligibility step and the merge job's own live re-check.
           echo "is_draft=${is_draft:-false}" >> "$GITHUB_OUTPUT"
           echo "round=$round is_draft=${is_draft:-false} (labels: $(printf '%s' "$labels" | tr '\n' ' '))"
+
+          # ---- `synchronize` is round 2's automatic trigger, and ONLY that ----
+          # The coder pushing fixes is exactly the event round 2 was waiting
+          # for, and making it automatic removes the one manual step left in
+          # the loop. Making it a review of EVERY push is a different and
+          # much more expensive thing: one judge run plus up to 3 research
+          # runs of real subscription budget, on a diff PR-Agent has already
+          # reviewed. So a synchronize is refused here unless the PR is
+          # genuinely mid-fix-cycle (`devteam:awaiting-fixes` present ->
+          # round 2).
+          #
+          # Refused AFTER the label read and BEFORE anything paid: that one
+          # `gh api` call is the whole cost of a push to a round-1 or
+          # escalated PR. `/aw-review` still forces a review from any state,
+          # which is what makes this safe to be strict about.
+          if [ "${{ github.event.action }}" = "synchronize" ] && [ "$round" != "2" ]; then
+            echo "synchronize on a round-$round PR — not re-reviewing. \
+            Automatic re-review is round 2 only (label devteam:awaiting-fixes); \
+            comment /aw-review to force one."
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if ! is_trusted "$author"; then
             {
@@ -401,24 +478,27 @@ jobs:
     needs: gate
     if: needs.gate.outputs.allowed == 'true'
     runs-on: ${{ fromJSON(inputs.runs_on) }}
+    outputs:
+      # Read by `merge-attempt`'s same-run entry point, purely to decide
+      # whether spawning that job is worth a runner at all. It is NOT the
+      # authority: the job re-reads the `devteam/merge-eligible` status on
+      # the PR's LIVE head before merging, because that is the only form of
+      # the answer that is pinned to a SHA.
+      eligible: ${{ steps.findings.outputs.eligible }}
     # Hard ceiling on a dead/stalled judge — paired with the server-side 900s
     # runner timeout on the dispatch call below and the always()-finalize
     # step, so `devteam/code-review` can never stay `pending` forever.
     #
-    # 45, not 20, and the number is load-bearing. This job runs the reviewer
-    # dispatch (up to the 900s = 15 min server-side ceiling) and THEN the
-    # `ci_gate` step, which has its own 20-minute budget for waiting on the
-    # caller repo's CI. At 20 the two budgets overlapped instead of nesting:
-    # the job died before the gate could reach its own deadline, so the gate's
-    # "still waiting on X after 20 min" diagnostic was unreachable and a
-    # cancelled job was the only signal. Measured on AP-MT PR #6 — a round 2
-    # that passed with ZERO findings was killed at 20 min flat with no
-    # explanation, costing a full paid review cycle to re-run.
-    #
-    # So this must stay > (dispatch ceiling 15) + (gate deadline 20). Keep the
-    # invariant if you change either number; it is asserted by
-    # `test_the_job_timeout_leaves_room_for_the_gates_own_deadline`.
-    timeout-minutes: 45
+    # 25, down from 45 in v1.2.1. The 45 was (dispatch 15) + (the old
+    # ci_gate's own 20-minute poll) + headroom, and the two budgets had to
+    # NEST rather than overlap — at 20/20 the job died before the gate could
+    # print its own "still waiting" diagnostic, which is how AP-MT PR #6 lost
+    # a passing round 2 to a bare `The operation was canceled`. The poll is
+    # gone, so the only long thing left in this job is the dispatch and its
+    # 900s = 15 min server-side ceiling; 25 leaves 10 minutes for everything
+    # else (posting N inline comments on a big review is the slow part) and
+    # no longer holds a runner for 45.
+    timeout-minutes: 25
     steps:
       - name: Mark code review pending
         env:
@@ -538,6 +618,7 @@ jobs:
           HEAD_SHA: ${{ needs.gate.outputs.sha }}
           ROUND: ${{ needs.gate.outputs.round }}
           IS_DRAFT: ${{ needs.gate.outputs.is_draft }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           python3 <<'PYEOF'
@@ -715,6 +796,40 @@ jobs:
               gh_out.write(f"eligible={'true' if eligible else 'false'}\n")
           print(f"round={round_} findings={len(findings)} blocking={len(blocking)} "
                 f"eligible={eligible}")
+
+          # ---- publish eligibility AS A COMMIT STATUS ON THIS SHA ----
+          #
+          # This is the hand-off to `merge-attempt`, and the whole reason the
+          # merge no longer needs a poll: the verdict is now durable, pinned
+          # to a SHA, and readable by a job in a LATER workflow run that
+          # shares no state with this one.
+          #
+          # WRITTEN ONLY WHEN ELIGIBLE, never as a `failure`/`pending`
+          # counterpart. Three reasons, all load-bearing:
+          #   - `merge-attempt` treats "no success status on this SHA" as
+          #     "not cleared", so absence already carries the negative. A
+          #     second state to keep in sync is a second thing to get wrong.
+          #   - this context must never look like a failing check on a PR
+          #     that is simply mid-fix-cycle, which is the normal state of
+          #     every round-1 PR with findings.
+          #   - it must not become a blocking check if anyone ever turns on
+          #     branch protection — it is in the gate's own ADVISORY set for
+          #     the same reason.
+          #
+          # A new push gets a new SHA with no status, so eligibility can
+          # never be inherited by an unreviewed head. That property is the
+          # reason this is a status and not a label.
+          if eligible:
+              subprocess.run(
+                  ["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{sha}",
+                   "-f", "state=success",
+                   "-f", "context=devteam/merge-eligible",
+                   "-f", f"description=round {round_}: cleared to merge once CI is green",
+                   "-f", f"target_url={os.environ.get('RUN_URL', '')}",
+                   "--silent"],
+                  check=True,
+              )
+              print(f"devteam/merge-eligible -> success on {sha[:7]}")
           PYEOF
 
       # always(), same reason as the gate's own publish step: a status left on
@@ -782,216 +897,6 @@ jobs:
           else
             echo "no label change (round=$ROUND findings=${FINDINGS_COUNT:-0} blocking=${BLOCKING_COUNT:-0})"
           fi
-
-      # ---- merge ----
-      # `AW_DEVTEAM_MERGE_TOKEN`, a PAT with contents:write +
-      # pull-requests:write on the caller repo. NOT `GITHUB_TOKEN`: pushes
-      # created by GITHUB_TOKEN do not trigger downstream workflows, so a
-      # GITHUB_TOKEN-authored merge push would land and every
-      # `on: push: branches [master]` / `workflow_run` workflow in the caller
-      # repo would silently never fire — a release cut, a deploy, an image
-      # build, going dark with a green PR to point at.
-      #
-      # Plain `gh pr merge --squash`, no `--auto`: `--auto` only pauses for
-      # checks that BRANCH PROTECTION marks required, and none of these repos
-      # has branch protection (direct push to master is kept deliberately as
-      # the break-glass path — if a bad merge breaks this very loop, the fix
-      # must not depend on the loop it would be fixing). `ci_gate` below is
-      # therefore not belt-and-suspenders: it is the ONLY gate between a red
-      # test suite and a squash-merge to master, which is why the merge step
-      # runs only after `ci_gate` has already SUCCEEDED. By that point the SHA
-      # is already green — nothing left for `--auto` to usefully wait on.
-      - name: Wait for the repo's own CI to be green on this head SHA
-        id: ci_gate
-        if: steps.findings.outputs.eligible == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
-          REPO: ${{ github.repository }}
-          CI_CHECK_NAME: ${{ inputs.ci_check_name }}
-        run: |
-          set -euo pipefail
-          python3 <<'PYEOF'
-          import json, os, subprocess, sys, time
-
-          # Pinned BY NAME to the caller's own CI job, via the required
-          # `ci_check_name` input (`coverage` on aw-app-template, `pytest` on
-          # AP-MT, `unit` on aw-workspace core). Present AND passing is
-          # required — "absent" must not read as "fine", or deleting the CI
-          # job would silently re-open this merge window.
-          REQUIRED = {os.environ["CI_CHECK_NAME"]}
-          # Our own review surfaces are advisory by standing rule and must not
-          # gate the merge (devteam/code-review is this very job; waiting on
-          # it would deadlock). Names are listed even for repos that don't
-          # have the corresponding workflow — an absent check name simply
-          # never appears in `gh pr checks` output, so it costs nothing.
-          #
-          # `CodeRabbit` is the literal check name the CodeRabbit GitHub App
-          # publishes (verified against tekflox/aw-app-template PRs #13-15).
-          # It is a THIRD-PARTY SaaS reviewer and advisory by the same
-          # standing rule as our own two — and it must be here, not merely
-          # harmless: it sits `pending` for as long as CodeRabbit is
-          # reviewing, which without this entry would make every merge on
-          # such a repo wait on it and then refuse at the 20-minute deadline.
-          # Only aw-app-template has it installed today; the other callers
-          # pay nothing for the entry.
-          ADVISORY = {"devteam/ai-review", "devteam/code-review", "ai-review",
-                      "code-review", "gate", "fork-notice", "merged-event",
-                      "CodeRabbit"}
-
-          # NEW HERE, and load-bearing: as a REUSABLE workflow, this file's
-          # jobs are reported to `gh pr checks` as "<caller job id> / <job id>"
-          # — e.g. "review / code-review", "review / gate". The flat
-          # exact-name match the three copy-pasted originals used would no
-          # longer recognise ANY of them, and this job would sit waiting on
-          # ITSELF until the 20-minute deadline, then refuse to merge. So each
-          # row is matched on its full name AND on the segment after the last
-          # "/", and the caller's job name is irrelevant either way.
-          def tail(name):
-              return (name or "").rsplit("/", 1)[-1].strip()
-
-          def is_advisory(name):
-              return name in ADVISORY or tail(name) in ADVISORY
-
-          repo, pr = os.environ["REPO"], os.environ["PR_NUMBER"]
-          # Must stay comfortably BELOW the job's own `timeout-minutes`, which
-          # starts counting at job start — i.e. before the reviewer dispatch
-          # that runs ahead of this step. If the two budgets are equal, the
-          # job is killed before this loop can ever reach its own deadline, so
-          # the diagnostic error below is unreachable and the only thing anyone
-          # sees is `##[error]The operation was canceled`. That is exactly what
-          # happened on AP-MT PR #6: both were 20, the dispatch ate 2.4 min,
-          # and a round 2 that had PASSED with zero findings died with no
-          # explanation. The guard is
-          # `test_the_job_timeout_leaves_room_for_the_gates_own_deadline`.
-          deadline = time.time() + 20 * 60
-
-          def checks():
-              # `timeout=` is not optional. Without it a hung `gh` blocks this
-              # step forever, printing NOTHING — the loop below only logs once
-              # it has a result, so a hang inside this call is invisible until
-              # the job timeout kills it. AP-MT PR #6's round 2 sat here for
-              # 17m53s and emitted not one line between `##[endgroup]` and
-              # `The operation was canceled`. A bounded call turns that into a
-              # retryable failed read, which the `rows is None` branch already
-              # knows how to handle.
-              try:
-                  out = subprocess.run(
-                      ["gh", "pr", "checks", pr, "--repo", repo,
-                       "--json", "name,state,bucket"],
-                      capture_output=True, text=True, timeout=60)
-              except subprocess.TimeoutExpired:
-                  print("::warning::gh pr checks did not return within 60s; "
-                        "treating as a failed read and retrying")
-                  return None
-              # `gh pr checks` exits non-zero when anything is failing or
-              # pending, so returncode is not an error signal here — only
-              # unparseable output is. But empty stdout WITH stderr content
-              # is a real command failure (bad flag, auth, transient API
-              # error) — `out.stdout or "[]"` used to treat that identically
-              # to "found zero checks", which silently turned a real error
-              # into "required check did not pass" on AP-MT PR #7 (confirmed
-              # live: 4 straight /aw-review retries, same instant empty
-              # result, even ~40 min after pytest had actually gone green).
-              #
-              # The underlying cause there was a MISSING `checks: read` on
-              # the caller's token: `gh pr checks` reads check-runs through
-              # the Checks API, and on a PRIVATE repo that read is refused
-              # without it — deterministically, not flakily. A public repo's
-              # rollup is readable without it, which is why the same code
-              # merged fine on the public aw-app-template and failed every
-              # single round on the private AP-MT. See the caller checklist
-              # at the bottom of this file: `checks: read` is REQUIRED.
-              stdout = out.stdout.strip()
-              if not stdout:
-                  if out.stderr.strip():
-                      print(f"::warning::gh pr checks produced no output; stderr: "
-                            f"{out.stderr[:300]}")
-                      return None
-                  return []
-              try:
-                  return json.loads(stdout)
-              except json.JSONDecodeError:
-                  print(f"::warning::could not parse gh pr checks output: "
-                        f"{out.stdout[:200]} {out.stderr[:200]}")
-                  return None
-
-          while True:
-              rows = checks()
-              if rows is None:
-                  if time.time() > deadline:
-                      print("::error::could not read this PR's checks; refusing to merge")
-                      sys.exit(1)
-                  time.sleep(20); continue
-
-              relevant = [r for r in rows if not is_advisory(r.get("name"))]
-              pending = [r for r in relevant if r.get("bucket") == "pending"]
-              failed = [r for r in relevant if r.get("bucket") in ("fail", "cancel")]
-              # Both forms, so `ci_check_name` can name a plain job (`unit`)
-              # or, in a caller whose CI is itself reusable, the tail of a
-              # "parent / child" name.
-              passed = set()
-              for r in relevant:
-                  if r.get("bucket") == "pass":
-                      passed.add(r["name"])
-                      passed.add(tail(r["name"]))
-
-              if failed:
-                  print("::error::refusing to merge — CI is not green on this head SHA: "
-                        + ", ".join(f"{r['name']}={r.get('state')}" for r in failed))
-                  sys.exit(1)
-              if pending:
-                  if time.time() > deadline:
-                      print("::error::refusing to merge — still waiting on "
-                            + ", ".join(r["name"] for r in pending)
-                            + " after 20 min. Re-run /aw-review once CI has settled.")
-                      sys.exit(1)
-                  print("waiting on: " + ", ".join(r["name"] for r in pending))
-                  time.sleep(20); continue
-
-              missing = REQUIRED - passed
-              if missing:
-                  print(f"::error::refusing to merge — required check(s) {sorted(missing)} "
-                        f"did not report a pass on this head SHA. Saw: "
-                        f"{sorted((r['name'], r.get('bucket')) for r in relevant)}")
-                  sys.exit(1)
-              print("CI is green: " + ", ".join(sorted(passed)))
-              break
-          PYEOF
-      - name: Merge if eligible
-        id: merge
-        # ci_gate must have SUCCEEDED, not merely not-failed: it is the ONLY
-        # thing standing in for the branch-protection checks these repos
-        # deliberately don't have.
-        if: steps.findings.outputs.eligible == 'true' && steps.ci_gate.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ secrets.AW_DEVTEAM_MERGE_TOKEN }}
-          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::AW_DEVTEAM_MERGE_TOKEN is not set on this repository (or the \
-            caller did not pass \`secrets: inherit\`). Refusing to fall back to \
-            GITHUB_TOKEN: its merge push would not trigger this repo's own \
-            push-/workflow_run-triggered workflows, so the deploy or release that \
-            normally follows a merge would silently stop happening."
-            exit 1
-          fi
-          # Second, independent draft guard, re-read LIVE rather than taken
-          # from the gate's snapshot: the author can mark the PR draft while
-          # the review is still running, and that is exactly the moment they
-          # most mean "do not merge this". The authoritative guard is in the
-          # eligibility step; this one costs one API call and closes the
-          # window that one cannot see.
-          if [ "$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" \
-                    --json isDraft --jq .isDraft)" = "true" ]; then
-            echo "::notice::#$PR_NUMBER became a draft since the review started — \
-            not merging. Mark it ready for review to re-run round 1."
-            exit 0
-          fi
-          gh pr merge "$PR_NUMBER" --repo "${{ github.repository }}" \
-            --squash --delete-branch
-          echo "squash-merged #$PR_NUMBER via AW_DEVTEAM_MERGE_TOKEN"
 
       # ---- tell the platform what this round decided ----
       # LAST, and after the findings are already on the PR: the woken coder
@@ -1090,6 +995,413 @@ jobs:
           if not code.startswith("2"):
               print(f"::warning::devteam-review-event {event} returned HTTP {code}")
               sys.exit(1)
+          PYEOF
+
+  # ---------------------------------------------------------------------------
+  # THE MERGE. One script, two entry points, no polling.
+  #
+  #   (a) same run — `needs: [gate, code-review]`, taken when the review just
+  #       computed eligible=true. The common case: CI was already green
+  #       before the verdict landed, so this merges immediately.
+  #   (b) `workflow_run` — the caller forwards a `completed` event from its
+  #       OWN CI workflow, and this job runs with no gate and no review in
+  #       front of it. This is the case the 20-minute poll existed for, and
+  #       the reason it can be deleted: the real event arrives whenever CI
+  #       actually finishes, at 3 minutes or at 3 hours.
+  #
+  # `always()` is REQUIRED, not defensive. On entry point (b) BOTH `needs`
+  # are skipped (the gate's own `if` admits only pull_request/issue_comment),
+  # and a job whose needs were skipped is itself skipped unless the condition
+  # is `always()`/`!cancelled()`. The explicit event test then carries the
+  # whole decision — which is why it is written out rather than relying on
+  # the needs' outcome.
+  #
+  # `needs.code-review.outputs.eligible` on the same-run arm is an
+  # optimisation, not the authority: it decides whether this job is worth a
+  # runner. The script re-reads `devteam/merge-eligible` live on the PR's
+  # CURRENT head before it merges anything, because that is the only form of
+  # the verdict that cannot be stale.
+  # ---------------------------------------------------------------------------
+  merge-attempt:
+    needs: [gate, code-review]
+    if: >-
+      always() &&
+      (
+        github.event_name == 'workflow_run' ||
+        needs.code-review.outputs.eligible == 'true'
+      )
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    # Nothing here waits on anything: a handful of bounded API reads and one
+    # merge call. 10 is already generous; if this job is running long it is
+    # stuck, not busy.
+    timeout-minutes: 10
+    steps:
+      - name: Attempt the merge
+        id: merge
+        env:
+          # Every READ uses GITHUB_TOKEN. The merge itself does NOT — see the
+          # MERGE_TOKEN note in the script.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_TOKEN: ${{ secrets.AW_DEVTEAM_MERGE_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          CI_CHECK_NAME: ${{ inputs.ci_check_name }}
+          # Entry point (a). Empty on a workflow_run run, where both needs
+          # are skipped.
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.gate.outputs.sha }}
+          # Entry point (b).
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_NAME: ${{ github.event.workflow_run.name }}
+          WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -euo pipefail
+          python3 <<'PYEOF'
+          import json, os, subprocess, sys, time
+
+          REPO = os.environ["REPO"]
+          EVENT_NAME = os.environ["EVENT_NAME"]
+
+          # The status the review job writes the instant it computes
+          # eligible=true, and only then. Absence of a `success` here on a
+          # given SHA IS the negative verdict for that SHA — there is no
+          # failure-state counterpart to read.
+          ELIGIBLE_CONTEXT = "devteam/merge-eligible"
+
+          # Pinned BY NAME to the caller's own CI job, via the required
+          # `ci_check_name` input (`coverage` on aw-app-template, `pytest` on
+          # AP-MT, `unit` on aw-workspace core, `Validate compose config` on
+          # aw-stack). Present AND passing is required — "absent" must not
+          # read as "fine", or deleting the CI job would silently re-open
+          # this merge window.
+          REQUIRED = {os.environ["CI_CHECK_NAME"]}
+
+          # Our own review surfaces are advisory by standing rule and must
+          # not gate the merge. Names are listed even for repos that don't
+          # have the corresponding workflow — an absent check name simply
+          # never appears in `gh pr checks` output, so it costs nothing.
+          #
+          # `devteam/merge-eligible` is in here for the same reason
+          # `devteam/code-review` is: it is this loop's own surface, it is
+          # advisory by standing rule, and it must never be something the
+          # merge waits on.
+          #
+          # `merge-attempt` is THIS JOB. It is `pending` while this very code
+          # runs, so without the entry the single read below would always see
+          # a pending check and this job would decline to merge, every time,
+          # forever. The old polling gate had the identical hazard with
+          # `code-review`; this is the same trap one job over.
+          #
+          # `CodeRabbit` is the literal check name the CodeRabbit GitHub App
+          # publishes (verified against tekflox/aw-app-template PRs #13-15).
+          # It is a THIRD-PARTY SaaS reviewer and advisory by the same
+          # standing rule as our own — and it must be here, not merely
+          # harmless: it sits `pending` for as long as CodeRabbit is
+          # reviewing, which without this entry would stall every merge on
+          # such a repo. Only aw-app-template has it installed today; the
+          # other callers pay nothing for the entry.
+          ADVISORY = {"devteam/ai-review", "devteam/code-review",
+                      "devteam/merge-eligible", "ai-review", "code-review",
+                      "merge-eligible", "gate", "fork-notice", "merged-event",
+                      "merge-attempt", "CodeRabbit"}
+
+          # As a REUSABLE workflow, this file's jobs are reported to `gh pr
+          # checks` as "<caller job id> / <job id>" — e.g. "review /
+          # code-review". A flat exact-name match would not recognise any of
+          # them. So each row is matched on its full name AND on the segment
+          # after the last "/", and the caller's job name is irrelevant
+          # either way.
+          def tail(name):
+              return (name or "").rsplit("/", 1)[-1].strip()
+
+          def is_advisory(name):
+              return name in ADVISORY or tail(name) in ADVISORY
+
+          def neutral(msg):
+              """There is nothing to merge, and that is not a failure.
+
+              Entry point (b) fires on EVERY completion of the caller's CI
+              workflow, on every branch — most of which have no open PR, no
+              eligibility status, or CI still running elsewhere. Those must
+              exit 0: a red run on an unrelated branch's CI completion is
+              noise that trains people to ignore this workflow, and the
+              signal that a merge did not happen is the PR still being open.
+              """
+              print(f"::notice::{msg}")
+              sys.exit(0)
+
+          def api(path):
+              """`gh api <path>` -> parsed JSON, or None on an unreadable call.
+
+              Bounded, for the same reason the merge gate's `gh pr checks`
+              call is: an unbounded `gh` that hangs blocks the step while
+              printing nothing at all, which is invisible until the job
+              timeout kills it (AP-MT PR #6 sat in exactly that state for
+              17m53s). A bounded call turns a hang into a readable failure.
+              """
+              try:
+                  out = subprocess.run(["gh", "api", path],
+                                       capture_output=True, text=True, timeout=60)
+              except subprocess.TimeoutExpired:
+                  print(f"::warning::gh api {path} did not return within 60s")
+                  return None
+              if out.returncode != 0:
+                  print(f"::warning::gh api {path} failed: {out.stderr[:300]}")
+                  return None
+              try:
+                  return json.loads(out.stdout or "null")
+              except json.JSONDecodeError:
+                  print(f"::warning::could not parse gh api {path}: {out.stdout[:200]}")
+                  return None
+
+          # ---- 1. which PR is this event about ----
+          if EVENT_NAME == "workflow_run":
+              event_sha = os.environ.get("WORKFLOW_RUN_HEAD_SHA") or ""
+              print(f"workflow_run: {os.environ.get('WORKFLOW_RUN_NAME')} "
+                    f"-> {os.environ.get('WORKFLOW_RUN_CONCLUSION')} on {event_sha[:7]}")
+              if not event_sha:
+                  neutral("workflow_run event carried no head_sha")
+              # `commits/{sha}/pulls`, NOT `github.event.workflow_run
+              # .pull_requests[]`. That array is documented as populated only
+              # when the head and base are in the SAME repository, and in
+              # practice it comes back empty for exactly the runs we care
+              # about. Resolving the PR from the SHA is one extra API call
+              # and is simply correct.
+              pulls = api(f"repos/{REPO}/commits/{event_sha}/pulls")
+              if pulls is None:
+                  print(f"::error::could not resolve a PR from {event_sha}")
+                  sys.exit(1)
+              open_pulls = [p for p in pulls if p.get("state") == "open"]
+              if not open_pulls:
+                  neutral(f"no open PR has {event_sha[:7]} as its head — "
+                          f"nothing to merge (a push to the default branch, or an "
+                          f"already-merged PR, lands here and is expected)")
+              pr_number = open_pulls[0]["number"]
+          else:
+              pr_number = os.environ.get("PR_NUMBER") or ""
+              event_sha = os.environ.get("HEAD_SHA") or ""
+              if not pr_number or not event_sha:
+                  print("::error::same-run entry point reached with no PR number "
+                        "or head SHA from the gate")
+                  sys.exit(1)
+
+          # ---- 2. is this PR still a thing we may merge, RIGHT NOW ----
+          # Every one of these is re-read live rather than taken from the
+          # event payload or from the gate's snapshot. On entry point (b) the
+          # payload is about a CI run, not a PR, and on entry point (a) the
+          # snapshot can be 20 minutes old — the author can close, draft or
+          # push to the PR during the review, and those are precisely the
+          # moments they most mean "do not merge this".
+          pr = api(f"repos/{REPO}/pulls/{pr_number}")
+          if pr is None:
+              print(f"::error::could not read PR #{pr_number}; refusing to merge")
+              sys.exit(1)
+
+          if pr.get("merged"):
+              print(f"#{pr_number} is already merged — nothing to do")
+              sys.exit(0)
+          if pr.get("state") != "open":
+              neutral(f"#{pr_number} is {pr.get('state')} — not merging")
+
+          # Fork guard, on BOTH entry points. The gate has its own for the
+          # review; this one is independent because entry point (b) never
+          # passes through the gate at all, and a `workflow_run` run executes
+          # with the caller's full secrets regardless of where the PR came
+          # from.
+          head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+          if head_repo != REPO:
+              neutral(f"#{pr_number}'s head is {head_repo or 'a deleted fork'}, "
+                      f"not {REPO} — declining to merge a fork PR")
+
+          if pr.get("draft"):
+              neutral(f"#{pr_number} is a draft — not merging. Mark it ready for "
+                      f"review to re-run round 1.")
+
+          live_sha = ((pr.get("head") or {}).get("sha")) or ""
+          if live_sha != event_sha:
+              # NEW IN v1.3.0, and it closes a race the polling version had
+              # wide open: the old gate merged "the PR", not "the SHA the
+              # review passed". A push landing between the verdict and the
+              # merge therefore shipped an unreviewed head under a review
+              # that never saw it.
+              neutral(f"#{pr_number}'s head moved to {live_sha[:7]} since "
+                      f"{event_sha[:7]} was cleared — not merging. The new head "
+                      f"gets its own review.")
+
+          # ---- 3. eligibility, read live from the commit status ----
+          combined = api(f"repos/{REPO}/commits/{live_sha}/status")
+          if combined is None:
+              print(f"::error::could not read commit statuses on {live_sha[:7]}; "
+                    f"refusing to merge")
+              sys.exit(1)
+          cleared = any(s.get("context") == ELIGIBLE_CONTEXT
+                        and s.get("state") == "success"
+                        for s in (combined.get("statuses") or []))
+          if not cleared:
+              neutral(f"{ELIGIBLE_CONTEXT} is not success on {live_sha[:7]} — the "
+                      f"review has not cleared this head for merge")
+
+          # ---- 4. the caller's own CI: ONE bounded read, no loop ----
+          def checks():
+              # `timeout=` is not optional. Without it a hung `gh` blocks
+              # this step forever, printing NOTHING. AP-MT PR #6's round 2
+              # sat in exactly this call for 17m53s and emitted not one line
+              # between `##[endgroup]` and `The operation was canceled`. A
+              # bounded call turns that into a retryable failed read, which
+              # the `rows is None` branch already knows how to handle.
+              try:
+                  out = subprocess.run(
+                      ["gh", "pr", "checks", str(pr_number), "--repo", REPO,
+                       "--json", "name,state,bucket"],
+                      capture_output=True, text=True, timeout=60)
+              except subprocess.TimeoutExpired:
+                  print("::warning::gh pr checks did not return within 60s; "
+                        "treating as a failed read and retrying")
+                  return None
+              # `gh pr checks` exits non-zero when anything is failing or
+              # pending, so returncode is not an error signal here — only
+              # unparseable output is. But empty stdout WITH stderr content
+              # is a real command failure (bad flag, auth, transient API
+              # error) — `out.stdout or "[]"` used to treat that identically
+              # to "found zero checks", which silently turned a real error
+              # into "required check did not pass" on AP-MT PR #7 (confirmed
+              # live: 4 straight /aw-review retries, same instant empty
+              # result, even ~40 min after pytest had actually gone green).
+              #
+              # The underlying cause there was a MISSING `checks: read` on
+              # the caller's token: `gh pr checks` reads check-runs through
+              # the Checks API, and on a PRIVATE repo that read is refused
+              # without it — deterministically, not flakily. `actions: read`
+              # is a second, separate scope the same call needs (AP-MT PR
+              # #9). A public repo's rollup is readable without either, which
+              # is why the same code merged fine on the public
+              # aw-app-template and failed every single round on the private
+              # AP-MT. See the caller checklist at the bottom of this file:
+              # both scopes are REQUIRED, on both sides.
+              stdout = out.stdout.strip()
+              if not stdout:
+                  if out.stderr.strip():
+                      print(f"::warning::gh pr checks produced no output; stderr: "
+                            f"{out.stderr[:300]}")
+                      return None
+                  return []
+              try:
+                  return json.loads(stdout)
+              except json.JSONDecodeError:
+                  print(f"::warning::could not parse gh pr checks output: "
+                        f"{out.stdout[:200]} {out.stderr[:200]}")
+                  return None
+
+          # Retries cover a FAILED READ (a transient API error, a hung call)
+          # — never "CI is still running". Waiting out a pending check is
+          # what the 20-minute loop did and what this release exists to
+          # delete: a pending check means the CI-completion event has not
+          # arrived yet, and that event is the retry.
+          rows = None
+          for attempt in (1, 2, 3):
+              rows = checks()
+              if rows is not None:
+                  break
+              print(f"checks read attempt {attempt} failed")
+              if attempt < 3:
+                  time.sleep(attempt * 5)
+          if rows is None:
+              print(f"::error::could not read #{pr_number}'s checks after 3 "
+                    f"attempts; refusing to merge")
+              sys.exit(1)
+
+          relevant = [r for r in rows if not is_advisory(r.get("name"))]
+          pending = [r for r in relevant if r.get("bucket") == "pending"]
+          failed = [r for r in relevant if r.get("bucket") in ("fail", "cancel")]
+          # Both forms, so `ci_check_name` can name a plain job (`unit`) or,
+          # in a caller whose CI is itself reusable, the tail of a
+          # "parent / child" name.
+          passed = set()
+          for r in relevant:
+              if r.get("bucket") == "pass":
+                  passed.add(r["name"])
+                  passed.add(tail(r["name"]))
+
+          if failed:
+              # exit 0, deliberately. CI being red is already reported by
+              # CI — reddening this job too would just put a second failing
+              # check on the PR saying the same thing, and on entry point (b)
+              # it would do so on every single failed CI run in the repo. The
+              # merge simply does not happen; a later green re-run fires its
+              # own workflow_run and this job re-attempts.
+              neutral("not merging — CI is not green on this head SHA: "
+                      + ", ".join(f"{r['name']}={r.get('state')}" for r in failed))
+          if pending:
+              neutral("not merging yet — still running: "
+                      + ", ".join(r["name"] for r in pending)
+                      + ". The CI-completion event will re-attempt this.")
+
+          missing = REQUIRED - passed
+          if missing:
+              # A warning rather than an error, and still no merge. "Absent"
+              # must never read as "fine" — that rule is why `ci_check_name`
+              # is required-and-passing rather than not-failing — but the
+              # common way to get here is benign (CI has not started on this
+              # SHA yet, so nothing is pending AND nothing has passed), and
+              # failing the job for it would redden PRs for a race. The
+              # genuinely broken case — a CI job that was renamed or deleted
+              # — surfaces as a PR that stays open with this warning on it,
+              # and `/aw-review` is the recovery path.
+              print(f"::warning::not merging — required check(s) {sorted(missing)} "
+                    f"have not reported a pass on {live_sha[:7]}. Saw: "
+                    f"{sorted((r['name'], r.get('bucket')) for r in relevant)}")
+              sys.exit(0)
+
+          print("CI is green: " + ", ".join(sorted(passed)))
+
+          # ---- 5. merge ----
+          # `AW_DEVTEAM_MERGE_TOKEN`, a PAT with contents:write +
+          # pull-requests:write on the caller repo. NOT `GITHUB_TOKEN`:
+          # pushes created by GITHUB_TOKEN do not trigger downstream
+          # workflows, so a GITHUB_TOKEN-authored merge push would land and
+          # every `on: push` / `on: workflow_run` workflow in the caller repo
+          # would silently never fire — a release cut, a deploy, an image
+          # build, going dark with a green PR to point at.
+          #
+          # Plain `gh pr merge --squash`, no `--auto`: `--auto` only pauses
+          # for checks that BRANCH PROTECTION marks required, and none of
+          # these repos has branch protection (direct push to master is kept
+          # deliberately as the break-glass path — if a bad merge breaks this
+          # very loop, the fix must not depend on the loop it would be
+          # fixing). Everything above is therefore not belt-and-suspenders:
+          # it is the ONLY gate between a red test suite and a squash-merge.
+          merge_token = os.environ.get("MERGE_TOKEN") or ""
+          if not merge_token:
+              print("::error::AW_DEVTEAM_MERGE_TOKEN is not set on this repository "
+                    "(or the caller did not pass it BY NAME — `secrets: inherit` "
+                    "does not cross an account boundary). Refusing to fall back to "
+                    "GITHUB_TOKEN: its merge push would not trigger this repo's own "
+                    "push-/workflow_run-triggered workflows, so the deploy or "
+                    "release that normally follows a merge would silently stop "
+                    "happening.")
+              sys.exit(1)
+
+          out = subprocess.run(
+              ["gh", "pr", "merge", str(pr_number), "--repo", REPO,
+               "--squash", "--delete-branch"],
+              capture_output=True, text=True, timeout=180,
+              env={**os.environ, "GH_TOKEN": merge_token})
+          if out.returncode == 0:
+              print(f"squash-merged #{pr_number} ({live_sha[:7]}) via "
+                    f"AW_DEVTEAM_MERGE_TOKEN")
+              sys.exit(0)
+
+          # ALREADY MERGED IS A SUCCESS. Both entry points can fire for the
+          # same head SHA — a CI run completing at the same moment the review
+          # posts its verdict reaches this code twice — and whichever loses
+          # that race must not redden a PR that merged perfectly well.
+          after = api(f"repos/{REPO}/pulls/{pr_number}")
+          if after and after.get("merged"):
+              print(f"#{pr_number} was already merged (the other entry point, or "
+                    f"a human, got there first) — treating as success")
+              sys.exit(0)
+          print(f"::error::gh pr merge failed: {out.stderr[:500]}")
+          sys.exit(1)
           PYEOF
 
   # ---------------------------------------------------------------------------
@@ -1198,6 +1510,51 @@ jobs:
           PYEOF
 
 # ── CALLER CHECKLIST ──────────────────────────────────────────────────────
+# TRIGGER SURFACE, REQUIRED as of v1.3.0 — the caller's `on:` block:
+#
+#     on:
+#       pull_request:
+#         types: [opened, reopened, ready_for_review, synchronize, closed]
+#       issue_comment:
+#         types: [created]
+#       workflow_run:
+#         workflows: ["<THE CALLER'S OWN CI WORKFLOW `name:`>"]
+#         types: [completed]
+#
+#     concurrency:
+#       group: code-review-${{ github.event.pull_request.number
+#                || github.event.issue.number
+#                || github.event.workflow_run.head_branch }}
+#       cancel-in-progress: false
+#
+# Three things about that block, each of which has a way of going wrong
+# silently:
+#
+#   `synchronize` is what makes round 2 automatic. Without it the loop still
+#   works, it just needs a `/aw-review` comment after every fix push, which
+#   is what v1.2.1 and earlier required. The gate refuses a synchronize that
+#   is not round 2 after a single label read, so adding it does not spend
+#   review budget on round-1 pushes.
+#
+#   `workflow_run.workflows:` takes the CI workflow's `name:` — the human
+#   string at the top of that file, NOT its filename and NOT its job id.
+#   ("Test" on aw-app-template / AP-MT / aw-workspace, "CI" on aw-stack.)
+#   Get it wrong, or rename the CI workflow later, and nothing fails: the
+#   event simply never fires, and merges whose CI finishes after the review
+#   verdict stop happening until someone comments `/aw-review`. Check it with
+#   `gh api repos/<owner>/<repo>/actions/workflows --jq '.workflows[].name'`.
+#
+#   The `|| github.event.workflow_run.head_branch` arm of the concurrency
+#   group is not cosmetic. A workflow_run event has neither
+#   `pull_request.number` nor `issue.number`, so without it EVERY
+#   workflow_run-triggered run in the repo collapses into the single group
+#   `code-review-`, and with `cancel-in-progress: false` they queue behind
+#   each other one at a time.
+#
+# AND NOTE: `workflow_run` only ever fires for a trigger definition that is
+# already on the DEFAULT BRANCH. The PR that adds this block cannot exercise
+# the path the block enables. Land it, then prove it on the next PR.
+#
 # In the caller's `uses:` job, REQUIRED — all six:
 #     permissions:
 #       contents: read
@@ -1227,15 +1584,15 @@ jobs:
 # tekflox/aw-app-template (merged first try) and the private AP-MT (failed
 # four consecutive rounds, ~40 min after its checks had gone green).
 #
-# `actions: read` is the THIRD, separate scope gap in this same step — found
+# `actions: read` is the THIRD, separate scope gap in this same call — found
 # after checks: read was already live everywhere. `gh pr checks` always
 # embeds checkSuite{workflowRun{...}} in its GraphQL query regardless of the
 # requested --json fields (gh CLI v2.97.0, api/query_builder.go), and that
 # edge is an Actions-resource read that checks: read does not grant. Missing
 # it on a private caller is again a hard, deterministic GraphQL 403 —
 # `Resource not accessible by integration (...checkSuite.workflowRun)` — on
-# every poll, so the ci_gate retry loop runs its full 20-minute budget and
-# still never reads a check. Live case: fredericowu/agents-platform-multitenant
+# every read, so all three attempts fail and the merge-attempt refuses. Live
+# case: fredericowu/agents-platform-multitenant
 # PR #9, CI green for hours, gate refused to merge anyway. Checks: read alone
 # was not enough because it only covers the Checks API's own name/state/
 # conclusion fields, not the edge back to the Actions run that produced the
