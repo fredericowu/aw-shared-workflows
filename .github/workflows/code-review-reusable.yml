@@ -393,7 +393,21 @@ jobs:
     # Hard ceiling on a dead/stalled judge — paired with the server-side 900s
     # runner timeout on the dispatch call below and the always()-finalize
     # step, so `devteam/code-review` can never stay `pending` forever.
-    timeout-minutes: 20
+    #
+    # 45, not 20, and the number is load-bearing. This job runs the reviewer
+    # dispatch (up to the 900s = 15 min server-side ceiling) and THEN the
+    # `ci_gate` step, which has its own 20-minute budget for waiting on the
+    # caller repo's CI. At 20 the two budgets overlapped instead of nesting:
+    # the job died before the gate could reach its own deadline, so the gate's
+    # "still waiting on X after 20 min" diagnostic was unreachable and a
+    # cancelled job was the only signal. Measured on AP-MT PR #6 — a round 2
+    # that passed with ZERO findings was killed at 20 min flat with no
+    # explanation, costing a full paid review cycle to re-run.
+    #
+    # So this must stay > (dispatch ceiling 15) + (gate deadline 20). Keep the
+    # invariant if you change either number; it is asserted by
+    # `test_the_job_timeout_leaves_room_for_the_gates_own_deadline`.
+    timeout-minutes: 45
     steps:
       - name: Mark code review pending
         env:
@@ -829,13 +843,36 @@ jobs:
               return name in ADVISORY or tail(name) in ADVISORY
 
           repo, pr = os.environ["REPO"], os.environ["PR_NUMBER"]
+          # Must stay comfortably BELOW the job's own `timeout-minutes`, which
+          # starts counting at job start — i.e. before the reviewer dispatch
+          # that runs ahead of this step. If the two budgets are equal, the
+          # job is killed before this loop can ever reach its own deadline, so
+          # the diagnostic error below is unreachable and the only thing anyone
+          # sees is `##[error]The operation was canceled`. That is exactly what
+          # happened on AP-MT PR #6: both were 20, the dispatch ate 2.4 min,
+          # and a round 2 that had PASSED with zero findings died with no
+          # explanation. The guard is
+          # `test_the_job_timeout_leaves_room_for_the_gates_own_deadline`.
           deadline = time.time() + 20 * 60
 
           def checks():
-              out = subprocess.run(
-                  ["gh", "pr", "checks", pr, "--repo", repo,
-                   "--json", "name,state,bucket"],
-                  capture_output=True, text=True)
+              # `timeout=` is not optional. Without it a hung `gh` blocks this
+              # step forever, printing NOTHING — the loop below only logs once
+              # it has a result, so a hang inside this call is invisible until
+              # the job timeout kills it. AP-MT PR #6's round 2 sat here for
+              # 17m53s and emitted not one line between `##[endgroup]` and
+              # `The operation was canceled`. A bounded call turns that into a
+              # retryable failed read, which the `rows is None` branch already
+              # knows how to handle.
+              try:
+                  out = subprocess.run(
+                      ["gh", "pr", "checks", pr, "--repo", repo,
+                       "--json", "name,state,bucket"],
+                      capture_output=True, text=True, timeout=60)
+              except subprocess.TimeoutExpired:
+                  print("::warning::gh pr checks did not return within 60s; "
+                        "treating as a failed read and retrying")
+                  return None
               # `gh pr checks` exits non-zero when anything is failing or
               # pending, so returncode is not an error signal here — only
               # unparseable output is. But empty stdout WITH stderr content

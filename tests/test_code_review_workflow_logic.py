@@ -47,6 +47,7 @@ import sys
 from pathlib import Path
 
 import textwrap
+import re
 import pytest
 
 WORKFLOW = (Path(__file__).resolve().parents[1]
@@ -563,3 +564,61 @@ def test_checks_read_is_requested_by_the_reusable_itself():
     """The specific scope v1.1.1 missed. `gh pr checks` in the ci_gate step
     cannot see check-runs on a PRIVATE caller without it."""
     assert _own_permissions().get("checks") == "read"
+
+
+# --- the gate must be able to fail LOUDLY, not get killed mid-wait -----------
+#
+# AP-MT PR #6's round 2 passed the review with zero findings and then died with
+# nothing but `##[error]The operation was canceled`. Two separate defects, both
+# inherited verbatim from the three copy-pasted originals:
+#
+#   1. `checks()` called `subprocess.run` with no `timeout=`, so a hung `gh`
+#      blocked the step silently — 17m53s with not one line of output, because
+#      the loop only logs once it HAS a result.
+#   2. the job's `timeout-minutes` equalled the gate's own deadline, so the job
+#      was always killed before the gate could reach that deadline and print
+#      its "still waiting on X" diagnostic. The two budgets overlapped where
+#      they needed to nest.
+#
+# Neither is reachable by running the workflow on a healthy repo, which is why
+# they survived three copies and two of my own releases.
+
+
+def test_the_checks_call_is_bounded_by_a_timeout():
+    """An unbounded `gh` call makes a hang indistinguishable from a slow CI,
+    and emits nothing while it happens."""
+    src = _extract_heredoc("- name: Wait for the repo's own CI to be green")
+    call = src[src.index("def checks():"):]
+    call = call[: call.index("try:") + 2000 if "try:" in call else 2000]
+    assert "timeout=" in call, "gh pr checks must not be called unbounded"
+    assert "TimeoutExpired" in src, (
+        "a timeout that raises instead of returning None would crash the step "
+        "rather than retry it"
+    )
+
+
+def test_the_job_timeout_leaves_room_for_the_gates_own_deadline():
+    """The job budget must strictly exceed dispatch + gate, or the gate's
+    diagnostic is unreachable and a cancelled job is the only signal."""
+    text = WORKFLOW.read_text()
+
+    gate_src = _extract_heredoc("- name: Wait for the repo's own CI to be green")
+    m = re.search(r"deadline = time\.time\(\) \+ (\d+) \* 60", gate_src)
+    assert m, "could not find the gate's own deadline"
+    gate_minutes = int(m.group(1))
+
+    # the code-review job's timeout, i.e. the one containing the gate step
+    job = text[text.index("  code-review:"):]
+    m = re.search(r"timeout-minutes: (\d+)", job)
+    assert m, "the code-review job has no timeout-minutes"
+    job_minutes = int(m.group(1))
+
+    assert job_minutes > gate_minutes, (
+        f"job timeout ({job_minutes}m) must exceed the gate's own deadline "
+        f"({gate_minutes}m), or the job dies before the gate can report why"
+    )
+    # and with room for the reviewer dispatch that runs BEFORE the gate step
+    assert job_minutes >= gate_minutes + 15, (
+        f"job timeout ({job_minutes}m) leaves only {job_minutes - gate_minutes}m "
+        f"for the reviewer dispatch, whose own server-side ceiling is 15m"
+    )

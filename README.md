@@ -50,6 +50,27 @@ $ git push --delete origin v1.0.0
 All three tag SHAs unchanged afterwards. To add a new version you create a *new*
 tag; that is still allowed (only `update`/`deletion` are blocked, not creation).
 
+### `v1.1.3` is a DUD. Never pin it.
+
+It points at exactly the same commit as `v1.1.2` and contains none of the fix
+it was cut for. A shell-quoting error made the `git commit` fail while the
+`git tag` and both pushes succeeded, so the tag was created on the unchanged
+`HEAD`. The content is identical to v1.1.2, so pinning it is harmless rather
+than broken — it is simply a lie about which version you are on. The fix it
+was meant to carry shipped as **`v1.1.4`**.
+
+This is the immutability rule working as designed and costing what it is
+supposed to cost: the obvious repair is to re-point `v1.1.3`, the ruleset
+refuses that for everyone including the owner, and so the version number is
+burned instead of the history being rewritten under three consumers. Verify a
+tag's *content* after cutting it, not just that the push succeeded:
+
+```
+gh api repos/fredericowu/aw-shared-workflows/contents/\
+  .github/workflows/code-review-reusable.yml?ref=vX.Y.Z -q .content \
+  | base64 -d | grep <something the release changed>
+```
+
 That rule is not stylistic. `app-release.yml` in this estate is referenced via a
 moving `@master` ref from ~45 app repos, and one fail-loud edit there turned the
 whole marketplace red simultaneously. Exact tags make the blast radius of a
@@ -77,7 +98,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.2
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.4
     with:
       ci_check_name: pytest
     permissions:
@@ -149,6 +170,17 @@ As of `v1.1.1` the gate at least distinguishes the two cases — empty stdout
 symptom a timeout instead of an instant false negative; it is not a
 substitute for granting the scope (and on v1.1.1 specifically it was the
 *only* thing that landed — see above).
+
+**v1.1.4** makes the gate able to fail *loudly*. Two defects inherited from the
+original copies meant it could instead die with no explanation at all:
+`gh pr checks` was called with no `timeout=`, so a hung call blocked the step
+silently; and the job's `timeout-minutes` equalled the gate's own 20-minute
+deadline, so the job was killed before the gate could reach that deadline and
+print its diagnostic. Measured on AP-MT PR #6: a round 2 that **passed with
+zero findings** sat in that call for 17m53s, emitted nothing between
+`##[endgroup]` and `The operation was canceled`, and cost a full paid review
+cycle. The call is now bounded and retried, the job budget nests the gate's
+instead of overlapping it, and both are asserted by tests.
 
 ### Secrets
 
