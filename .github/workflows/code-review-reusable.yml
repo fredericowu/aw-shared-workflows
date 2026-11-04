@@ -206,6 +206,17 @@ permissions:
   # Required for `gh pr checks` in the ci_gate step to see check-runs at all
   # on a PRIVATE caller. See the long note in the CALLER CHECKLIST below.
   checks: read
+  # SEPARATE from checks: read, and additionally required. gh CLI's `gh pr
+  # checks` always builds a GraphQL query that embeds
+  # checkSuite{workflowRun{workflow{name}}} inside the CheckRun fragment, no
+  # matter which --json fields you ask for (gh v2.97.0, api/query_builder.go).
+  # Resolving that checkSuite -> workflowRun edge is an Actions-resource read,
+  # not a Checks-API read, so checks: read alone does not cover it. On a
+  # PRIVATE caller, missing this is a deterministic
+  # "Resource not accessible by integration (...checkSuite.workflowRun)"
+  # GraphQL error on every single poll — not transient, so the ci_gate retry
+  # loop can never succeed. See the long note in the CALLER CHECKLIST below.
+  actions: read
 
 jobs:
   # Same two-entry-path shape as the original (fork check on both paths,
@@ -1187,13 +1198,14 @@ jobs:
           PYEOF
 
 # ── CALLER CHECKLIST ──────────────────────────────────────────────────────
-# In the caller's `uses:` job, REQUIRED — all five:
+# In the caller's `uses:` job, REQUIRED — all six:
 #     permissions:
 #       contents: read
 #       pull-requests: write
 #       issues: write
 #       statuses: write
 #       checks: read        # <- omitting this breaks PRIVATE repos only
+#       actions: read       # <- omitting this ALSO breaks PRIVATE repos only
 #
 # A caller grant is NECESSARY BUT NOT SUFFICIENT: the effective token is the
 # intersection of the caller's block and THIS FILE's own top-level
@@ -1214,6 +1226,20 @@ jobs:
 # so the identical caller works there — the two live cases were the public
 # tekflox/aw-app-template (merged first try) and the private AP-MT (failed
 # four consecutive rounds, ~40 min after its checks had gone green).
+#
+# `actions: read` is the THIRD, separate scope gap in this same step — found
+# after checks: read was already live everywhere. `gh pr checks` always
+# embeds checkSuite{workflowRun{...}} in its GraphQL query regardless of the
+# requested --json fields (gh CLI v2.97.0, api/query_builder.go), and that
+# edge is an Actions-resource read that checks: read does not grant. Missing
+# it on a private caller is again a hard, deterministic GraphQL 403 —
+# `Resource not accessible by integration (...checkSuite.workflowRun)` — on
+# every poll, so the ci_gate retry loop runs its full 20-minute budget and
+# still never reads a check. Live case: fredericowu/agents-platform-multitenant
+# PR #9, CI green for hours, gate refused to merge anyway. Checks: read alone
+# was not enough because it only covers the Checks API's own name/state/
+# conclusion fields, not the edge back to the Actions run that produced the
+# check suite.
 #
 # Per consumer repo, once:
 #   - secrets: AW_CODEREVIEW_V1_KEY (workspace-bound, scoped to
