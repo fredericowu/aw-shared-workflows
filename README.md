@@ -77,7 +77,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.1
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.2
     with:
       ci_check_name: pytest
     permissions:
@@ -108,6 +108,24 @@ All five lines in the example above are required. **`checks: read` is the one
 that bites**, because leaving it out is completely invisible on a public repo
 and fatal on a private one.
 
+**A scope must appear on BOTH sides, and a caller grant alone buys nothing.**
+The effective `GITHUB_TOKEN` is the *intersection* of the caller's `uses:`-job
+block and this workflow's own top-level `permissions:`. Once a `permissions:`
+key names any scope, every scope it does **not** name is forced to `none`
+rather than inherited (GitHub docs, `permissions`: *"If you specify the access
+for any of these permissions, all of those that are not specified are set to
+`none`"*). So an omission in the shared file is an explicit `none` that caps
+every caller to zero.
+
+v1.1.1 got this exactly wrong, and it is worth stating plainly because the
+release was *named* for the fix: it added `checks: read` to all three callers
+and to the caller checklist, and never touched its own `permissions:` block.
+Net effect was no fix at all, just a clearer error message. Caught in review on
+`aw-app-template#17`, not by CI, because nothing compared the two lists.
+**v1.1.2** fixes the block and adds
+`test_the_reusable_requests_every_scope_the_caller_checklist_demands`, which
+parses both lists and fails if they diverge.
+
 The merge gate reads the PR's checks with `gh pr checks`, which goes through
 the Checks API. On a **private** repo that read is refused without
 `checks: read` — and it does not error, it returns an **empty list**. The gate
@@ -129,7 +147,8 @@ As of `v1.1.1` the gate at least distinguishes the two cases — empty stdout
 *with* stderr content is treated as a failed read and retried until the
 20-minute deadline, rather than as "zero checks exist". That makes the
 symptom a timeout instead of an instant false negative; it is not a
-substitute for granting the scope.
+substitute for granting the scope (and on v1.1.1 specifically it was the
+*only* thing that landed — see above).
 
 ### Secrets
 

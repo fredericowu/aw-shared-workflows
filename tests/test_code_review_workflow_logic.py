@@ -490,3 +490,76 @@ def test_an_empty_read_with_no_stderr_is_genuinely_zero_checks():
 
 def test_unparseable_output_is_a_failed_read():
     assert _checks_reader("not json at all", "") is None
+
+
+# --- the two permissions lists must not drift ---------------------------------
+#
+# v1.1.1 was cut specifically to fix a missing `checks: read`, added it to all
+# three callers and to the CALLER CHECKLIST, and never touched this file's own
+# top-level `permissions:` block. That is not a partial fix, it is no fix: for
+# a reusable workflow the effective GITHUB_TOKEN is the INTERSECTION of the
+# caller's grant and the called workflow's own block, and once a `permissions:`
+# key names any scope, every unnamed scope is forced to `none` rather than
+# inherited (GitHub docs, `permissions`). So the omission here capped every
+# caller to `checks: none` no matter what they granted, and the bug the release
+# was named for stayed fully live — with a better error message.
+#
+# Caught in review on aw-app-template#17, not by CI, because nothing compared
+# the two lists. Now something does.
+
+
+def _own_permissions() -> dict:
+    """The workflow's own top-level `permissions:` block, as {scope: access}.
+
+    Text-scanned, not YAML-parsed: pytest is this suite's only dependency and
+    the file's docstring keeps it that way deliberately.
+    """
+    lines = WORKFLOW.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln == "permissions:")
+    out = {}
+    for ln in lines[start + 1:]:
+        if ln.startswith("  #") or not ln.strip():
+            continue
+        if not ln.startswith("  ") or ln.startswith("   "):
+            break
+        scope, _, access = ln.strip().partition(":")
+        out[scope.strip()] = access.strip()
+    return out
+
+
+def _checklist_permissions() -> dict:
+    """The `permissions:` block the CALLER CHECKLIST comment tells callers to
+    use, un-commented back into {scope: access}."""
+    lines = WORKFLOW.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines)
+                 if ln.strip().startswith("#") and ln.strip().endswith("permissions:"))
+    out = {}
+    for ln in lines[start + 1:]:
+        body = ln.lstrip("#").strip()
+        if not body:
+            break
+        body = body.split("#", 1)[0].strip()      # drop a trailing comment
+        if ":" not in body:
+            break
+        scope, _, access = body.partition(":")
+        out[scope.strip()] = access.strip()
+    return out
+
+
+def test_the_reusable_requests_every_scope_the_caller_checklist_demands():
+    """If the checklist tells callers to grant a scope, this file must request
+    it too — otherwise the intersection silently drops it to `none` and the
+    caller's grant buys nothing."""
+    own, checklist = _own_permissions(), _checklist_permissions()
+    assert checklist, "could not parse the caller checklist's permissions block"
+    assert own == checklist, (
+        "the reusable workflow's own permissions and the caller checklist have "
+        f"drifted — own={own} checklist={checklist}. An unlisted scope is "
+        "`none`, not inherited, so a caller cannot make up the difference."
+    )
+
+
+def test_checks_read_is_requested_by_the_reusable_itself():
+    """The specific scope v1.1.1 missed. `gh pr checks` in the ci_gate step
+    cannot see check-runs on a PRIVATE caller without it."""
+    assert _own_permissions().get("checks") == "read"

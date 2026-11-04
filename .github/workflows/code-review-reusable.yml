@@ -181,11 +181,31 @@ on:
 # sides state the same set: this file documents what the loop actually needs,
 # and the caller's copy is what lifts a repo whose default workflow
 # permissions are read-only.
+#
+# BOTH SIDES. That is not a stylistic preference, it is the whole mechanism,
+# and v1.1.1 got it wrong by updating only the callers. Once a `permissions:`
+# key names ANY scope, every scope it does not name is forced to `none`
+# (GitHub docs, `permissions`: "If you specify the access for any of these
+# permissions, all of those that are not specified are set to `none`"). So an
+# omission here is not "inherit from the caller", it is an explicit `none`,
+# and it silently caps every caller to zero no matter what they grant. A
+# caller-side grant alone buys nothing.
+#
+# `checks: read` is the one that made this concrete. v1.1.1 added it to all
+# three callers and to the checklist below, and left this block untouched —
+# so the private-repo bug it was cut to fix was still fully live, now with a
+# better error message instead of a fix. Caught in review on
+# aw-app-template#17; fixed in v1.1.2, and guarded by a test
+# (`test_the_reusable_requests_every_scope_the_caller_checklist_demands`) so
+# the two lists cannot drift apart again.
 permissions:
   contents: read
   pull-requests: write
   issues: write
   statuses: write
+  # Required for `gh pr checks` in the ci_gate step to see check-runs at all
+  # on a PRIVATE caller. See the long note in the CALLER CHECKLIST below.
+  checks: read
 
 jobs:
   # Same two-entry-path shape as the original (fork check on both paths,
@@ -1137,6 +1157,14 @@ jobs:
 #       issues: write
 #       statuses: write
 #       checks: read        # <- omitting this breaks PRIVATE repos only
+#
+# A caller grant is NECESSARY BUT NOT SUFFICIENT: the effective token is the
+# intersection of the caller's block and THIS FILE's own top-level
+# `permissions:`, and an unlisted scope there means `none`, not "inherit". So
+# a scope has to appear in BOTH. Keep the two lists identical — the test
+# `test_the_reusable_requests_every_scope_the_caller_checklist_demands`
+# parses this checklist and that block and fails if they diverge, because
+# v1.1.1 shipped exactly that divergence and capped every caller to zero.
 #
 # `checks: read` is not optional and its absence is invisible on a public
 # repo. The merge gate reads the PR's checks with `gh pr checks`, which goes
