@@ -67,10 +67,53 @@ def _dedent_block(block: str) -> str:
     return "\n".join(line[pad:] if len(line) >= pad else line for line in lines)
 
 
-def _extract_heredoc(marker_before: str) -> str:
+def _code_only(src: str) -> str:
+    """``src`` with whole-line ``#`` comments stripped.
+
+    Scan CODE through this. Assert on prose only where prose is the subject.
+
+    The standing hazard: this workflow is deliberately comment-dense, and a
+    comment explaining why something matters necessarily repeats the token a
+    guard would scan for — so scanning raw text for a code token tests the
+    documentation, not the code. It bit once already. The comment above
+    ``checks()`` opens with "``timeout=`` is not optional", which by itself
+    satisfied ``"timeout=" in call`` and left the bounded-call guard below
+    passing with the real ``timeout=60`` kwarg deleted.
+
+    Honest scope, because the convenient story is wrong: stripping comments
+    is NOT what repaired that guard — ``_call_args`` is, by scoping the scan
+    to the call's own argument list, where the offending comment never was.
+    Regressing this function to ``return src`` leaves all 34 tests green.
+    It is kept as the general discipline for scans that cannot be scoped
+    that tightly, not as this defect's fix.
+    """
+    return "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def _call_args(code: str, callee: str) -> str:
+    """The literal argument list of the first ``callee(…)`` call in ``code``.
+
+    Paren-matched rather than scanning to the next ``)``, so a nested call
+    can never truncate the slice early and quietly shrink what a guard sees.
+    """
+    start = code.index(callee + "(") + len(callee) + 1
+    depth, i = 1, start
+    while depth:
+        depth += {"(": 1, ")": -1}.get(code[i], 0)
+        i += 1
+    return code[start:i - 1]
+
+
+def _extract_heredoc(marker_before: str, text: str | None = None) -> str:
     """The body of the first ``python3 … <<'PYEOF' … PYEOF`` heredoc that
-    appears after ``marker_before`` in the workflow."""
-    text = WORKFLOW.read_text()
+    appears after ``marker_before`` in the workflow.
+
+    ``text`` defaults to the real workflow; pass a string to read a modified
+    copy, which is how the vacuity guard below feeds a mutated version in.
+    """
+    text = WORKFLOW.read_text() if text is None else text
     anchor = text.index(marker_before)
     start = text.index("PYEOF", anchor)
     body_start = text.index("\n", start) + 1
@@ -584,16 +627,60 @@ def test_checks_read_is_requested_by_the_reusable_itself():
 # they survived three copies and two of my own releases.
 
 
+_GATE_STEP = "- name: Wait for the repo's own CI to be green"
+
+
+def _checks_call_timeout(text: str) -> str:
+    """The ``timeout=`` seconds on the gate's ``gh pr checks`` call, read from
+    ``text``; ``""`` if that call is unbounded.
+
+    A function of the text, not of the file, so the vacuity guard below can
+    hand it a deliberately broken copy and assert this reports the break.
+    Scoped to ``subprocess.run``'s own argument list: a ``timeout=`` anywhere
+    else in the function — or in a comment — would not bound THIS call.
+    """
+    body = _code_only(_extract_heredoc(_GATE_STEP, text))
+    body = body[body.index("def checks():"):]
+    m = re.search(r"\btimeout=(\d+)", _call_args(body, "subprocess.run"))
+    return m.group(1) if m else ""
+
+
 def test_the_checks_call_is_bounded_by_a_timeout():
     """An unbounded `gh` call makes a hang indistinguishable from a slow CI,
     and emits nothing while it happens."""
-    src = _extract_heredoc("- name: Wait for the repo's own CI to be green")
-    call = src[src.index("def checks():"):]
-    call = call[: call.index("try:") + 2000 if "try:" in call else 2000]
-    assert "timeout=" in call, "gh pr checks must not be called unbounded"
-    assert "TimeoutExpired" in src, (
+    assert _checks_call_timeout(WORKFLOW.read_text()), (
+        "gh pr checks must not be called unbounded"
+    )
+    assert "TimeoutExpired" in _code_only(_extract_heredoc(_GATE_STEP)), (
         "a timeout that raises instead of returning None would crash the step "
         "rather than retry it"
+    )
+
+
+def test_the_timeout_guard_is_not_vacuous():
+    """Mutation guard: delete the real kwarg and the guard above MUST fail.
+
+    Its first version scanned a 2000-char slice for the bare string
+    ``timeout=``, which the explanatory comment directly above the call
+    already contained — so it passed with the kwarg deleted and reported
+    coverage it did not have. A guard that cannot fail is worse than no
+    guard, because it stops anyone looking. This test is what makes the one
+    above mean something, and it is the only assertion here that would have
+    caught the original defect.
+
+    Mutation testing found this; neither review nor a green suite did. The
+    other four guards in this file were mutated the same way and all failed
+    correctly, so this is the single instance rather than a pattern.
+    """
+    real = WORKFLOW.read_text()
+    broken = real.replace("text=True, timeout=60)", "text=True)", 1)
+    assert broken != real, (
+        "mutation anchor is stale — re-point it at the real call, or this "
+        "guard silently stops mutating anything"
+    )
+    assert not _checks_call_timeout(broken), (
+        "the bounded-call guard still passes on a copy with the kwarg "
+        "removed, so it is not guarding the call"
     )
 
 
