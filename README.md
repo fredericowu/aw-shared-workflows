@@ -8,6 +8,13 @@ repos. One file, several callers, no copy-paste drift.
 | Workflow | Purpose |
 |---|---|
 | `.github/workflows/code-review-reusable.yml` | The Dev Team's two-round PR review → merge loop (`workflow_call`). |
+| `.github/workflows/test.yml` | This repo's own CI — runs `tests/`. |
+
+`tests/test_code_review_workflow_logic.py` extracts the reusable workflow's
+embedded step scripts by text-scanning its heredoc markers and executes them,
+so it asserts against the bytes CI actually runs. It moved here from
+`tekflox/aw-app-template` along with the logic it guards. **Run it before
+tagging** — `python -m pytest tests/ -q`.
 
 ## Pin an exact tag. Never a moving ref.
 
@@ -46,7 +53,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.0.0
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.0
     with:
       ci_check_name: pytest
     permissions:
@@ -54,7 +61,11 @@ jobs:
       pull-requests: write
       issues: write
       statuses: write
-    secrets: inherit
+    # Pass by NAME, not `secrets: inherit` — see "Secrets" below.
+    secrets:
+      AW_CODEREVIEW_V1_KEY: ${{ secrets.AW_CODEREVIEW_V1_KEY }}
+      AW_DEVTEAM_MERGE_TOKEN: ${{ secrets.AW_DEVTEAM_MERGE_TOKEN }}
+      AW_DEVTEAM_EVENT_SECRET: ${{ secrets.AW_DEVTEAM_EVENT_SECRET }}
 ```
 
 ### Inputs
@@ -68,9 +79,24 @@ jobs:
 
 ### Secrets
 
-Callers pass `secrets: inherit`; this workflow declares no `secrets:` block.
-Each secret is read with an explicit "unset" branch, because `inherit` yields an
-empty string (never an error) for a secret the caller repo doesn't have.
+**Pass them by name. Do not use `secrets: inherit`.**
+
+All three are declared as `required: false` under `on.workflow_call.secrets`,
+and callers pass each explicitly. `inherit` is not sufficient here, and it
+fails *silently*: GitHub's rule is that "workflows that call reusable workflows
+**in the same organization or enterprise** can use the `inherit` keyword" — it
+does not cross an account boundary. This repo is owned by `fredericowu`, and
+one of the callers is `tekflox/aw-app-template`.
+
+Measured live (aw-app-template PR #16, 2026-11-04): the caller passed
+`secrets: inherit`, `AW_CODEREVIEW_V1_KEY` **was** set on that repo, and it
+still arrived as an **empty string** — while the same-owner caller
+(`fredericowu/aw-workspace`) inherited it fine. That is the shape of bug that
+reads as "the secret is missing" and sends you to the wrong repo.
+
+Each secret is still read with an explicit "unset" branch, so a genuinely
+missing one produces a fail-loud CI error naming the repo and the secret
+rather than a confusing downstream 401 or 500.
 
 | Secret | Used for |
 |---|---|

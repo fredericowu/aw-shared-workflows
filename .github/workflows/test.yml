@@ -1,0 +1,88 @@
+name: Test
+
+# This repo's own CI. It exists because of a gap the extraction created and
+# would otherwise have left open: `code-review-reusable.yml` carries a real
+# two-round state machine in embedded Python — label-driven round detection,
+# round-1 vs round-2 merge eligibility, the `blocks_merge`-missing
+# fail-closed rule, the draft guard — that ~3 repos now depend on, and
+# nothing here executed a single assertion against it.
+#
+# `tests/test_code_review_workflow_logic.py` MOVED here from
+# tekflox/aw-app-template when that repo's copy of the loop became a thin
+# caller. In that repo it was run by the app's own coverage job. Moving the
+# file without moving a runner would have been the worse half of the change:
+# a test suite nobody executes is not a guard, and this one exists precisely
+# because the Dev Team reviewer flagged the missing guard twice.
+#
+# No coverage gate here on purpose: there is no package in this repo to
+# measure. The tests EXTRACT the workflow's own step scripts by text-scanning
+# its heredoc markers and run those, so they assert against the bytes CI
+# actually runs — which also means extraction fails loudly if someone renames
+# a step, rather than silently testing nothing.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Named `tests` rather than `test`: it is the check name a future
+  # `ci_check_name: tests` would pin if this repo ever runs the review loop
+  # on itself, and renaming a check later silently re-opens a merge window.
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          # The extracted step scripts are executed by whatever `python3` the
+          # GitHub-hosted runner provides at review time. Pinning 3.12 here
+          # keeps this suite on a version that exists on `ubuntu-latest`
+          # today, which is what the reusable workflow's own jobs run on by
+          # default.
+          python-version: '3.12'
+
+      # pytest is the ONLY dependency, and the test file's docstring explains
+      # why it is kept that way (it deliberately text-scans instead of
+      # parsing YAML, so a parser dependency would be incidental coupling).
+      - name: Install pytest
+        run: python -m pip install --quiet pytest
+
+      - name: Workflow logic regression tests
+        run: python -m pytest tests/ -q -p no:cacheprovider
+
+      # Cheap, and catches the failure mode a logic test cannot: a file that
+      # no longer parses as a workflow at all. `yaml.safe_load` is not how
+      # Actions parses it, so this is a smoke check, not a validator — it
+      # would still catch the unbalanced-quote class of typo that otherwise
+      # only surfaces as "Invalid workflow file" on a caller's PR.
+      - name: Workflows parse as YAML
+        run: |
+          python -m pip install --quiet pyyaml
+          python - <<'PY'
+          import pathlib
+          import sys
+
+          import yaml
+
+          failed = False
+          for p in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              try:
+                  yaml.safe_load(p.read_text())
+              except yaml.YAMLError as exc:
+                  print(f"::error file={p}::does not parse: {exc}")
+                  failed = True
+              else:
+                  print(f"ok: {p}")
+          sys.exit(1 if failed else 0)
+          PY

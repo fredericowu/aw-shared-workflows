@@ -43,12 +43,26 @@ name: Code Review (reusable)
 # bumped deliberately, with the oldest/most-exercised consumer
 # (tekflox/aw-app-template) used as the canary.
 #
-# ── SECRETS: INHERITED, NOT DECLARED ──────────────────────────────────────
-# There is no `on.workflow_call.secrets:` block. Callers pass
-# `secrets: inherit`, which makes every caller-repo secret visible here
-# without this file having to enumerate them. Each secret below is read with
-# an explicit "unset" branch, because `inherit` yields an EMPTY STRING for a
-# secret the caller repo does not have — never an error:
+# ── SECRETS: DECLARED, AND PASSED EXPLICITLY ──────────────────────────────
+# All three are declared under `on.workflow_call.secrets:` below as
+# `required: false`, and every caller passes them BY NAME.
+#
+# `secrets: inherit` was tried first and is NOT sufficient, for a reason that
+# fails silently rather than loudly. GitHub's rule: "Workflows that call
+# reusable workflows in the same organization or enterprise can use the
+# `inherit` keyword" — `inherit` does not cross an ACCOUNT boundary. This
+# repo is owned by `fredericowu`; `tekflox/aw-app-template` is one of the
+# callers. Measured live on 2026-11-04 (aw-app-template PR #16): the caller
+# passed `secrets: inherit`, `AW_CODEREVIEW_V1_KEY` IS set on that repo, and
+# it still arrived here as an EMPTY STRING. Meanwhile the same-owner caller
+# (`fredericowu/aw-workspace`) inherited it fine — which is exactly the shape
+# of bug that looks like "the secret is missing" and sends you to the wrong
+# repo. Declaring them and passing by name works regardless of who owns what.
+#
+# Each secret is still read with an explicit "unset" branch, because an
+# optional, unpassed secret yields an EMPTY STRING here, never an error — and
+# that guard is what turned the failure above into a one-line CI error naming
+# the repo instead of a confusing downstream 401:
 #
 #   `AW_CODEREVIEW_V1_KEY`     the reviewer dispatch; MUST be a
 #                              WORKSPACE-BOUND Agents Platform ApiKey (an
@@ -138,6 +152,29 @@ on:
         required: false
         type: string
         default: 'https://agents-platform.aw.tekflox.com'
+    secrets:
+      # All `required: false`, deliberately. A caller missing one gets a
+      # precise, fail-loud error from the step that needs it, naming the repo
+      # and the secret — which is strictly more useful than GitHub refusing
+      # the whole workflow call with a generic validation error before any of
+      # our own diagnostics can run. See the SECRETS note in this file's
+      # header for why these are declared at all rather than inherited.
+      AW_CODEREVIEW_V1_KEY:
+        description: >-
+          Agents Platform ApiKey for the reviewer dispatch. MUST be
+          WORKSPACE-BOUND and scoped to `code-reviewer-sonnet` — an unbound
+          key gives an opaque 500 at the /v1 door, not a 401.
+        required: false
+      AW_DEVTEAM_MERGE_TOKEN:
+        description: >-
+          PAT with contents:write + pull-requests:write on the caller repo,
+          used ONLY for the squash-merge. Never GITHUB_TOKEN: pushes it
+          authors do not trigger downstream workflows.
+        required: false
+      AW_DEVTEAM_EVENT_SECRET:
+        description: >-
+          HMAC key the platform's /api/github/devteam-review-event verifies.
+        required: false
 
 # Declared here AND on the caller's calling job. For a reusable workflow the
 # effective GITHUB_TOKEN permissions are the INTERSECTION of the two, so both
