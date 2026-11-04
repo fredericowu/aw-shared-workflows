@@ -740,11 +740,22 @@ jobs:
           REQUIRED = {os.environ["CI_CHECK_NAME"]}
           # Our own review surfaces are advisory by standing rule and must not
           # gate the merge (devteam/code-review is this very job; waiting on
-          # it would deadlock). `devteam/ai-review` is listed even for repos
-          # with no ai-review.yml — an absent check name simply never appears
-          # in `gh pr checks` output, so it costs nothing to list.
+          # it would deadlock). Names are listed even for repos that don't
+          # have the corresponding workflow — an absent check name simply
+          # never appears in `gh pr checks` output, so it costs nothing.
+          #
+          # `CodeRabbit` is the literal check name the CodeRabbit GitHub App
+          # publishes (verified against tekflox/aw-app-template PRs #13-15).
+          # It is a THIRD-PARTY SaaS reviewer and advisory by the same
+          # standing rule as our own two — and it must be here, not merely
+          # harmless: it sits `pending` for as long as CodeRabbit is
+          # reviewing, which without this entry would make every merge on
+          # such a repo wait on it and then refuse at the 20-minute deadline.
+          # Only aw-app-template has it installed today; the other callers
+          # pay nothing for the entry.
           ADVISORY = {"devteam/ai-review", "devteam/code-review", "ai-review",
-                      "code-review", "gate", "fork-notice", "merged-event"}
+                      "code-review", "gate", "fork-notice", "merged-event",
+                      "CodeRabbit"}
 
           # NEW HERE, and load-bearing: as a REUSABLE workflow, this file's
           # jobs are reported to `gh pr checks` as "<caller job id> / <job id>"
