@@ -818,9 +818,31 @@ jobs:
                   capture_output=True, text=True)
               # `gh pr checks` exits non-zero when anything is failing or
               # pending, so returncode is not an error signal here — only
-              # unparseable output is.
+              # unparseable output is. But empty stdout WITH stderr content
+              # is a real command failure (bad flag, auth, transient API
+              # error) — `out.stdout or "[]"` used to treat that identically
+              # to "found zero checks", which silently turned a real error
+              # into "required check did not pass" on AP-MT PR #7 (confirmed
+              # live: 4 straight /aw-review retries, same instant empty
+              # result, even ~40 min after pytest had actually gone green).
+              #
+              # The underlying cause there was a MISSING `checks: read` on
+              # the caller's token: `gh pr checks` reads check-runs through
+              # the Checks API, and on a PRIVATE repo that read is refused
+              # without it — deterministically, not flakily. A public repo's
+              # rollup is readable without it, which is why the same code
+              # merged fine on the public aw-app-template and failed every
+              # single round on the private AP-MT. See the caller checklist
+              # at the bottom of this file: `checks: read` is REQUIRED.
+              stdout = out.stdout.strip()
+              if not stdout:
+                  if out.stderr.strip():
+                      print(f"::warning::gh pr checks produced no output; stderr: "
+                            f"{out.stderr[:300]}")
+                      return None
+                  return []
               try:
-                  return json.loads(out.stdout or "[]")
+                  return json.loads(stdout)
               except json.JSONDecodeError:
                   print(f"::warning::could not parse gh pr checks output: "
                         f"{out.stdout[:200]} {out.stderr[:200]}")
@@ -1108,6 +1130,26 @@ jobs:
           PYEOF
 
 # ── CALLER CHECKLIST ──────────────────────────────────────────────────────
+# In the caller's `uses:` job, REQUIRED — all five:
+#     permissions:
+#       contents: read
+#       pull-requests: write
+#       issues: write
+#       statuses: write
+#       checks: read        # <- omitting this breaks PRIVATE repos only
+#
+# `checks: read` is not optional and its absence is invisible on a public
+# repo. The merge gate reads the PR's checks with `gh pr checks`, which goes
+# through the Checks API; on a private repo that read is REFUSED without
+# `checks: read` and returns an empty list — deterministically, every round,
+# with no error surfaced to the step. The gate then reports
+# `required check(s) ['<ci_check_name>'] did not report a pass ... Saw: []`
+# and never merges, which reads exactly like a CI failure and sends you to
+# look at the wrong workflow. A public repo's rollup is readable without it,
+# so the identical caller works there — the two live cases were the public
+# tekflox/aw-app-template (merged first try) and the private AP-MT (failed
+# four consecutive rounds, ~40 min after its checks had gone green).
+#
 # Per consumer repo, once:
 #   - secrets: AW_CODEREVIEW_V1_KEY (workspace-bound, scoped to
 #     code-reviewer-sonnet), AW_DEVTEAM_MERGE_TOKEN, AW_DEVTEAM_EVENT_SECRET

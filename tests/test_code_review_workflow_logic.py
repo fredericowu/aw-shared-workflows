@@ -46,6 +46,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import textwrap
 import pytest
 
 WORKFLOW = (Path(__file__).resolve().parents[1]
@@ -431,3 +432,61 @@ def test_the_merge_waits_on_the_repos_own_ci():
     merge_step = text[text.index("- name: Merge if eligible") :]
     merge_step = merge_step[: merge_step.index("run: |")]
     assert "steps.ci_gate.outcome == 'success'" in merge_step
+
+
+# --- ci_gate's checks() reader ------------------------------------------------
+#
+# AP-MT PR #7 burned four consecutive /aw-review rounds on this one function.
+# The caller's token lacked `checks: read`, so on that PRIVATE repo `gh pr
+# checks` returned nothing at all — and `json.loads(out.stdout or "[]")` made
+# that indistinguishable from "this PR legitimately has zero checks", so the
+# gate failed instantly with `Saw: []` instead of retrying or timing out.
+
+
+def _checks_reader(stdout: str, stderr: str):
+    """Run the real `checks()` body from the ci_gate step against a faked
+    `subprocess.run` result, and return whatever it decided."""
+    src = _extract_heredoc("- name: Wait for the repo's own CI to be green")
+    assert "def checks():" in src, "extracted the wrong block — no checks() in it"
+
+    body = src[src.index("def checks():"):]
+    body = body[: body.index("\n          while True:") if "\n          while True:" in body
+                else body.index("\nwhile True:")]
+
+    ns = {"json": json, "os": {}, "subprocess": None, "pr": "1", "repo": "o/r"}
+
+    class _Out:
+        pass
+
+    out = _Out()
+    out.stdout, out.stderr = stdout, stderr
+
+    class _FakeSubprocess:
+        @staticmethod
+        def run(*a, **kw):
+            return out
+
+    ns["subprocess"] = _FakeSubprocess
+    ns["os"] = os
+    exec(textwrap.dedent(body), ns)
+    return ns["checks"]()
+
+
+def test_a_real_read_is_parsed():
+    assert _checks_reader('[{"name": "pytest", "bucket": "pass"}]', "") == [
+        {"name": "pytest", "bucket": "pass"}
+    ]
+
+
+def test_an_empty_read_with_stderr_is_a_failed_read_not_zero_checks():
+    """The `checks: read` case. Returning [] here fails the gate instantly;
+    returning None makes the caller retry until its 20-minute deadline."""
+    assert _checks_reader("", "gh: Resource not accessible by integration") is None
+
+
+def test_an_empty_read_with_no_stderr_is_genuinely_zero_checks():
+    assert _checks_reader("", "") == []
+
+
+def test_unparseable_output_is_a_failed_read():
+    assert _checks_reader("not json at all", "") is None

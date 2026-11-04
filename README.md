@@ -77,7 +77,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.0
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.1
     with:
       ci_check_name: pytest
     permissions:
@@ -85,6 +85,7 @@ jobs:
       pull-requests: write
       issues: write
       statuses: write
+      checks: read          # REQUIRED — see "Permissions" below.
     # Pass by NAME, not `secrets: inherit` — see "Secrets" below.
     secrets:
       AW_CODEREVIEW_V1_KEY: ${{ secrets.AW_CODEREVIEW_V1_KEY }}
@@ -100,6 +101,35 @@ jobs:
 | `runs_on` | no | `'"ubuntu-latest"'` | JSON-encoded `runs-on`, consumed as `fromJSON(...)`. A JSON string or a JSON array both work (`'["self-hosted","aw-baremetal"]'`). |
 | `dispatch_url` | no | `https://agents-platform.aw.tekflox.com` | Agents Platform base for the reviewer dispatch. |
 | `event_url` | no | `https://agents-platform.aw.tekflox.com` | Agents Platform base for the round-outcome event. |
+
+### Permissions
+
+All five lines in the example above are required. **`checks: read` is the one
+that bites**, because leaving it out is completely invisible on a public repo
+and fatal on a private one.
+
+The merge gate reads the PR's checks with `gh pr checks`, which goes through
+the Checks API. On a **private** repo that read is refused without
+`checks: read` — and it does not error, it returns an **empty list**. The gate
+then says:
+
+```
+refusing to merge — required check(s) ['pytest'] did not report a pass
+          on this head SHA. Saw: []
+```
+
+which reads like a CI failure and sends you to debug the wrong workflow. It is
+deterministic, not flaky: measured on AP-MT PR #7 as four consecutive
+`/aw-review` rounds returning empty instantly, including ~40 minutes after
+`pytest` had already gone green. The identical caller on the **public**
+aw-app-template merged on the first attempt, because a public repo's check
+rollup is readable without the scope.
+
+As of `v1.1.1` the gate at least distinguishes the two cases — empty stdout
+*with* stderr content is treated as a failed read and retried until the
+20-minute deadline, rather than as "zero checks exist". That makes the
+symptom a timeout instead of an instant false negative; it is not a
+substitute for granting the scope.
 
 ### Secrets
 
