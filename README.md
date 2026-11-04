@@ -26,6 +26,30 @@ Not `@master`, and not a moving major alias like `@v1`. Tags here are
 **immutable** — nothing is ever retagged. A change ships as a new tag, and each
 consumer is bumped deliberately.
 
+**That is enforced by GitHub, not by discipline.** A ruleset on this repo
+(`Immutable version tags`, target `tag`, pattern `refs/tags/v*`) blocks
+`update`, `deletion` and `non_fast_forward`, with **no bypass actors** — so not
+even the repo owner can move a published tag. This matters because every caller
+hands its *entire merge gate* to a pinned ref here: an unprotected tag is only
+marginally better than `@master`, since anyone with push access could silently
+re-point it and change three repos' merge logic with no commit, no diff and no
+CI signal in any of them.
+
+Caught by the Dev Team reviewer on AP-MT PR #6, which checked and found
+`/tags/protection` 404ing and `/rulesets` empty while this file claimed
+immutability. Verified after fixing, by attempting the attack rather than
+trusting the API:
+
+```
+$ git push -f origin v1.0.1          # re-point to another commit
+ ! [remote rejected] v1.0.1 -> v1.0.1 (push declined due to repository rule violations)
+$ git push --delete origin v1.0.0
+ ! [remote rejected] v1.0.0 (push declined due to repository rule violations)
+```
+
+All three tag SHAs unchanged afterwards. To add a new version you create a *new*
+tag; that is still allowed (only `update`/`deletion` are blocked, not creation).
+
 That rule is not stylistic. `app-release.yml` in this estate is referenced via a
 moving `@master` ref from ~45 app repos, and one fail-loud edit there turned the
 whole marketplace red simultaneously. Exact tags make the blast radius of a
