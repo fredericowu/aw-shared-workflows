@@ -8,13 +8,21 @@ repos. One file, several callers, no copy-paste drift.
 | Workflow | Purpose |
 |---|---|
 | `.github/workflows/code-review-reusable.yml` | The Dev Team's two-round PR review → merge loop (`workflow_call`). |
+| `.github/workflows/ai-review-reusable.yml` | PR-Agent's advisory AI review, status `devteam/ai-review` (`workflow_call`). |
 | `.github/workflows/test.yml` | This repo's own CI — runs `tests/`. |
 
-`tests/test_code_review_workflow_logic.py` extracts the reusable workflow's
-embedded step scripts by text-scanning its heredoc markers and executes them,
-so it asserts against the bytes CI actually runs. It moved here from
-`tekflox/aw-app-template` along with the logic it guards. **Run it before
-tagging** — `python -m pytest tests/ -q`.
+The two review workflows are independent and a repo can run either or both.
+They share **one `v*` tag line** rather than having a family each — the
+ruleset that makes tags immutable targets `refs/tags/v*` only, so a separate
+`ai-v*` family would be unprotected. The cost is that a fix to one workflow
+cuts a tag the other's callers simply don't have to bump.
+
+`tests/test_code_review_workflow_logic.py` and
+`tests/test_ai_review_workflow_logic.py` extract the reusable workflows'
+embedded step scripts by text-scanning them and execute them, so they assert
+against the bytes CI actually runs. The first moved here from
+`tekflox/aw-app-template` along with the logic it guards. **Run them before
+tagging** — `python -m pytest tests/ -q` (69 tests).
 
 ## Pin an exact tag. Never a moving ref.
 
@@ -221,6 +229,130 @@ rather than a confusing downstream 401 or 500.
 The full caller checklist, with the `gh` commands, is at the bottom of the
 workflow file itself.
 
+## `ai-review-reusable.yml`
+
+PR-Agent's advisory review, published as the commit status
+`devteam/ai-review` on the PR head SHA. Never a required check. Inference
+runs through Agents Platform's OpenAI-compatible `/v1` door against the
+dedicated `pr-agent-llm` agent.
+
+A whole thin caller — this is the entire file a consumer repo needs:
+
+```yaml
+name: AI Review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event.sender.type == 'Bot' && 'bot-noop' || 'review' }}
+  cancel-in-progress: true
+
+jobs:
+  ai-review:
+    uses: fredericowu/aw-shared-workflows/.github/workflows/ai-review-reusable.yml@v1.2.0
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+    secrets:
+      AW_PRAGENT_V1_KEY: ${{ secrets.AW_PRAGENT_V1_KEY }}
+```
+
+`synchronize` **is** in that trigger list, unlike the code-review caller
+above. That is deliberate: PR-Agent reviews every push by design, whereas
+the review→merge loop is driven by explicit rounds.
+
+### Inputs
+
+| Input | Required | Default | Notes |
+|---|---|---|---|
+| `api_base` | no | `https://agents-platform.aw.tekflox.com/v1` | Fed to `OPENAI__API_BASE`. An input only so a staging Agents Platform can be pointed at without forking the file; every caller today uses the default. |
+
+That is the whole input surface. The model (`openai/agent/pr-agent-llm`), the
+empty fallback list, the token/timeout values, the auto-flags
+(describe + review on, `/improve` on demand only) and the SHA-pinned
+`The-PR-Agent/pr-agent@efdde4a` (v0.49.0) are all **hardcoded**. They do not
+vary per repo, and parameterizing a thing that does not vary is how
+`code-review.yml`'s three copies drifted 554 lines apart.
+
+`runs-on: ubuntu-latest` is hardcoded too, in all three jobs, and there is no
+`runs_on` input. This workflow has an open `pull_request` trigger, so on a
+public caller anyone can open a fork PR, and a fork PR on
+`[self-hosted, aw-baremetal]` is arbitrary code execution on the bare-metal
+host that runs the whole workspace. There is also no `actions/checkout` —
+PR-Agent reads the diff through the GitHub API, so untrusted code never
+reaches the runner at all. A private caller therefore pays GitHub-hosted
+minutes (~3–5 min/PR), which also keeps this workflow off the single
+self-hosted runner AP-MT's CI, deploy and code-review loop already share.
+
+### Permissions
+
+All four lines above are required, **on both sides**, for the same
+intersection reason as `code-review-reusable.yml` — see that section above;
+the `v1.1.1` lesson applies identically here, and
+`test_the_reusable_requests_every_scope_the_caller_checklist_demands` in the
+new suite compares the two lists in both directions.
+
+There is **no `checks: read`** here, and that is not an omission: nothing in
+this workflow touches the Checks API. The gate resolves a fork with
+`gh api repos/.../pulls`, and the review publishes *commit statuses*, which
+are a different API from check-runs. Adding the scope would fail the parity
+test.
+
+### Secrets
+
+| Secret | Used for |
+|---|---|
+| `AW_PRAGENT_V1_KEY` | PR-Agent's inference. **Must be workspace-bound** — an unbound Agents Platform ApiKey gives an opaque 500 at the `/v1` door, not a 401 — and scoped to `pr-agent-llm` alone, so a leak cannot dispatch any other agent. |
+
+**Pass it by name, never `secrets: inherit`** — same account-boundary
+silence documented above. The `ai-review` job reads it with an explicit
+"unset" branch *before* invoking PR-Agent, so a missing secret is a one-line
+CI error naming the repo and the secret. The original `ai-review.yml` had no
+such guard and an empty key surfaced as a confusing 401 from the `/v1` door.
+
+**Mint one per caller repo.** Not a shared key: per-repo revocation, same
+convention as `AW_CODEREVIEW_V1_KEY`. Verify a fresh mint against the door
+*before* setting it as a secret — 200 with exactly one model listed, 403 for
+an out-of-scope agent, 401 for a garbage key:
+
+```
+curl -s -H "Authorization: Bearer $KEY" \
+  https://agents-platform.aw.tekflox.com/v1/models | jq '.data | length'   # -> 1
+gh secret set AW_PRAGENT_V1_KEY --body "$KEY" --repo <owner/repo>
+```
+
+### What the caller still owns
+
+- **`concurrency`** — and the group expression above is **literal, not
+  illustrative**. A reusable workflow's own `concurrency` keys on the shared
+  file's identity, so it has to live in the caller; and the `bot-noop` arm is
+  the `809a1a6` fix for CodeRabbit's auto-comment cancelling PR-Agent's own
+  in-flight review (`cancel-in-progress` is evaluated at workflow level,
+  before any job-level `if`, so the reusable's `sender.type != 'Bot'` guard on
+  the `gate` job is correct but unreachable in time). The guard moved into the
+  shared file and the key stayed in the caller, so the two halves of one
+  invariant now live in different repos — which is why the caller checklist
+  carries the exact string and two tests assert both halves.
+- **Nothing else.** No labels, no repo variables, no `.pr_agent.toml` (that
+  file is read from the default branch only, and every load-bearing value is
+  set as a host env var in the reusable; `api_base` is rejected from a repo
+  file outright). `tekflox/aw-app-template` keeps its own as documentation of
+  that asymmetry.
+
+### If you are editing a caller's own `ai-review.yml` in a PR
+
+`pull_request` runs the caller's PR copy, so a conversion or pin-bump PR does
+exercise its own `pull_request` path live. `issue_comment` — typing `/review`
+or `/improve` — **always runs the default-branch copy**, so such a PR cannot
+exercise its own comment path. Verify that on the next PR after merge rather
+than burning time debugging it.
+
 ## Provenance
 
 Extracted from `fredericowu/agents-platform-multitenant@2aab9cd5`'s
@@ -235,3 +367,13 @@ match the originals used would have had the merge gate waiting on itself).
 Every design comment in that file was kept. Read it before changing anything
 here; most of what looks redundant is load-bearing and has a live incident
 behind it.
+
+`ai-review-reusable.yml` was extracted from `tekflox/aw-app-template`'s
+standalone `.github/workflows/ai-review.yml`, the only copy that existed —
+AP-MT and aw-workspace never had one, which is the point of the extraction:
+PR-Agent becomes part of the common block every rollout repo gets rather than
+a one-repo feature. Behaviour is unchanged from that file, all three of its
+jobs came across, and every design comment came with them. One thing was
+*added* rather than ported: the fail-loud empty-secret guard, which the
+original did not need because it read a repo secret directly instead of a
+`workflow_call` one.
