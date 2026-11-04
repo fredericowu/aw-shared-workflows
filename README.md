@@ -22,7 +22,7 @@ cuts a tag the other's callers simply don't have to bump.
 embedded step scripts by text-scanning them and execute them, so they assert
 against the bytes CI actually runs. The first moved here from
 `tekflox/aw-app-template` along with the logic it guards. **Run them before
-tagging** — `python -m pytest tests/ -q` (69 tests).
+tagging** — `python -m pytest tests/ -q` (112 tests).
 
 ## Pin an exact tag. Never a moving ref.
 
@@ -87,6 +87,12 @@ change exactly one repo at a time.
 **Rollout order for a new tag:** bump `tekflox/aw-app-template` first — it is the
 oldest and most-exercised consumer, so it is the canary — then the rest.
 
+A tag that changes the caller's **trigger surface** (as `v1.3.0` does) costs
+the canary **two** PRs, not one: `issue_comment` and `workflow_run` both fire
+against the *default-branch* copy of the caller's workflow, so the PR that
+adds a trigger can never exercise the path that trigger enables. PR 1 lands
+the triggers and the pin; PR 2 is the live proof.
+
 ## `code-review-reusable.yml`
 
 A thin caller looks like this:
@@ -96,17 +102,22 @@ name: Code Review
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review, closed]
+    types: [opened, reopened, ready_for_review, synchronize, closed]
   issue_comment:
     types: [created]
+  # The CI workflow's `name:`, not its filename. "Test" here; "CI" on
+  # aw-stack. This is what makes the merge event-driven — see below.
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
 
 concurrency:
-  group: code-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.4
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.3.0
     with:
       ci_check_name: pytest
     permissions:
@@ -115,12 +126,90 @@ jobs:
       issues: write
       statuses: write
       checks: read          # REQUIRED — see "Permissions" below.
+      actions: read         # REQUIRED — see "Permissions" below.
     # Pass by NAME, not `secrets: inherit` — see "Secrets" below.
     secrets:
       AW_CODEREVIEW_V1_KEY: ${{ secrets.AW_CODEREVIEW_V1_KEY }}
       AW_DEVTEAM_MERGE_TOKEN: ${{ secrets.AW_DEVTEAM_MERGE_TOKEN }}
       AW_DEVTEAM_EVENT_SECRET: ${{ secrets.AW_DEVTEAM_EVENT_SECRET }}
 ```
+
+### Triggers (`v1.3.0` — the caller contract changed)
+
+All three `on:` entries above are load-bearing, and `v1.3.0` is the release
+that made the last two required. A caller that bumps the pin without them
+still reviews and still merges the easy case; it just quietly loses the two
+behaviours the release exists for.
+
+| Trigger | What it buys |
+|---|---|
+| `pull_request: synchronize` | Round 2 starts by itself on the coder's fix push. Before this, every round 2 needed a manual `/aw-review` comment. |
+| `workflow_run: [completed]` on the caller's own CI | The merge re-attempts when CI *actually* finishes, however long that takes. This replaced a 20-minute poll that gave up — see below. |
+
+Three ways to get that block wrong, all of which fail silently:
+
+- **`workflows:` takes the CI workflow's `name:`** — the human string at the
+  top of the file, not the filename and not the job id. Confirm it:
+  `gh api repos/<owner>/<repo>/actions/workflows --jq '.workflows[].name'`.
+  Rename the CI workflow later and nothing breaks loudly; merges on the
+  slow-CI path just stop happening.
+- **The `|| github.event.workflow_run.head_branch` arm of the concurrency
+  group is not cosmetic.** A `workflow_run` event has neither
+  `pull_request.number` nor `issue.number`, so without it every such run in
+  the repo collapses into the single group `code-review-` and, with
+  `cancel-in-progress: false`, queues one at a time.
+- **`workflow_run` only fires for a trigger definition already on the
+  DEFAULT BRANCH.** The PR that adds this block cannot exercise what it
+  enables. Land it, then prove it on the next PR. (That is why v1.3.0's
+  canary took two PRs on aw-app-template.)
+
+`synchronize` costs nothing on PRs that are not mid-fix-cycle: the gate
+reads the PR's labels and refuses a non-round-2 synchronize before any paid
+judge run.
+
+### How the merge works (and why it stopped polling)
+
+Up to `v1.2.1`, the review job finished by polling `gh pr checks` in a
+20-minute loop until the caller's CI went green, then merged inline. That
+shape produced two separate production bugs on its own (a masking empty read
+on AP-MT PR #7, a missing `actions: read` on PR #9), spent a 20-minute window
+on every PR whose CI finished after the verdict, and capped the whole loop:
+a suite slower than 20 minutes could never merge at all.
+
+`v1.3.0` replaces it with a commit status plus a real event:
+
+1. The review job publishes **`devteam/merge-eligible`** (`state=success`) on
+   the PR head SHA at the moment it computes `eligible=true`, and never
+   otherwise. Eligibility is still decided in exactly one place — the round
+   rule, the `blocks_merge` rule and the draft rule are unchanged.
+2. A **`merge-attempt`** job reads that status live and merges. Two entry
+   points, one script: the same run (`needs: [gate, code-review]`) for the
+   common case where CI was already green, and the caller's forwarded
+   `workflow_run` event for the case the poll existed for.
+
+A **commit status**, not a label, because eligibility is a property of a
+*SHA*. A label is PR-scoped and would survive the push that invalidates the
+review that set it, handing a brand-new unreviewed head the eligibility its
+predecessor earned. That per-SHA property also *is* the head-moved guard,
+which is new: `merge-attempt` re-reads the PR's live head before merging, and
+a head that moved simply has no status on it. The old inline merge merged
+"the PR", not "the SHA the review passed".
+
+What it costs, stated plainly so nobody rediscovers it as a bug:
+
+- **No poll means no self-healing window.** A dropped `workflow_run`
+  delivery, or a `merge-attempt` that fails mechanically, is not retried by
+  anything. `/aw-review` (or another push) is the recovery path, and it is
+  deliberately kept for exactly this.
+- **Every completion of the named CI workflow, on any branch, spawns a
+  few-second `merge-attempt` job**, which exits neutral when no open PR owns
+  that SHA. On the two self-hosted callers that is real, small, runner noise.
+- **A renamed CI workflow silently kills the event path.** It degrades to
+  manual `/aw-review`; it never merges red, because `merge-attempt` reads the
+  checks itself.
+
+In exchange the 20-minute ceiling is gone (slow CI still merges), and a
+re-run of a failed CI job that passes the second time now auto-merges.
 
 ### Inputs
 
@@ -133,9 +222,9 @@ jobs:
 
 ### Permissions
 
-All five lines in the example above are required. **`checks: read` is the one
-that bites**, because leaving it out is completely invisible on a public repo
-and fatal on a private one.
+All six lines in the example above are required. **`checks: read` and
+`actions: read` are the ones that bite**, because leaving either out is
+completely invisible on a public repo and fatal on a private one.
 
 **A scope must appear on BOTH sides, and a caller grant alone buys nothing.**
 The effective `GITHUB_TOKEN` is the *intersection* of the caller's `uses:`-job
@@ -173,22 +262,40 @@ aw-app-template merged on the first attempt, because a public repo's check
 rollup is readable without the scope.
 
 As of `v1.1.1` the gate at least distinguishes the two cases — empty stdout
-*with* stderr content is treated as a failed read and retried until the
-20-minute deadline, rather than as "zero checks exist". That makes the
-symptom a timeout instead of an instant false negative; it is not a
-substitute for granting the scope (and on v1.1.1 specifically it was the
-*only* thing that landed — see above).
+*with* stderr content is treated as a failed read and retried, rather than as
+"zero checks exist". That makes the symptom a visible retry-then-refuse
+instead of an instant false negative; it is not a substitute for granting the
+scope (and on v1.1.1 specifically it was the *only* thing that landed — see
+above). The reader kept that three-way answer when the merge moved into
+`merge-attempt` in v1.3.0: it is what the three-attempt retry budget hangs
+off, and the budget covers a *failed read* only, never a CI run that is still
+going.
 
-**v1.1.4** makes the gate able to fail *loudly*. Two defects inherited from the
-original copies meant it could instead die with no explanation at all:
-`gh pr checks` was called with no `timeout=`, so a hung call blocked the step
-silently; and the job's `timeout-minutes` equalled the gate's own 20-minute
-deadline, so the job was killed before the gate could reach that deadline and
-print its diagnostic. Measured on AP-MT PR #6: a round 2 that **passed with
-zero findings** sat in that call for 17m53s, emitted nothing between
-`##[endgroup]` and `The operation was canceled`, and cost a full paid review
-cycle. The call is now bounded and retried, the job budget nests the gate's
-instead of overlapping it, and both are asserted by tests.
+`actions: read` (**v1.2.1**) is a third, separate gap in that same call. `gh
+pr checks` always embeds `checkSuite{workflowRun{...}}` in its GraphQL query
+regardless of the `--json` fields requested (gh v2.97.0,
+`api/query_builder.go`), and resolving that edge is an *Actions*-resource
+read. On a private caller, missing it is a hard `Resource not accessible by
+integration (...checkSuite.workflowRun)` on every read. Live case: AP-MT PR
+#9, CI green for hours, gate refused to merge anyway.
+
+**v1.1.4** makes the check read able to fail *loudly*. Two defects inherited
+from the original copies meant it could instead die with no explanation at
+all: `gh pr checks` was called with no `timeout=`, so a hung call blocked the
+step silently; and the job's `timeout-minutes` equalled the gate's own
+20-minute deadline, so the job was killed before the gate could reach that
+deadline and print its diagnostic. Measured on AP-MT PR #6: a round 2 that
+**passed with zero findings** sat in that call for 17m53s, emitted nothing
+between `##[endgroup]` and `The operation was canceled`, and cost a full paid
+review cycle. The call is bounded, and remains so in `merge-attempt`. The
+second half of that pair no longer has a defect to guard: v1.3.0 deleted the
+deadline along with the poll, so there are no longer two budgets that could
+overlap.
+
+**v1.3.0 needs no new scopes.** `statuses: write` already covered publishing
+`devteam/merge-eligible` and reading it back; resolving a PR from a SHA is a
+`pull-requests` read. The two permission lists are therefore identical to
+v1.2.1's, which is what the parity test requires.
 
 ### Secrets
 
@@ -219,10 +326,17 @@ rather than a confusing downstream 401 or 500.
 
 ### What the caller still owns
 
-- **`concurrency`** — keyed on the caller's PR number. A reusable workflow's own
+- **Every trigger** — a `workflow_call` workflow has none of its own, so the
+  whole `on:` block above is the caller's, including the CI workflow's
+  literal `name:` in `workflow_run.workflows`. See "Triggers" above; this is
+  the half of the contract that fails silently when it drifts.
+- **`concurrency`** — keyed on the caller's PR number, with the
+  `workflow_run.head_branch` fallback arm. A reusable workflow's own
   `concurrency` would key on this file's identity instead.
 - **Two labels** — `devteam:awaiting-fixes` (`#FBCA04`) and `devteam:needs-human`
-  (`#B60205`). The round state machine lives in them.
+  (`#B60205`). The round state machine lives in them, and
+  `devteam:awaiting-fixes` is now also what admits an automatic round 2 on a
+  fix push.
 - **Optional `AW_REVIEW_TRUSTED_AUTHORS`** repo variable (comma-separated
   logins). Unset falls back to `fredericowu` in the gate's own code.
 
