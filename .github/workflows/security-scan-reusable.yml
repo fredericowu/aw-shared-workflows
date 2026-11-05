@@ -1,0 +1,399 @@
+name: Security scan (reusable)
+
+# Free SAST + SCA + Secrets scanning (Semgrep + Trivy + Gitleaks), as a
+# `workflow_call` reusable workflow. Decided with Frederico as a no-cost
+# alternative to Veracode. Three independent jobs, each uploading its own
+# SARIF under its own category.
+#
+# REPORT-ONLY BY DESIGN: every scan step is `continue-on-error` (and the
+# gitleaks run swallows its own exit 1), so a finding never fails the build.
+# This is a reporting pipeline, not a merge gate, and it must not become one
+# without a deliberate decision — a repo-wide gate that reddens 61 repos at
+# once is the failure mode `app-release.yml` already taught this estate.
+#
+# ── PROVENANCE ────────────────────────────────────────────────────────────
+# Extracted verbatim-in-behaviour from the 97-line `security-scan.yml` that
+# was rolled out standalone to 61 repos in September 2026
+# (`tekflox/aw-app-weather`'s copy is the representative one; 52 of the 61
+# are byte-identical to it modulo their cron line). Semantics are UNCHANGED:
+# the same three jobs, the same SHA pins, the same report-only posture, and
+# every inline rationale came across with the step it explains.
+#
+# This is the THIRD reusable workflow in this repo, beside
+# `code-review-reusable.yml` and `ai-review-reusable.yml`, and it shares
+# their single `v*` tag line rather than getting a `sec-v*` family of its
+# own — the live ruleset that makes tags immutable targets `refs/tags/v*`
+# only, so a separate family would be unprotected. Cost of sharing the line:
+# a change here cuts a repo-wide tag, and the other files' callers simply
+# don't bump.
+#
+# The 61 copies were NOT all identical when this was extracted, which is the
+# whole argument for converging them. Five distinct variants existed:
+#   - 52 repos: the canonical file above.
+#   - 6 repos (incl. `aw-app-template`): runs-on derived from the repo owner
+#     via `startsWith(github.repository, 'tekflox/')`.
+#   - `aw-app-uc-phd`: runs-on hardcoded to `ubuntu-latest`.
+#   - `aw-app-knowledgeable`: the same file with most design comments dropped.
+#   - `aw-app-research-search`: SARIF upload made `continue-on-error` plus a
+#     retained artifact — the same problem `sarif_upload` below solves, solved
+#     differently and in one repo only.
+# The first three are all the same underlying fact, and it is the reason
+# `runs_on` is an input: see the next block.
+#
+# ── WHAT IS, AND IS NOT, AN INPUT ─────────────────────────────────────────
+# Exactly two inputs: `runs_on` and `sarif_upload`. Both exist because they
+# are the only axes on which the 61 copies genuinely diverged, and both
+# divergences were real breakage rather than taste.
+#
+# Everything else stays hardcoded on purpose. The scan tool versions, the
+# Semgrep rule packs, Trivy's scanner set, the three SARIF categories, the
+# report-only `continue-on-error` posture and the SHA pins are all invariants
+# of "how this estate scans a repo". Parameterizing a thing that does not
+# vary is precisely how `code-review.yml`'s three copies drifted 554 lines
+# apart before they were converged.
+#
+# NOT an input, and it cannot be one: THE CRON. GitHub Actions does not
+# execute `on.schedule` from a called workflow — triggers live on the caller,
+# always. Each thin caller therefore keeps its own staggered `on.schedule`
+# plus `workflow_dispatch: {}`. That matches how the two sibling workflows
+# already work (their callers own their triggers and concurrency too), so it
+# is the house pattern rather than a limitation worked around.
+#
+# NOT an input either: `concurrency`. A weekly cron on one repo has nothing
+# to serialize against, and the 61 standalone copies declared none. A caller
+# that wants one declares its own.
+#
+# ── runs_on: SELF-HOSTED BY DEFAULT, AND WHY THAT IS SAFE HERE ────────────
+# Default `'["self-hosted","aw-baremetal"]'`, because all 61 existing copies
+# target it and the staggered weekly cron exists specifically to keep them
+# from hammering those shared runners at once.
+#
+# That default is the OPPOSITE of `ai-review-reusable.yml`'s hardcoded
+# `ubuntu-latest`, and the difference is load-bearing rather than
+# inconsistent. That file has an open `pull_request` trigger, so on a public
+# caller anyone can open a fork PR, and a fork PR on `[self-hosted,
+# aw-baremetal]` is arbitrary code execution on the bare-metal host that runs
+# the whole workspace. THIS file is reachable only from `schedule` and
+# `workflow_dispatch`, which can run nothing but trusted default-branch code
+# — no untrusted contributor input ever reaches it. The checkout here is of
+# the caller's own default branch, not of a PR head.
+#
+#   THEREFORE: A CALLER MUST NEVER ADD A `pull_request` OR
+#   `pull_request_target` TRIGGER TO ITS THIN CALLER. Doing so converts the
+#   self-hosted default into exactly the RCE path the sibling workflow
+#   refuses to accept. A caller that genuinely needs scanning on PRs must
+#   pass `runs_on: '"ubuntu-latest"'` in the same change. This file's own
+#   `on:` block declares `workflow_call` and nothing else, and
+#   `test_the_reusable_declares_only_workflow_call` asserts that it stays
+#   that way.
+#
+# `runs_on` is an input at all because a personal-account caller may not be
+# able to reach those runners. The `[self-hosted, aw-baremetal]` label is
+# served two different ways in this estate, and only one of them is portable:
+#   - `tekflox/*` repos reach the ORG runner group `aw-private` (the 4 shared
+#     `aw-baremetal-tekflox*` runners).
+#   - some `fredericowu/*` repos have their OWN repo-level runner
+#     (`aw-baremetal-aw-backend` and friends, group `Default`).
+# An org runner group cannot be shared outside its org, so a personal-account
+# repo with no dedicated runner of its own would QUEUE FOREVER rather than
+# fail — a silent hang, not an error. That is the live fact behind both the
+# `aw-app-template` owner-conditional variant and `aw-app-uc-phd`'s
+# `ubuntu-latest`. Such a caller passes `runs_on: '"ubuntu-latest"'`.
+#
+# Consumed as `fromJSON(inputs.runs_on)`, the same mechanism as
+# `code-review-reusable.yml`'s own `runs_on`: a JSON string
+# (`'"ubuntu-latest"'`) or a JSON array (`'["self-hosted","aw-baremetal"]'`)
+# both work.
+#
+# ── sarif_upload: LOAD-BEARING ON PRIVATE REPOS ───────────────────────────
+# GitHub refuses a code-scanning SARIF upload on a repo without Advanced
+# Security. Measured live on 2026-11-05 across this canary set: "Advanced
+# Security must be enabled for this repository to use code scanning" on
+# `tekflox/aw-stack`, and "Code scanning is not enabled for this repository"
+# on `fredericowu/aw-backend`, `aw-console` and `aw-tekflox`. Four of five
+# canary repos, all private. With `sarif_upload: false` the three
+# `upload-sarif` steps are skipped and the scans still run.
+#
+# WHEN `true`, A FAILED UPLOAD STAYS RED. The upload steps deliberately carry
+# NO `continue-on-error`: on a repo that is supposed to be feeding its
+# Security tab, an upload that silently stops working is a reporting pipeline
+# that looks healthy and reports nothing. `aw-app-research-search` solved the
+# private-repo case by making the upload best-effort instead, which also
+# swallows a genuine regression on the repos where upload is the whole point.
+# An explicit per-caller boolean says which repo is which, and keeps the
+# failure loud everywhere else. Asserted by
+# `test_the_sarif_upload_steps_are_never_best_effort`.
+#
+# ── ONE DELIBERATE ADDITION VS THE 61 COPIES ──────────────────────────────
+# The three `.sarif` files are ALSO always uploaded as run artifacts
+# (`actions/upload-artifact`, `if: always()`). This is the only behaviour
+# this file adds, and it exists because of the input above: a private caller
+# with `sarif_upload: false` would otherwise run three scans and keep none of
+# their findings anywhere a human could read them. With the artifact, every
+# caller gets inspectable output regardless of its Advanced Security status —
+# which is also what makes a canary verifiable on a private repo, where
+# `code-scanning/analyses` returns nothing by definition.
+#
+# `if: always()` and `if-no-files-found: warn` together: a scan step that
+# crashed before writing its SARIF must not then fail the artifact step on
+# top of it, and a missing report is already visible as the scan step's own
+# red `continue-on-error` entry.
+#
+# ── PINNING: EXACT TAGS ONLY ──────────────────────────────────────────────
+# Callers MUST pin an exact, immutable tag (`@v1.6.0`), never `@master` and
+# never a moving major alias (`@v1`). This is not style. `app-release.yml` in
+# this estate is referenced via a moving `@master` ref from ~45 app repos,
+# and a single fail-loud edit there turned the entire marketplace red at
+# once. A tag is never retagged here; a change ships as a new tag and each
+# caller is bumped deliberately.
+#
+# The same rule applies INSIDE this file to third-party actions: every
+# `uses:` is pinned to a full 40-character commit SHA with the human version
+# in a trailing comment. Note `actions/upload-artifact`'s pin below is an
+# older v7 commit than the v7 tag currently points at — which is the point of
+# pinning, and matches the 7 other places this estate already pins it.
+# Asserted by `test_every_action_is_sha_pinned`.
+#
+# ── NO SECRETS ────────────────────────────────────────────────────────────
+# There is deliberately no `secrets:` block: the scan needs nothing but the
+# automatic `GITHUB_TOKEN`, used solely to upload SARIF. Nothing here calls
+# the Agents Platform, so none of the `AW_*` credentials the two sibling
+# workflows declare are relevant — and not declaring them is what keeps a
+# scheduled job on a self-hosted runner from having a credential it has no
+# use for.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: >-
+          JSON-encoded `runs-on` value, consumed as
+          `fromJSON(inputs.runs_on)`. A JSON array
+          (["self-hosted","aw-baremetal"]) or a JSON string ("ubuntu-latest")
+          both work. Defaults to the self-hosted bare-metal pair every
+          existing copy of this scan targets; pass '"ubuntu-latest"' from a
+          caller that cannot reach those runners (see this file's header —
+          a personal-account repo with no dedicated runner queues forever
+          rather than failing).
+        required: false
+        type: string
+        default: '["self-hosted","aw-baremetal"]'
+      sarif_upload:
+        description: >-
+          Upload each scan's SARIF to the caller's Security > Code scanning
+          tab. Set FALSE on a repo without GitHub Advanced Security — the
+          upload API refuses those outright ("Advanced Security must be
+          enabled" / "Code scanning is not enabled") and the job would fail
+          on a working scan. The scans themselves, and the SARIF run
+          artifacts, are unaffected either way.
+        required: false
+        type: boolean
+        default: true
+
+# Declared here AND on the caller's calling job. For a reusable workflow the
+# effective GITHUB_TOKEN permissions are the INTERSECTION of the two, so both
+# sides state the same set: this file documents what the scan actually needs,
+# and the caller's copy is what lifts a repo whose default workflow
+# permissions are read-only.
+#
+# BOTH SIDES. That is not a stylistic preference, it is the whole mechanism,
+# and `code-review-reusable.yml`'s v1.1.1 got it wrong by updating only the
+# callers. Once a `permissions:` key names ANY scope, every scope it does not
+# name is forced to `none` (GitHub docs, `permissions`: "If you specify the
+# access for any of these permissions, all of those that are not specified
+# are set to `none`"). So an omission here is not "inherit from the caller",
+# it is an explicit `none`, and it silently caps every caller to zero no
+# matter what they grant. A caller-side grant alone buys nothing.
+#
+# `security-events: write` is the one that matters here: without it on BOTH
+# sides, every `upload-sarif` step 403s on a caller that does have Advanced
+# Security — which looks exactly like the no-GHAS failure `sarif_upload`
+# exists for, and sends you to flip the wrong switch. Guarded by
+# `test_the_reusable_requests_every_scope_the_caller_checklist_demands`.
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  semgrep:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: Install Semgrep
+        run: pip install semgrep
+      - name: Run Semgrep (SAST)
+        continue-on-error: true
+        run: |
+          semgrep scan --config p/security-audit --config p/owasp-top-ten \
+            --sarif --output semgrep.sarif .
+      - name: Upload SARIF
+        if: always() && inputs.sarif_upload
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+      # Always retained, independently of the upload above — see the
+      # "ONE DELIBERATE ADDITION" note in this file's header.
+      - name: Retain SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          if-no-files-found: warn
+
+  trivy:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Run Trivy (SCA + secrets + IaC/Dockerfile misconfig)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy.sarif
+      - name: Upload SARIF
+        if: always() && inputs.sarif_upload
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+      - name: Retain SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trivy-sarif
+          path: trivy.sarif
+          if-no-files-found: warn
+
+  gitleaks:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history: this job's whole point is scanning commits that are
+          # no longer in the working tree. A shallow clone silently reduces
+          # it to a worse duplicate of Trivy's secret scanner.
+          fetch-depth: 0
+      - name: Install Gitleaks
+        # Deliberately the OSS CLI, not gitleaks/gitleaks-action — that
+        # wrapper requires a paid license for org-owned repos (tekflox is an
+        # org). Redundant by design with Trivy's own secret scanner: each
+        # tool catches different patterns, and this one covers full git
+        # history, not just the working tree.
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) GL_ARCH=x64 ;;
+            aarch64) GL_ARCH=arm64 ;;
+            *) GL_ARCH="$ARCH" ;;
+          esac
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_${GL_ARCH}.tar.gz" \
+            | tar -xz gitleaks
+      - name: Run Gitleaks (secrets in git history)
+        # gitleaks exits 1 on a finding by design; swallow it so the
+        # Annotations panel doesn't show a red "failure" for this
+        # report-only scan. The SARIF file is already written by then.
+        run: ./gitleaks detect --source . --report-format sarif --report-path gitleaks.sarif -v || true
+      - name: Upload SARIF
+        if: always() && inputs.sarif_upload
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+      - name: Retain SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          if-no-files-found: warn
+
+# ── CALLER CHECKLIST ──────────────────────────────────────────────────────
+# A whole thin caller, which is the entire file a consumer repo needs:
+#
+#     name: Security scan
+#
+#     on:
+#       schedule:
+#         - cron: "11 0 * * 1"
+#       workflow_dispatch: {}
+#
+#     jobs:
+#       security-scan:
+#         uses: fredericowu/aw-shared-workflows/.github/workflows/security-scan-reusable.yml@v1.6.0
+#         permissions:
+#           contents: read
+#           security-events: write
+#
+# THE TRIGGERS ARE THE CALLER'S, AND THEY HAVE TO BE. GitHub Actions does not
+# execute `on.schedule` from a called workflow, so a cron here would never
+# fire — it is not a stylistic choice and there is no input that can replace
+# it. `workflow_dispatch: {}` is what makes a caller verifiable on demand
+# (`gh workflow run "Security scan" --repo <owner>/<repo>`), which is how
+# every rollout of this has been checked.
+#
+# PICK AN UNUSED CRON SLOT. The cron above is an example, not a default to
+# copy: these jobs are staggered specifically so 60+ repos don't hammer the 4
+# shared self-hosted runners at once, and 8 repos already collide on
+# "45 2 * * 3" from a rollout that copy-pasted one. Check before choosing:
+#     grep -h 'cron:' repos/*/.github/workflows/security-scan.yml | sort | uniq -c
+# Hour 0 UTC was entirely unused across all 61 copies as of 2026-11-05.
+#
+# NEVER ADD A `pull_request` OR `pull_request_target` TRIGGER. The default
+# `runs_on` is self-hosted bare metal, and this workflow is safe there only
+# because `schedule`/`workflow_dispatch` can run nothing but trusted
+# default-branch code. A fork PR on that runner is arbitrary code execution
+# on the host running the whole workspace. If a caller genuinely needs
+# PR-time scanning, it must pass `runs_on: '"ubuntu-latest"'` in the same
+# change. See this file's header, and `ai-review-reusable.yml`'s own
+# runs-on block for the same reasoning from the other direction.
+#
+# In the caller's `uses:` job, REQUIRED — both:
+#     permissions:
+#       contents: read
+#       security-events: write
+#
+# A caller grant is NECESSARY BUT NOT SUFFICIENT: the effective token is the
+# intersection of the caller's block and THIS FILE's own top-level
+# `permissions:`, and an unlisted scope there means `none`, not "inherit". So
+# a scope has to appear in BOTH, and the two lists must stay identical — the
+# test `test_the_reusable_requests_every_scope_the_caller_checklist_demands`
+# parses this checklist and that block and fails on any divergence in either
+# direction, because `code-review-reusable.yml`'s v1.1.1 shipped exactly that
+# divergence and capped every caller to zero.
+#
+# `security-events: write` is still required on a caller passing
+# `sarif_upload: false`, and is listed unconditionally above on purpose: the
+# flag is per-caller configuration that a repo flips the day it gets Advanced
+# Security, and a permissions block that has to be edited at the same moment
+# is a second step someone will miss.
+#
+# ON A PRIVATE REPO, PASS `sarif_upload: false`:
+#
+#       jobs:
+#         security-scan:
+#           uses: fredericowu/aw-shared-workflows/.github/workflows/security-scan-reusable.yml@v1.6.0
+#           permissions:
+#             contents: read
+#             security-events: write
+#           with:
+#             sarif_upload: false
+#
+# GitHub refuses the code-scanning upload without Advanced Security, so a
+# true-by-default caller on such a repo fails on a scan that worked. Check
+# which case a repo is in before rolling out, rather than after:
+#     gh api repos/<owner>/<repo>/code-scanning/analyses --jq 'length'
+# A 403/404 naming Advanced Security or "not enabled" means `false`. The
+# findings are still retained as run artifacts either way:
+#     gh run view <run-id> --repo <owner>/<repo> --json artifacts
+#
+# Per consumer repo, once: nothing else. No secrets, no labels, no repo
+# variables, no `.pr_agent.toml`. The scan uses only the automatic
+# GITHUB_TOKEN.

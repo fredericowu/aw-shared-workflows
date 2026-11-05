@@ -9,20 +9,22 @@ repos. One file, several callers, no copy-paste drift.
 |---|---|
 | `.github/workflows/code-review-reusable.yml` | The Dev Team's two-round PR review → merge loop (`workflow_call`). |
 | `.github/workflows/ai-review-reusable.yml` | PR-Agent's advisory AI review, status `devteam/ai-review` (`workflow_call`). |
+| `.github/workflows/security-scan-reusable.yml` | Weekly Semgrep + Trivy + Gitleaks scan, SARIF to code scanning (`workflow_call`). |
 | `.github/workflows/test.yml` | This repo's own CI — runs `tests/`. |
 
-The two review workflows are independent and a repo can run either or both.
-They share **one `v*` tag line** rather than having a family each — the
+The three workflows are independent and a repo can run any combination of
+them. They share **one `v*` tag line** rather than having a family each — the
 ruleset that makes tags immutable targets `refs/tags/v*` only, so a separate
-`ai-v*` family would be unprotected. The cost is that a fix to one workflow
-cuts a tag the other's callers simply don't have to bump.
+`ai-v*` or `sec-v*` family would be unprotected. The cost is that a fix to one
+workflow cuts a tag the others' callers simply don't have to bump.
 
-`tests/test_code_review_workflow_logic.py` and
-`tests/test_ai_review_workflow_logic.py` extract the reusable workflows'
+`tests/test_code_review_workflow_logic.py`,
+`tests/test_ai_review_workflow_logic.py` and
+`tests/test_security_scan_workflow_logic.py` extract the reusable workflows'
 embedded step scripts by text-scanning them and execute them, so they assert
 against the bytes CI actually runs. The first moved here from
 `tekflox/aw-app-template` along with the logic it guards. **Run them before
-tagging** — `python -m pytest tests/ -q` (112 tests).
+tagging** — `python -m pytest tests/ -q` (157 tests).
 
 ## Pin an exact tag. Never a moving ref.
 
@@ -467,6 +469,140 @@ or `/improve` — **always runs the default-branch copy**, so such a PR cannot
 exercise its own comment path. Verify that on the next PR after merge rather
 than burning time debugging it.
 
+## `security-scan-reusable.yml`
+
+Free SAST + SCA + secrets scanning as a no-cost alternative to Veracode:
+three independent jobs (Semgrep, Trivy, Gitleaks), each uploading its own
+SARIF under its own category. **Report-only** — every scan step is
+`continue-on-error` and the gitleaks run swallows its own exit 1, so a finding
+never fails the build. It is not a merge gate and must not become one without
+a deliberate decision: a repo-wide gate that reddens 61 repos at once is the
+failure mode `app-release.yml` already taught this estate.
+
+A whole thin caller — this is the entire file a consumer repo needs:
+
+```yaml
+name: Security scan
+
+on:
+  schedule:
+    - cron: "11 0 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  security-scan:
+    uses: fredericowu/aw-shared-workflows/.github/workflows/security-scan-reusable.yml@v1.6.0
+    permissions:
+      contents: read
+      security-events: write
+```
+
+**The cron lives in the caller and cannot be an input.** GitHub Actions does
+not execute `on.schedule` from a called workflow — triggers always belong to
+the caller, so a schedule in the shared file would simply never fire. Each
+caller therefore keeps its own staggered slot plus `workflow_dispatch: {}`,
+which is also what makes a rollout verifiable on demand
+(`gh workflow run "Security scan" --repo <owner>/<repo>`).
+
+**Pick an unused slot.** The stagger exists so 60+ repos don't hammer the 4
+shared self-hosted runners at once, and 8 repos already collide on
+`"45 2 * * 3"` from a rollout that copy-pasted one. Check first:
+
+```bash
+grep -h 'cron:' repos/*/.github/workflows/security-scan.yml | sort | uniq -c
+```
+
+Hour 0 UTC was entirely unused across all 61 copies as of 2026-11-05.
+
+### Inputs
+
+| Input | Required | Default | Notes |
+|---|---|---|---|
+| `runs_on` | no | `'["self-hosted","aw-baremetal"]'` | JSON-encoded `runs-on`, consumed as `fromJSON(...)`. Pass `'"ubuntu-latest"'` from a caller that cannot reach those runners — see below, it **queues forever** rather than failing. |
+| `sarif_upload` | no | `true` | Set **false** on a repo without GitHub Advanced Security: the code-scanning upload API refuses those outright, so the job would fail on a scan that worked. |
+
+Everything else is hardcoded: the tool versions, Semgrep's rule packs,
+Trivy's scanner set, the three categories and the report-only posture. They
+do not vary per repo, and parameterizing a thing that does not vary is how
+`code-review.yml`'s three copies drifted 554 lines apart.
+
+### `runs_on` defaults to self-hosted — the opposite of `ai-review-reusable.yml`
+
+That difference is load-bearing, not an inconsistency. The AI review has an
+open `pull_request` trigger, so a fork PR on `[self-hosted, aw-baremetal]`
+would be arbitrary code execution on the bare-metal host. This workflow
+declares **only `workflow_call`** and is reachable just from the caller's
+`schedule`/`workflow_dispatch`, which can run nothing but trusted
+default-branch code.
+
+> **A caller must never add a `pull_request` or `pull_request_target`
+> trigger.** Doing so converts the self-hosted default into exactly that RCE
+> path. A caller that genuinely needs PR-time scanning must pass
+> `runs_on: '"ubuntu-latest"'` in the same change.
+> `test_the_reusable_declares_only_workflow_call` asserts this file's half.
+
+`runs_on` is an input at all because the `aw-baremetal` label is served two
+different ways here, and only one is portable: `tekflox/*` repos reach the org
+runner group `aw-private` (4 shared runners), while some `fredericowu/*` repos
+have their **own** repo-level runner. An org runner group cannot be shared
+outside its org, so a personal-account repo with neither would **queue
+forever rather than fail** — a silent hang. That is the live fact behind the
+`aw-app-template` owner-conditional variant and `aw-app-uc-phd`'s
+`ubuntu-latest`.
+
+### `sarif_upload`, and why a failed upload stays red
+
+Measured live on 2026-11-05: `tekflox/aw-stack` returns "Advanced Security
+must be enabled for this repository to use code scanning", and
+`fredericowu/aw-backend`, `aw-console` and `aw-tekflox` return "Code scanning
+is not enabled for this repository" — 4 of the 5 canary repos, all private.
+With `sarif_upload: false` the three `upload-sarif` steps are skipped and the
+scans still run.
+
+When it is `true`, the upload steps carry **no `continue-on-error`** on
+purpose. On a repo that is supposed to be feeding its Security tab, an upload
+that silently stops working is a reporting pipeline that looks healthy and
+reports nothing. `aw-app-research-search`'s variant made the upload
+best-effort instead, which also swallows a genuine regression on the repos
+where upload is the whole point. An explicit per-caller boolean says which
+repo is which. Check which case a repo is in *before* rolling out:
+
+```bash
+gh api repos/<owner>/<repo>/code-scanning/analyses --jq 'length'
+```
+
+### The one behaviour added vs the 61 standalone copies
+
+All three `.sarif` files are **also** uploaded as run artifacts
+(`if: always()`). A private caller with `sarif_upload: false` would otherwise
+run three scans and keep none of their findings anywhere readable. It is also
+what makes a canary verifiable on a private repo, where
+`code-scanning/analyses` returns nothing by definition:
+
+```bash
+gh run view <run-id> --repo <owner>/<repo> --json artifacts
+```
+
+### Permissions
+
+Both lines are required **on both sides**, for the same intersection reason as
+the two workflows above — `security-events: write` missing on *either* side
+403s every upload on a repo that *does* have Advanced Security, which looks
+exactly like the no-GHAS failure `sarif_upload` exists for and sends you to
+flip the wrong switch. The checklist lists both scopes even for a
+`sarif_upload: false` caller, deliberately: the flag is configuration a repo
+flips the day it gets Advanced Security, and a permissions block needing the
+same edit is a second step someone will miss.
+
+### What the caller still owns
+
+- **The triggers** — cron slot and `workflow_dispatch`, per above. Not
+  optional and not replaceable by an input.
+- **`concurrency`** — none needed. A weekly cron has nothing to serialize
+  against and the 61 standalone copies declared none.
+- **Nothing else.** No secrets, no labels, no repo variables. The scan uses
+  only the automatic `GITHUB_TOKEN`.
+
 ## Provenance
 
 Extracted from `fredericowu/agents-platform-multitenant@2aab9cd5`'s
@@ -481,6 +617,22 @@ match the originals used would have had the merge gate waiting on itself).
 Every design comment in that file was kept. Read it before changing anything
 here; most of what looks redundant is load-bearing and has a live incident
 behind it.
+
+`security-scan-reusable.yml` was extracted from the 97-line standalone
+`security-scan.yml` rolled out to **61 repos** in September 2026
+(`tekflox/aw-app-weather`'s copy is the representative one). Semantics are
+unchanged — same three jobs, same SHA pins, same report-only posture, every
+inline rationale carried across with the step it explains. Two things are
+new: the `sarif_upload` input, and the SARIF run artifacts.
+
+Those 61 copies were **not** identical when this was extracted, which is the
+whole argument for converging them. Five distinct variants existed: 52 on the
+canonical file, 6 (including `aw-app-template`) deriving `runs-on` from the
+repo owner, `aw-app-uc-phd` hardcoding `ubuntu-latest`,
+`aw-app-knowledgeable` with most design comments dropped, and
+`aw-app-research-search` with a best-effort upload plus retained artifact. The
+first three are all the same underlying runner-reachability fact, and they are
+why `runs_on` is an input.
 
 `ai-review-reusable.yml` was extracted from `tekflox/aw-app-template`'s
 standalone `.github/workflows/ai-review.yml`, the only copy that existed —
