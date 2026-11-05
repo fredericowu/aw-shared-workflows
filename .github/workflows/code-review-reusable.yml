@@ -998,6 +998,207 @@ jobs:
           PYEOF
 
   # ---------------------------------------------------------------------------
+  # PROVENANCE: every Dev Team PR must carry which agent run created it,
+  # enforced at a layer no coder can forget or skip (Architect design on
+  # Kanban card 40f5bf3b-9510-8174-be1c-c69bdc2676ba). A `prepare-commit-msg`
+  # hook stamps an `AW-Run-Id` trailer on every commit a runner container
+  # makes (separate card, agents-platform-runners repo); this job is the
+  # unskippable half. It fails the PR unless at least one commit actually
+  # carries one, and on success records the ids durably on the PR itself —
+  # a multi-commit squash-merge can drop commit bodies depending on repo
+  # settings, so the merge commit message is NOT relied on.
+  #
+  # Gated like `code-review` is — `needs.gate.outputs.allowed == 'true'` —
+  # same precondition: a fork PR, an untrusted author, or a non-round-2
+  # synchronize never reaches either job.
+  #
+  # Modelled on `devteam/merge-eligible`, not on raw check-run pass/fail:
+  # this job's own name is in `merge-attempt`'s ADVISORY set below (like
+  # every other job this file defines), so a transient failure here doesn't
+  # get re-litigated through the generic "any non-advisory check failing
+  # blocks" scan that exists for the CALLER's own CI. The actual gate is the
+  # explicit `devteam/provenance` commit status, written ONLY on success and
+  # read LIVE by `merge-attempt` — durable across workflow runs, which a
+  # `needs.<job>.outputs` read is not (entry point (b) below shares no job
+  # graph with the run that set it).
+  # ---------------------------------------------------------------------------
+  provenance-gate:
+    needs: gate
+    if: needs.gate.outputs.allowed == 'true'
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 10
+    steps:
+      - name: Check for a stamped AW-Run-Id trailer and record it on the PR
+        id: provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.gate.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 <<'PYEOF'
+          import json, os, re, subprocess, sys
+
+          REPO = os.environ["REPO"]
+          PR_NUMBER = os.environ["PR_NUMBER"]
+          SHA = os.environ["HEAD_SHA"]
+
+          def api(path, *, paginate=False):
+              cmd = ["gh", "api", path]
+              if paginate:
+                  cmd.append("--paginate")
+              out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+              if out.returncode != 0:
+                  print(f"::error::gh api {path} failed: {out.stderr[:300]}")
+                  sys.exit(1)
+              return json.loads(out.stdout or "null")
+
+          def publish_cleared(description):
+              subprocess.run(
+                  ["gh", "api", "-X", "POST", f"repos/{REPO}/statuses/{SHA}",
+                   "-f", "state=success",
+                   "-f", "context=devteam/provenance",
+                   "-f", f"description={description}",
+                   "-f", f"target_url={os.environ.get('RUN_URL', '')}",
+                   "--silent"],
+                  check=True,
+              )
+              print(f"devteam/provenance -> success on {SHA[:7]} ({description})")
+
+          # ---- the escape hatch, checked FIRST ----
+          # Every PR in this rollout shares the `fredericowu` author identity
+          # (agent and human both push as the same GitHub user), so an
+          # author allowlist cannot tell a human PR from an agent one — a
+          # label a human applies by hand is the only exemption that cannot
+          # be spoofed by the thing it is meant to catch. Agent contracts
+          # forbid applying this label themselves; the threat model here is
+          # omission (a coder that forgot/lost the hook), not an adversarial
+          # agent faking its way past review.
+          labels = api(f"repos/{REPO}/issues/{PR_NUMBER}/labels")
+          if any(l.get("name") == "provenance-exempt" for l in (labels or [])):
+              publish_cleared("provenance-exempt label applied by a human")
+              sys.exit(0)
+
+          # ---- zero commits: nothing to check, and nothing to merge either ----
+          # A draft/empty PR has no commit to carry a trailer yet. Failing it
+          # here would just be a red check on a PR that was never mergeable
+          # from this state anyway (the draft guard in merge-attempt already
+          # withholds it) — `devteam/provenance` is simply never published,
+          # the same "absence is the negative, not an error" shape as
+          # `devteam/merge-eligible`.
+          commits = api(f"repos/{REPO}/pulls/{PR_NUMBER}/commits", paginate=True)
+          if not commits:
+              print(f"PR #{PR_NUMBER} has zero commits — nothing to check")
+              sys.exit(0)
+
+          TRAILER_RE = re.compile(r"^AW-Run-Id:\s*([0-9a-f]{32})\s*$", re.MULTILINE)
+          SESSION_RE = re.compile(r"^AW-Session-Id:\s*(\S+)\s*$", re.MULTILINE)
+          CARD_RE = re.compile(r"^AW-Card:\s*(\S+)\s*$", re.MULTILINE)
+
+          def first_match(regex, message):
+              m = regex.search(message)
+              return m.group(1) if m else None
+
+          # Newest commit first: the provenance footer should reflect this
+          # PR's most recent work, so a later push's trailer wins over an
+          # earlier one even if both happen to carry one.
+          found = None
+          for commit in reversed(commits):
+              message = (commit.get("commit") or {}).get("message") or ""
+              run_id = first_match(TRAILER_RE, message)
+              if run_id:
+                  found = {
+                      "run_id": run_id,
+                      "session_id": first_match(SESSION_RE, message) or "",
+                      "card_id": first_match(CARD_RE, message) or "",
+                      "commit_sha": commit.get("sha", "")[:7],
+                  }
+                  break
+
+          if found is None:
+              print(f"::error::no commit on PR #{PR_NUMBER} carries a well-formed "
+                    f"AW-Run-Id trailer ({len(commits)} commit(s) checked). Every "
+                    f"Dev Team PR must carry which agent run created it — see the "
+                    f"aw-agent-coder contract. A human opening this PR by hand "
+                    f"should apply the `provenance-exempt` label instead of faking "
+                    f"a trailer.")
+              sys.exit(1)
+
+          print(f"provenance OK: AW-Run-Id {found['run_id']} on {found['commit_sha']} "
+                f"(session={found['session_id'] or '-'} card={found['card_id'] or '-'})")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh_out:
+              for k, v in found.items():
+                  gh_out.write(f"{k}={v}\n")
+          publish_cleared(f"AW-Run-Id {found['run_id'][:12]}… verified")
+          PYEOF
+
+      - name: Record the provenance footer on the PR body and a sticky comment
+        if: steps.provenance.outputs.run_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          RUN_ID: ${{ steps.provenance.outputs.run_id }}
+          SESSION_ID: ${{ steps.provenance.outputs.session_id }}
+          CARD_ID: ${{ steps.provenance.outputs.card_id }}
+        run: |
+          set -euo pipefail
+          python3 <<'PYEOF'
+          import json, os, re, subprocess, sys
+
+          REPO = os.environ["REPO"]
+          PR_NUMBER = os.environ["PR_NUMBER"]
+          # Markers, not a fixed byte range: idempotent on every round (round
+          # 1, round 2, a later /aw-review) rather than appending a new
+          # footer each time. This is the durable record a squash-merge can
+          # drop the commit body of — see the header note on this job.
+          START = "<!-- devteam:provenance:start -->"
+          END = "<!-- devteam:provenance:end -->"
+
+          lines = [f"**Run:** `{os.environ['RUN_ID']}`"]
+          if os.environ.get("SESSION_ID"):
+              lines.append(f"**Session:** `{os.environ['SESSION_ID']}`")
+          if os.environ.get("CARD_ID"):
+              lines.append(f"**Card:** `{os.environ['CARD_ID']}`")
+          footer = (
+              f"{START}\n---\n\U0001F9FE **Provenance** — this PR carries the "
+              f"agent run that created it, stamped by a `prepare-commit-msg` "
+              f"hook (survives a squash-merge that drops commit bodies).\n\n"
+              + "\n".join(lines) + f"\n{END}"
+          )
+
+          def gh(*args):
+              out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
+              if out.returncode != 0:
+                  print(f"::error::gh {' '.join(args)} failed: {out.stderr[:300]}")
+                  sys.exit(1)
+              return out.stdout
+
+          # ---- PR body: idempotent replace between markers ----
+          pr = json.loads(gh("api", f"repos/{REPO}/pulls/{PR_NUMBER}"))
+          body = pr.get("body") or ""
+          if START in body and END in body:
+              body = re.sub(re.escape(START) + r".*?" + re.escape(END), footer,
+                             body, flags=re.S)
+          else:
+              body = body.rstrip() + "\n\n" + footer
+          gh("api", "-X", "PATCH", f"repos/{REPO}/pulls/{PR_NUMBER}", "-f", f"body={body}")
+
+          # ---- sticky comment: find-and-update, or create ----
+          comments = json.loads(gh("api", f"repos/{REPO}/issues/{PR_NUMBER}/comments",
+                                    "--paginate"))
+          existing = next((c for c in comments if START in (c.get("body") or "")), None)
+          if existing:
+              gh("api", "-X", "PATCH", f"repos/{REPO}/issues/comments/{existing['id']}",
+                 "-f", f"body={footer}")
+          else:
+              gh("api", f"repos/{REPO}/issues/{PR_NUMBER}/comments", "-f", f"body={footer}")
+          print("provenance footer recorded on the PR body and a sticky comment")
+          PYEOF
+
+  # ---------------------------------------------------------------------------
   # THE MERGE. One script, two entry points, no polling.
   #
   #   (a) same run — `needs: [gate, code-review]`, taken when the review just
@@ -1023,7 +1224,16 @@ jobs:
   # the verdict that cannot be stale.
   # ---------------------------------------------------------------------------
   merge-attempt:
-    needs: [gate, code-review]
+    # `provenance-gate` added so entry point (a) WAITS for it to post its own
+    # check-run before the live `gh pr checks` read below — without this, a
+    # same-run merge attempt can race it and see its own job as "pending",
+    # which is the identical self-referential trap `merge-attempt`'s own name
+    # is in ADVISORY to avoid (see that set's comment). It does not change
+    # whether a provenance failure BLOCKS the merge — that is the explicit
+    # `devteam/provenance` status read below, for the same reason
+    # `devteam/merge-eligible` is a status and not a `needs` check: entry
+    # point (b) shares no job graph with the run that set it.
+    needs: [gate, code-review, provenance-gate]
     if: >-
       always() &&
       (
@@ -1068,6 +1278,13 @@ jobs:
           # failure-state counterpart to read.
           ELIGIBLE_CONTEXT = "devteam/merge-eligible"
 
+          # Same shape, written by `provenance-gate` only when a commit on
+          # this SHA carries a well-formed `AW-Run-Id` trailer (or a human
+          # applied `provenance-exempt`). Read live rather than through
+          # `needs.provenance-gate` for the same reason eligibility is: entry
+          # point (b) below shares no job graph with the run that set it.
+          PROVENANCE_CONTEXT = "devteam/provenance"
+
           # Pinned BY NAME to the caller's own CI job, via the required
           # `ci_check_name` input (`coverage` on aw-app-template, `pytest` on
           # AP-MT, `unit` on aw-workspace core, `Validate compose config` on
@@ -1100,10 +1317,16 @@ jobs:
           # reviewing, which without this entry would stall every merge on
           # such a repo. Only aw-app-template has it installed today; the
           # other callers pay nothing for the entry.
+          # `devteam/provenance` / `provenance-gate` are here for the exact
+          # same reason `devteam/merge-eligible` / `code-review` are: this
+          # file's own jobs never gate the merge through their raw
+          # check-run pass/fail, only through an explicit status it writes
+          # on success. See `PROVENANCE_CONTEXT` below.
           ADVISORY = {"devteam/ai-review", "devteam/code-review",
-                      "devteam/merge-eligible", "ai-review", "code-review",
-                      "merge-eligible", "gate", "fork-notice", "merged-event",
-                      "merge-attempt", "CodeRabbit"}
+                      "devteam/merge-eligible", "devteam/provenance",
+                      "ai-review", "code-review", "merge-eligible",
+                      "provenance-gate", "gate", "fork-notice",
+                      "merged-event", "merge-attempt", "CodeRabbit"}
 
           # As a REUSABLE workflow, this file's jobs are reported to `gh pr
           # checks` as "<caller job id> / <job id>" — e.g. "review /
@@ -1234,12 +1457,21 @@ jobs:
               print(f"::error::could not read commit statuses on {live_sha[:7]}; "
                     f"refusing to merge")
               sys.exit(1)
+          statuses = combined.get("statuses") or []
           cleared = any(s.get("context") == ELIGIBLE_CONTEXT
                         and s.get("state") == "success"
-                        for s in (combined.get("statuses") or []))
+                        for s in statuses)
           if not cleared:
               neutral(f"{ELIGIBLE_CONTEXT} is not success on {live_sha[:7]} — the "
                       f"review has not cleared this head for merge")
+
+          provenance_cleared = any(s.get("context") == PROVENANCE_CONTEXT
+                                    and s.get("state") == "success"
+                                    for s in statuses)
+          if not provenance_cleared:
+              neutral(f"{PROVENANCE_CONTEXT} is not success on {live_sha[:7]} — no "
+                      f"commit on this PR carries a verified AW-Run-Id trailer (or "
+                      f"the provenance-exempt label) — not merging")
 
           # ---- 4. the caller's own CI: ONE bounded read, no loop ----
           def checks():
@@ -1601,11 +1833,14 @@ jobs:
 # Per consumer repo, once:
 #   - secrets: AW_CODEREVIEW_V1_KEY (workspace-bound, scoped to
 #     code-reviewer-sonnet), AW_DEVTEAM_MERGE_TOKEN, AW_DEVTEAM_EVENT_SECRET
-#   - labels: devteam:awaiting-fixes (#FBCA04), devteam:needs-human (#B60205)
+#   - labels: devteam:awaiting-fixes (#FBCA04), devteam:needs-human (#B60205),
+#     provenance-exempt (#0E8A16) — human-applied only, see `provenance-gate`
 #       gh label create devteam:awaiting-fixes --color FBCA04 --repo <owner/repo> \
 #         --description "Round 1 found something; the coder is addressing it"
 #       gh label create devteam:needs-human --color B60205 --repo <owner/repo> \
 #         --description "Round 2 still blocking; a human must decide"
+#       gh label create provenance-exempt --color 0E8A16 --repo <owner/repo> \
+#         --description "Human-applied: skips provenance-gate. Never apply this yourself."
 #   - optional variable AW_REVIEW_TRUSTED_AUTHORS (comma-separated logins).
 #     Unset falls back to `fredericowu` in the gate's own code.
 #       gh variable set AW_REVIEW_TRUSTED_AUTHORS --body "fredericowu,other" \

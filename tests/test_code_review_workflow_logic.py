@@ -959,6 +959,299 @@ def test_the_timeout_guard_is_not_vacuous():
 
 
 # --------------------------------------------------------------------------
+# provenance-gate — the AW-Run-Id trailer check and its live status
+# --------------------------------------------------------------------------
+
+_PROVENANCE_STEP = "- name: Check for a stamped AW-Run-Id trailer and record it on the PR"
+
+
+@pytest.fixture(scope="module")
+def provenance_script(tmp_path_factory) -> Path:
+    src = _extract_heredoc(_PROVENANCE_STEP)
+    assert "AW-Run-Id" in src, "extracted the wrong block — no trailer check in it"
+    path = tmp_path_factory.mktemp("wf") / "provenance.py"
+    path.write_text(src)
+    return path
+
+
+@pytest.fixture(scope="module")
+def provenance_gh(tmp_path_factory) -> Path:
+    """A `gh` that answers labels/commits reads from `$FAKE_GH_DIR` fixtures
+    and records every call (including the `statuses` POST) to `calls.log`,
+    the same shape as `merge_gh` above."""
+    bin_dir = tmp_path_factory.mktemp("provbin")
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "args = sys.argv[1:]\n"
+        'd = os.environ["FAKE_GH_DIR"]\n'
+        'with open(os.path.join(d, "calls.log"), "a") as f:\n'
+        '    f.write(" ".join(args) + "\\n")\n'
+        'path = next((a for a in args[1:] if a.startswith("repos/")), "")\n'
+        "def emit(name):\n"
+        "    p = os.path.join(d, name)\n"
+        "    if not os.path.exists(p):\n"
+        "        print('gh: no fixture ' + name, file=sys.stderr)\n"
+        "        sys.exit(1)\n"
+        "    sys.stdout.write(open(p).read())\n"
+        "    sys.exit(0)\n"
+        "if args[:1] == ['api']:\n"
+        "    if path.endswith('/labels'):\n"
+        "        emit('labels.json')\n"
+        "    if path.endswith('/commits'):\n"
+        "        emit('commits.json')\n"
+        "    if '/statuses/' in path:\n"
+        "        sys.exit(0)\n"
+        "print('gh: unexpected call ' + repr(args), file=sys.stderr)\n"
+        "sys.exit(1)\n"
+    )
+    gh.chmod(0o755)
+    return bin_dir
+
+
+REAL_RUN_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+
+def _commit(message, sha="deadbee"):
+    return {"sha": sha, "commit": {"message": message}}
+
+
+def _run_provenance(
+    provenance_script, provenance_gh, tmp_path, *, labels=None, commits=None
+):
+    d = tmp_path / "ghfix"
+    d.mkdir(exist_ok=True)
+    for leftover in ("calls.log",):
+        if (d / leftover).exists():
+            (d / leftover).unlink()
+    (d / "labels.json").write_text(json.dumps(labels if labels is not None else []))
+    (d / "commits.json").write_text(json.dumps(commits if commits is not None else []))
+    out = tmp_path / "gh_output"
+    out.write_text("")
+    env = {
+        **os.environ,
+        "PATH": f"{provenance_gh}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_GH_DIR": str(d),
+        "GH_TOKEN": "fake",
+        "REPO": "tekflox/aw-app-template",
+        "PR_NUMBER": "42",
+        "HEAD_SHA": "b" * 40,
+        "RUN_URL": "https://example.invalid/run/1",
+        "GITHUB_OUTPUT": str(out),
+    }
+    proc = subprocess.run(
+        [sys.executable, str(provenance_script)], capture_output=True, text=True, env=env
+    )
+    outputs = dict(
+        line.split("=", 1) for line in out.read_text().splitlines() if "=" in line
+    )
+    calls = (d / "calls.log").read_text() if (d / "calls.log").exists() else ""
+    return proc, outputs, calls
+
+
+def test_a_well_formed_trailer_clears_the_gate(
+    provenance_script, provenance_gh, tmp_path
+):
+    proc, outputs, calls = _run_provenance(
+        provenance_script,
+        provenance_gh,
+        tmp_path,
+        commits=[_commit(f"fix: thing\n\nAW-Run-Id: {REAL_RUN_ID}\n"
+                          f"AW-Session-Id: sess-1\nAW-Card: card-1\n")],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert outputs["run_id"] == REAL_RUN_ID
+    assert outputs["session_id"] == "sess-1"
+    assert outputs["card_id"] == "card-1"
+    assert "devteam/provenance" in calls and "state=success" in calls
+
+
+def test_no_trailer_on_any_commit_fails_the_gate(
+    provenance_script, provenance_gh, tmp_path
+):
+    proc, outputs, calls = _run_provenance(
+        provenance_script,
+        provenance_gh,
+        tmp_path,
+        commits=[_commit("just a normal commit, no trailer")],
+    )
+    assert proc.returncode != 0
+    assert "no commit on PR" in proc.stdout
+    assert "run_id" not in outputs
+    assert "devteam/provenance" not in calls
+
+
+def test_a_malformed_run_id_does_not_count(provenance_script, provenance_gh, tmp_path):
+    """Not 32 hex characters — a human-typed look-alike, or a truncated
+    id — must not pass as a real stamp."""
+    proc, outputs, calls = _run_provenance(
+        provenance_script,
+        provenance_gh,
+        tmp_path,
+        commits=[_commit("AW-Run-Id: not-a-real-run-id\n")],
+    )
+    assert proc.returncode != 0
+    assert "run_id" not in outputs
+
+
+def test_the_provenance_exempt_label_skips_the_gate_without_reading_commits(
+    provenance_script, provenance_gh, tmp_path
+):
+    """The human escape hatch — checked BEFORE any commit is read, so it
+    works even on a PR whose commits the gate would otherwise reject."""
+    proc, outputs, calls = _run_provenance(
+        provenance_script,
+        provenance_gh,
+        tmp_path,
+        labels=[{"name": "provenance-exempt"}],
+        commits=[],  # irrelevant — the commits endpoint must never be called
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "devteam/provenance" in calls and "state=success" in calls
+    assert "repos/tekflox/aw-app-template/pulls/42/commits" not in calls
+
+
+def test_zero_commits_does_not_fail_the_gate(
+    provenance_script, provenance_gh, tmp_path
+):
+    """A draft/empty PR has nothing to stamp yet — this must exit clean, not
+    red, and must not publish `devteam/provenance` either (nothing to merge
+    from this state, the draft/empty guard belongs to merge-attempt)."""
+    proc, outputs, calls = _run_provenance(
+        provenance_script, provenance_gh, tmp_path, commits=[]
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "devteam/provenance" not in calls
+
+
+def test_the_newest_commit_with_a_trailer_wins(
+    provenance_script, provenance_gh, tmp_path
+):
+    """Two pushes, two runs: the later one's ids are what the PR should
+    carry, even though the earlier commit also has a (now-stale) trailer."""
+    older_id = "1" * 32
+    newer_id = "2" * 32
+    proc, outputs, calls = _run_provenance(
+        provenance_script,
+        provenance_gh,
+        tmp_path,
+        commits=[
+            _commit(f"AW-Run-Id: {older_id}\n", sha="aaaaaaa"),
+            _commit("no trailer here", sha="bbbbbbb"),
+            _commit(f"AW-Run-Id: {newer_id}\n", sha="ccccccc"),
+        ],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert outputs["run_id"] == newer_id
+
+
+# --------------------------------------------------------------------------
+# provenance-gate's footer step — idempotent PR body + sticky comment
+# --------------------------------------------------------------------------
+
+_FOOTER_STEP = "- name: Record the provenance footer on the PR body and a sticky comment"
+
+
+@pytest.fixture(scope="module")
+def footer_script(tmp_path_factory) -> Path:
+    src = _extract_heredoc(_FOOTER_STEP)
+    assert "devteam:provenance:start" in src, "extracted the wrong block"
+    path = tmp_path_factory.mktemp("wf") / "footer.py"
+    path.write_text(src)
+    return path
+
+
+@pytest.fixture(scope="module")
+def footer_gh(tmp_path_factory) -> Path:
+    """A stateful fake `gh` that plays PR body + comment store, so the same
+    tmp_path can drive this script twice and prove the SECOND call replaces
+    the first footer in place rather than appending a second one."""
+    bin_dir = tmp_path_factory.mktemp("footerbin")
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "args = sys.argv[1:]\n"
+        'd = os.environ["FAKE_GH_DIR"]\n'
+        'sf = os.path.join(d, "state.json")\n'
+        'state = json.load(open(sf)) if os.path.exists(sf) else {"pr_body": "", "comments": []}\n'
+        "def save():\n"
+        "    json.dump(state, open(sf, 'w'))\n"
+        "def body_arg():\n"
+        "    for a in args:\n"
+        "        if a.startswith('body='):\n"
+        "            return a[len('body='):]\n"
+        "    return None\n"
+        "rest = args[1:]\n"
+        "is_patch = rest[:2] == ['-X', 'PATCH']\n"
+        "path = rest[2] if is_patch else rest[0]\n"
+        "if path.endswith('/pulls/42') and not is_patch:\n"
+        "    print(json.dumps({'body': state['pr_body']})); sys.exit(0)\n"
+        "if path.endswith('/pulls/42') and is_patch:\n"
+        "    state['pr_body'] = body_arg(); save(); sys.exit(0)\n"
+        "if path.endswith('/comments') and '--paginate' in rest:\n"
+        "    print(json.dumps(state['comments'])); sys.exit(0)\n"
+        "if path.endswith('/comments') and not is_patch:\n"
+        "    state['comments'].append({'id': len(state['comments']) + 1, 'body': body_arg()})\n"
+        "    save(); sys.exit(0)\n"
+        "if '/issues/comments/' in path and is_patch:\n"
+        "    cid = int(path.rsplit('/', 1)[-1])\n"
+        "    for c in state['comments']:\n"
+        "        if c['id'] == cid:\n"
+        "            c['body'] = body_arg()\n"
+        "    save(); sys.exit(0)\n"
+        "print('gh: unexpected call ' + repr(args), file=sys.stderr)\n"
+        "sys.exit(1)\n"
+    )
+    gh.chmod(0o755)
+    return bin_dir
+
+
+def _run_footer(footer_script, footer_gh, tmp_path, *, run_id, session_id="", card_id=""):
+    d = tmp_path / "ghfix"
+    d.mkdir(exist_ok=True)
+    env = {
+        **os.environ,
+        "PATH": f"{footer_gh}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_GH_DIR": str(d),
+        "GH_TOKEN": "fake",
+        "REPO": "tekflox/aw-app-template",
+        "PR_NUMBER": "42",
+        "RUN_ID": run_id,
+        "SESSION_ID": session_id,
+        "CARD_ID": card_id,
+    }
+    proc = subprocess.run(
+        [sys.executable, str(footer_script)], capture_output=True, text=True, env=env
+    )
+    state = json.loads((d / "state.json").read_text()) if (d / "state.json").exists() else None
+    return proc, state
+
+
+def test_the_footer_is_appended_once(footer_script, footer_gh, tmp_path):
+    proc, state = _run_footer(footer_script, footer_gh, tmp_path, run_id="r" * 32)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert state["pr_body"].count("<!-- devteam:provenance:start -->") == 1
+    assert "r" * 32 in state["pr_body"]
+    assert len(state["comments"]) == 1
+    assert "r" * 32 in state["comments"][0]["body"]
+
+
+def test_a_second_round_replaces_the_footer_in_place(footer_script, footer_gh, tmp_path):
+    """Round 2 (or a later `/aw-review`) on the same PR must not pile up a
+    second footer/comment — it must update the one already there."""
+    _run_footer(footer_script, footer_gh, tmp_path, run_id="r" * 32)
+    proc, state = _run_footer(footer_script, footer_gh, tmp_path, run_id="s" * 32)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert state["pr_body"].count("<!-- devteam:provenance:start -->") == 1
+    assert "r" * 32 not in state["pr_body"]
+    assert "s" * 32 in state["pr_body"]
+    assert len(state["comments"]) == 1, "a second round created a second comment"
+    assert "s" * 32 in state["comments"][0]["body"]
+
+
+# --------------------------------------------------------------------------
 # the merge itself — `merge-attempt`, both entry points, one script
 # --------------------------------------------------------------------------
 #
@@ -1044,8 +1337,17 @@ OTHER_SHA = "c" * 40
 # Sentinel: write no fixture file at all, so the fake `gh` fails that call the
 # way a real 403 from a missing `checks: read` does.
 _MISSING = object()
-_ELIGIBLE = {"statuses": [{"context": "devteam/merge-eligible", "state": "success"}]}
+_ELIGIBLE = {"statuses": [
+    {"context": "devteam/merge-eligible", "state": "success"},
+    {"context": "devteam/provenance", "state": "success"},
+]}
 _NOT_ELIGIBLE: dict = {"statuses": []}
+# Eligible per the review, but no commit ever carried a verified AW-Run-Id
+# trailer (or the provenance-exempt label) — the case `provenance-gate`
+# exists to create.
+_PROVENANCE_NOT_CLEARED = {
+    "statuses": [{"context": "devteam/merge-eligible", "state": "success"}]
+}
 _GREEN = [{"name": "coverage", "state": "SUCCESS", "bucket": "pass"}]
 
 
@@ -1160,6 +1462,21 @@ def test_a_workflow_run_with_no_eligible_status_exits_neutral(
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not merged
     assert "has not cleared this head" in proc.stdout
+
+
+def test_eligible_pr_with_no_provenance_status_does_not_merge(
+    merge_script, merge_gh, tmp_path
+):
+    """The review cleared this SHA, but no commit on the PR ever carried a
+    verified `AW-Run-Id` trailer and no human applied `provenance-exempt` —
+    `provenance-gate` never wrote `devteam/provenance`, and that absence must
+    block the merge exactly like a missing `devteam/merge-eligible` does."""
+    proc, merged = _run_merge(
+        merge_script, merge_gh, tmp_path, status=_PROVENANCE_NOT_CLEARED
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not merged
+    assert "devteam/provenance" in proc.stdout
 
 
 def test_no_open_pr_for_the_event_sha_exits_neutral(merge_script, merge_gh, tmp_path):
@@ -1311,6 +1628,13 @@ def test_the_loops_own_checks_never_block_the_merge(merge_script, merge_gh, tmp_
              "bucket": "pending"},
             {"name": "devteam/merge-eligible", "state": "SUCCESS",
              "bucket": "pass"},
+            # A real `provenance-gate` run can also FAIL its own check-run
+            # (no trailer this round, provenance-exempt not yet applied) —
+            # that must not reach the generic "any non-advisory check
+            # failing blocks" scan either: the actual gate is the
+            # `devteam/provenance` status, not this raw check-run.
+            {"name": "review / provenance-gate", "state": "FAILURE",
+             "bucket": "fail"},
             {"name": "CodeRabbit", "state": "IN_PROGRESS", "bucket": "pending"},
         ],
     )
