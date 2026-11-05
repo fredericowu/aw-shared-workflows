@@ -344,7 +344,11 @@ jobs:
 # shared self-hosted runners at once, and 8 repos already collide on
 # "45 2 * * 3" from a rollout that copy-pasted one. Check before choosing:
 #     grep -h 'cron:' repos/*/.github/workflows/security-scan.yml | sort | uniq -c
-# Hour 0 UTC was entirely unused across all 61 copies as of 2026-11-05.
+# Hour 0 UTC held no cron at all across the 61 standalone copies as of
+# 2026-11-05 — but the v1.6.0 canary rollout itself then claimed five hour-0
+# slots (aw-stack, aw-backend, aw-console, aw-tekflox, aw-remote-host), so
+# that is a snapshot and not a standing fact. Re-run the grep; do not read
+# "hour 0 was free" and pick another minute in it.
 #
 # NEVER ADD A `pull_request` OR `pull_request_target` TRIGGER. The default
 # `runs_on` is self-hosted bare metal, and this workflow is safe there only
