@@ -903,7 +903,12 @@ jobs:
       # must never arrive at a PR with nothing on it. `findings` wakes the
       # coder that opened the PR (resolved server-side from its run_id);
       # `escalate` does not wake anyone and moves the Kanban card to
-      # need_human with a sysadmin Telegram ping.
+      # need_human with a sysadmin Telegram ping. `cleared` (v1.5.0) also
+      # wakes no one — it exists purely so an eligible round leaves a durable
+      # row behind (the close-gate design, card
+      # merge-gate-close-loop-backlog-cards): the `merged-event` job looks
+      # this row up by head_sha when the PR actually closes, to file Backlog
+      # cards for whatever non-blocking leftovers the merged head carried.
       #
       # The endpoint is idempotent on (repo, pr_number, head_sha, round,
       # event), so a re-run of this job is safe. This step is best-effort by
@@ -942,10 +947,13 @@ jobs:
           elif [ "$round" = "2" ] && [ "${BLOCKING_COUNT:-0}" -gt 0 ]; then
             event=escalate
           else
-            # Eligible: nothing to report here. The `merged` event comes from
-            # the merged-event job when the PR actually closes.
-            echo "nothing to report (round=$round eligible=$ELIGIBLE)"
-            exit 0
+            # Eligible: still report, as `cleared`. A round-1-clean PR sends
+            # an EMPTY findings digest (devteam_findings.json is already []
+            # at this point); a round-2-clean PR sends whatever non-blocking
+            # findings survived, `blocks_merge` flags included. The `merged`
+            # event (from the merged-event job, when the PR actually closes)
+            # looks this row up by head_sha.
+            event=cleared
           fi
           python3 - "$event" <<'PYEOF'
           import hashlib, hmac, json, os, subprocess, sys
@@ -1670,6 +1678,13 @@ jobs:
           # The squash commit, not the PR head: it is what landed on master,
           # and it makes this delivery's idempotency key unique per merge.
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          # The review happens against the HEAD sha, never the merge commit —
+          # a review-digest row keyed on merge_commit_sha can therefore never
+          # be found by the server's leftover lookup. Added alongside the old
+          # field rather than replacing it, since existing callers may still
+          # read `head_sha`.
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
           if [ -z "${AW_DEVTEAM_EVENT_SECRET:-}" ]; then
@@ -1702,10 +1717,25 @@ jobs:
             round=1
           fi
           ROUND="$round" python3 <<'PYEOF'
-          import hashlib, hmac, json, os, subprocess, sys
+          import hashlib, hmac, json, os, re, subprocess, sys
 
           # Same RUNNER_TEMP reasoning as the findings/escalate event block.
           TMP = os.environ["RUNNER_TEMP"]
+
+          def _unchecked_items(body):
+              """Literal `- [ ]` (unchecked) checklist lines out of a PR body.
+
+              HTML comments are stripped FIRST, so a template's commented-out
+              boilerplate checklist is never picked up. Bounded to 50 items of
+              300 chars each — truncate, never error, on a pathological body.
+              """
+              body = re.sub(r"<!--.*?-->", "", body or "", flags=re.DOTALL)
+              items = []
+              for line in body.splitlines():
+                  m = re.match(r"^\s*-\s*\[\s*\]\s*(.+)$", line)
+                  if m:
+                      items.append(m.group(1).strip()[:300])
+              return items[:50]
 
           base = os.environ["EVENT_URL"].rstrip("/")
           payload = {
@@ -1715,6 +1745,8 @@ jobs:
               "pr_number": int(os.environ["PR_NUMBER"]),
               "pr_url": os.environ["PR_URL"],
               "head_sha": os.environ["MERGE_SHA"],
+              "pr_head_sha": os.environ["PR_HEAD_SHA"],
+              "unchecked_items": _unchecked_items(os.environ.get("PR_BODY", "")),
               "round": os.environ["ROUND"],
               "counts": {},
           }

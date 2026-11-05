@@ -1702,3 +1702,277 @@ def test_every_long_running_job_still_has_a_ceiling():
         "merge-attempt does nothing but bounded API calls; it must not be "
         "budgeted like a job that waits on a judge"
     )
+
+
+# --------------------------------------------------------------------------
+# v1.5.0: the close-gate feed — `cleared` event, and `merged` payload
+# enrichment (pr_head_sha + unchecked_items). Neither wakes the coder; both
+# exist so the close-gate (card merge-gate-close-loop-backlog-cards) has a
+# durable row to look up and a merge-time PR body to read.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def fake_curl(tmp_path_factory) -> Path:
+    """A `curl` on PATH that never touches the network.
+
+    Mimics the one invocation shape both event-POST steps use: `-o <path>`
+    (where the response body lands) and `--data-binary @<path>` (the signed
+    payload). Captures the posted payload to `$CURL_CAPTURE` when set, and
+    answers with `$CURL_HTTP_CODE` (default 200) the way real curl's
+    `-w "%{http_code}"` does — on stdout, no trailing newline, body routed
+    to `-o` instead.
+    """
+    bin_dir = tmp_path_factory.mktemp("bin")
+    curl = bin_dir / "curl"
+    curl.write_text(
+        "#!/bin/bash\n"
+        'out=""\n'
+        'body_file=""\n'
+        'prev=""\n'
+        'for arg in "$@"; do\n'
+        '  if [ "$prev" = "-o" ]; then out="$arg"; fi\n'
+        '  case "$arg" in\n'
+        "    @*) body_file=\"${arg#@}\" ;;\n"
+        "  esac\n"
+        '  prev="$arg"\n'
+        "done\n"
+        'if [ -n "${CURL_CAPTURE:-}" ] && [ -n "$body_file" ]; then cp "$body_file" "$CURL_CAPTURE"; fi\n'
+        'if [ -n "$out" ]; then printf "%s" "${CURL_BODY:-{\\"ok\\":true}}" > "$out"; fi\n'
+        'printf "%s" "${CURL_HTTP_CODE:-200}"\n'
+    )
+    curl.chmod(0o755)
+    return bin_dir
+
+
+@pytest.fixture(scope="module")
+def report_round_script(tmp_path_factory) -> Path:
+    """The `Report round outcome to the platform` step — the bash
+    event-selection logic plus its inlined python HMAC-POST — extracted
+    verbatim between its own `run: |` and the next job."""
+    text = WORKFLOW.read_text()
+    start = text.index("- name: Report round outcome to the platform")
+    run_marker = text.index("run: |", start)
+    body_start = text.index("\n", run_marker) + 1
+    first_pyeof = text.index("PYEOF", run_marker)
+    second_pyeof = text.index("PYEOF", first_pyeof + len("PYEOF"))
+    end = second_pyeof + len("PYEOF")
+    body = _dedent_block(text[body_start:end])
+    assert "event=cleared" in body, "extracted the wrong block"
+    path = tmp_path_factory.mktemp("wf") / "report_round.sh"
+    path.write_text(body)
+    return path
+
+
+def _run_report_round(
+    script: Path,
+    tmp_path,
+    fake_curl,
+    *,
+    findings: list,
+    blocking: list,
+    counts: dict,
+    round_: str,
+    secret: str = "s3cr3t",
+) -> dict:
+    """Drive the real step script and return the captured HTTP payload (or
+    `{}` if nothing was posted)."""
+    (tmp_path / "devteam_findings.json").write_text(json.dumps(findings))
+    (tmp_path / "devteam_blocking.json").write_text(json.dumps(blocking))
+    (tmp_path / "devteam_counts.json").write_text(json.dumps(counts))
+    capture = tmp_path / "captured_payload.json"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_curl}{os.pathsep}{os.environ['PATH']}",
+        "AW_DEVTEAM_EVENT_SECRET": secret,
+        "EVENT_URL": "https://example.invalid",
+        "REPO": "tekflox/aw-app-template",
+        "PR_NUMBER": "42",
+        "HEAD_SHA": "a" * 40,
+        "ROUND": round_,
+        "FINDINGS_COUNT": str(len(findings)),
+        "BLOCKING_COUNT": str(len(blocking)),
+        "MISSING_BLOCKS_MERGE": "0",
+        "ELIGIBLE": "true" if not blocking else "false",
+        "PR_URL": "https://github.com/tekflox/aw-app-template/pull/42",
+        "RUNNER_TEMP": str(tmp_path),
+        "CURL_CAPTURE": str(capture),
+    }
+    proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, f"step script failed:\n{proc.stdout}\n{proc.stderr}"
+    return json.loads(capture.read_text()) if capture.exists() else {}
+
+
+def test_a_round1_clean_pr_sends_cleared_with_an_empty_digest(
+    report_round_script, tmp_path, fake_curl
+):
+    """The exact gap the close-gate design closes: today this is "nothing to
+    report". Now it is a durable, empty row — proof the head was reviewed
+    clean, not merely that nobody looked."""
+    sent = _run_report_round(
+        report_round_script, tmp_path, fake_curl,
+        findings=[], blocking=[], counts={}, round_="1",
+    )
+    assert sent["event"] == "cleared"
+    assert sent["findings"] == []
+    assert sent["blocking"] == []
+    assert sent["round"] == "1"
+    assert sent["head_sha"] == "a" * 40
+
+
+def test_a_round2_clean_pr_sends_cleared_with_the_leftover_digest(
+    report_round_script, tmp_path, fake_curl
+):
+    """Round 2 clean (no finding blocks the merge) still carries whatever
+    non-blocking findings survived, `blocks_merge` flags and all — that is
+    precisely what the close-gate files as low/medium Backlog cards."""
+    leftovers = [HIGH_NON_BLOCKING, MINOR]
+    sent = _run_report_round(
+        report_round_script, tmp_path, fake_curl,
+        findings=leftovers, blocking=[], counts={"high": 1, "low": 1}, round_="2",
+    )
+    assert sent["event"] == "cleared"
+    assert len(sent["findings"]) == 2
+    assert {f["blocks_merge"] for f in sent["findings"] if "blocks_merge" in f} == {False}
+    assert sent["blocking"] == []
+
+
+@pytest.mark.parametrize(
+    "round_,findings,blocking,expected_event",
+    [
+        ("1", [MINOR], [], "findings"),  # unchanged: round 1 with findings wakes the coder
+        ("2", [MEDIUM_BLOCKING], [MEDIUM_BLOCKING], "escalate"),  # unchanged: round 2 blocking
+    ],
+)
+def test_non_eligible_rounds_are_unaffected_by_the_cleared_change(
+    report_round_script, tmp_path, fake_curl, round_, findings, blocking, expected_event
+):
+    sent = _run_report_round(
+        report_round_script, tmp_path, fake_curl,
+        findings=findings, blocking=blocking, counts={"x": 1}, round_=round_,
+    )
+    assert sent["event"] == expected_event
+
+
+def test_an_unset_secret_still_skips_cleanly_without_posting(
+    report_round_script, tmp_path, fake_curl
+):
+    """No regression on the existing short-circuit: an unset secret must
+    still exit 0 with nothing posted, cleared event included."""
+    (tmp_path / "devteam_findings.json").write_text("[]")
+    (tmp_path / "devteam_blocking.json").write_text("[]")
+    (tmp_path / "devteam_counts.json").write_text("{}")
+    capture = tmp_path / "captured_payload.json"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_curl}{os.pathsep}{os.environ['PATH']}",
+        "AW_DEVTEAM_EVENT_SECRET": "",
+        "EVENT_URL": "https://example.invalid",
+        "REPO": "tekflox/aw-app-template",
+        "PR_NUMBER": "42",
+        "HEAD_SHA": "a" * 40,
+        "ROUND": "1",
+        "FINDINGS_COUNT": "0",
+        "BLOCKING_COUNT": "0",
+        "MISSING_BLOCKS_MERGE": "0",
+        "ELIGIBLE": "true",
+        "PR_URL": "https://github.com/tekflox/aw-app-template/pull/42",
+        "RUNNER_TEMP": str(tmp_path),
+        "CURL_CAPTURE": str(capture),
+    }
+    proc = subprocess.run(["bash", str(report_round_script)], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0
+    assert not capture.exists(), "no secret means no POST, cleared included"
+
+
+# --------------------------------------------------------------------------
+# `merged-event` payload enrichment: pr_head_sha + unchecked_items
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def merged_event_script(tmp_path_factory) -> Path:
+    """The `merged-event` job's inlined python — builds the `merged`
+    payload, now including `pr_head_sha` and `unchecked_items`."""
+    src = _extract_heredoc("- name: Report the merge to the platform")
+    assert "unchecked_items" in src, "extracted the wrong block"
+    path = tmp_path_factory.mktemp("wf") / "merged_event.py"
+    path.write_text(src)
+    return path
+
+
+def _run_merged_event(
+    script: Path, tmp_path, fake_curl, *, pr_body: str, secret: str = "s3cr3t"
+) -> dict:
+    capture = tmp_path / "captured_merged_payload.json"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_curl}{os.pathsep}{os.environ['PATH']}",
+        "AW_DEVTEAM_EVENT_SECRET": secret,
+        "EVENT_URL": "https://example.invalid",
+        "REPO": "tekflox/aw-app-template",
+        "PR_NUMBER": "42",
+        "PR_URL": "https://github.com/tekflox/aw-app-template/pull/42",
+        "MERGE_SHA": "b" * 40,
+        "PR_HEAD_SHA": "c" * 40,
+        "PR_BODY": pr_body,
+        "ROUND": "1",
+        "RUNNER_TEMP": str(tmp_path),
+        "CURL_CAPTURE": str(capture),
+    }
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, f"merged-event script failed:\n{proc.stdout}\n{proc.stderr}"
+    return json.loads(capture.read_text())
+
+
+def test_merged_payload_keeps_merge_sha_and_adds_pr_head_sha(
+    merged_event_script, tmp_path, fake_curl
+):
+    """The bug the Architect is fixing: `head_sha` has always been the squash
+    merge commit, which a review digest (keyed on the PR's real HEAD) can
+    never match. Both fields must be present — old callers keep reading
+    `head_sha`, the close-gate lookup reads the new one."""
+    sent = _run_merged_event(merged_event_script, tmp_path, fake_curl, pr_body="")
+    assert sent["head_sha"] == "b" * 40
+    assert sent["pr_head_sha"] == "c" * 40
+
+
+def test_a_pr_body_with_zero_checklist_items_yields_an_empty_list(
+    merged_event_script, tmp_path, fake_curl
+):
+    sent = _run_merged_event(
+        merged_event_script, tmp_path, fake_curl,
+        pr_body="Just a plain description, no checklist at all.\n\n- not a checkbox\n- [x] already checked",
+    )
+    assert sent["unchecked_items"] == []
+
+
+def test_a_checklist_item_inside_an_html_comment_is_not_picked_up(
+    merged_event_script, tmp_path, fake_curl
+):
+    """Commented-out PR-template boilerplate must not surface as a real
+    unresolved item — only the live checklist item outside the comment
+    should survive."""
+    body = (
+        "<!--\n"
+        "Template boilerplate, never filled in:\n"
+        "- [ ] this is commented out and must not appear\n"
+        "-->\n"
+        "## Checklist\n"
+        "- [ ] this one is real and must appear\n"
+        "- [x] this one is checked and must not appear\n"
+    )
+    sent = _run_merged_event(merged_event_script, tmp_path, fake_curl, pr_body=body)
+    assert sent["unchecked_items"] == ["this one is real and must appear"]
+
+
+def test_a_pathologically_long_body_is_truncated_not_crashed(
+    merged_event_script, tmp_path, fake_curl
+):
+    """Bounded to 50 items of 300 chars each — truncate, never error."""
+    lines = [f"- [ ] item {i} " + ("x" * 500) for i in range(200)]
+    body = "\n".join(lines)
+    sent = _run_merged_event(merged_event_script, tmp_path, fake_curl, pr_body=body)
+    assert len(sent["unchecked_items"]) == 50
+    assert all(len(item) <= 300 for item in sent["unchecked_items"])
+    assert sent["unchecked_items"][0].startswith("item 0")
