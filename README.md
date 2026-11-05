@@ -512,7 +512,11 @@ shared self-hosted runners at once, and 8 repos already collide on
 grep -h 'cron:' repos/*/.github/workflows/security-scan.yml | sort | uniq -c
 ```
 
-Hour 0 UTC was entirely unused across all 61 copies as of 2026-11-05.
+Hour 0 UTC held no cron at all across the 61 standalone copies as of
+2026-11-05 — but the `v1.6.0` canary rollout then claimed five hour-0 slots
+itself (aw-stack, aw-backend, aw-console, aw-tekflox, aw-remote-host), so
+that is a snapshot and not a standing fact. Re-run the grep rather than
+reading "hour 0 is free" and picking another minute in it.
 
 ### Inputs
 
