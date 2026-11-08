@@ -96,10 +96,18 @@ name: Code Review (reusable)
 #                                severity.
 #                                none blocking -> merge.
 #                                any blocking  -> label `devteam:needs-human`,
-#                                                 POST `escalate`. No round 3.
-#   devteam:needs-human        -> TERMINAL. Further reviews are informational
-#                                only: no label change, no merge, no event. A
-#                                human removes the label to re-arm the machine.
+#                                                 POST `escalate`.
+#   devteam:needs-human        -> round "needs-human": the SAME lenient
+#                                `blocks_merge` lens as round 2, run again on
+#                                every `/aw-review`.
+#                                none blocking -> label REMOVED, merge, same
+#                                                 as any other eligible round.
+#                                any blocking  -> label stays, no new event
+#                                                 (already escalated once).
+#                                A human can still remove the label directly
+#                                to force round 1's full lens on the next
+#                                push/`/aw-review`, instead of waiting for a
+#                                clean `blocks_merge` verdict.
 #
 # Why labels and not commit counts or status history: `/aw-review` can be
 # invoked any number of times, workflow runs get cancelled and re-run, and a
@@ -567,9 +575,9 @@ jobs:
                   "a finding they declined. " +
                   (if $round == "needs-human" then
                     "NOTE: this PR already carries the `devteam:needs-human` " +
-                    "label, so this run is informational only -- it will not " +
-                    "merge and will not change any label. Review it anyway " +
-                    "and post your findings. "
+                    "label from an earlier escalation. Judge it exactly like " +
+                    "round 2: if nothing you find is genuinely `blocks_merge`, " +
+                    "the label will be REMOVED and the PR will merge. "
                   else "" end)
                 else "" end) +
                 (if $mode == "improve" then
@@ -735,11 +743,16 @@ jobs:
           # Round 1: eligible iff there are NO findings at all. Any finding
           # wakes the coder instead.
           #
-          # Round 2: eligible iff no finding has `blocks_merge == true`. That
-          # boolean — not severity — is the gate.
+          # Round 2 and `needs-human`: eligible iff no finding has
+          # `blocks_merge == true`. That boolean — not severity — is the
+          # gate, and it is the SAME gate for both: `needs-human` is not a
+          # harsher lens, it is round 2 run again on an already-escalated
+          # PR. A clean verdict here re-arms the machine (the "Set round
+          # labels" step below removes the label), the same as a human
+          # manually clearing it.
           #
-          # FAIL CLOSED on a missing `blocks_merge`: a round-2 finding without
-          # the field counts as blocking.
+          # FAIL CLOSED on a missing `blocks_merge`: a finding without the
+          # field counts as blocking, on round 2 or `needs-human` alike.
           round_ = os.environ.get("ROUND", "1")
 
           def _digest(items):
@@ -754,7 +767,7 @@ jobs:
 
           blocking = []
           missing_field = 0
-          if round_ == "2":
+          if round_ in ("2", "needs-human"):
               for f in findings:
                   if "blocks_merge" not in f:
                       missing_field += 1
@@ -764,10 +777,11 @@ jobs:
 
           if round_ == "1":
               eligible = not findings
-          elif round_ == "2":
+          elif round_ in ("2", "needs-human"):
               eligible = not blocking
           else:
-              # informational / needs-human: never eligible, by definition.
+              # informational (/aw-improve suggestion runs): never eligible,
+              # by definition — it is not a review round at all.
               eligible = False
 
           # A DRAFT PR is never merge-eligible, whatever the review said.
@@ -862,12 +876,18 @@ jobs:
             --silent
           echo "devteam/code-review -> $state ($description)"
 
-      # ---- the round state machine's one write to the PR ----
-      # Only ever ADDS a label. `devteam:needs-human` is removed by a human,
-      # and `devteam:awaiting-fixes` is left in place after round 2 on
-      # purpose: it is what makes a later `/aw-review` round 2 again rather
-      # than silently round 1. Both labels must already exist on the caller
-      # repo — see the caller checklist at the bottom of this file.
+      # ---- the round state machine's write to the PR ----
+      # Adds a label on round 1/2 escalation, same as always. The one
+      # subtraction: a clean `needs-human`-round verdict (no blocking
+      # finding) now REMOVES `devteam:needs-human` itself — a human clearing
+      # it by hand and a review clearing it by verdict are the same re-arm,
+      # so the machine stops being stuck on the human action specifically.
+      # A human can still remove it directly at any time to force round 1's
+      # full lens on the next push. `devteam:awaiting-fixes` is left in place
+      # after round 2 on purpose: it is what makes a later `/aw-review`
+      # round 2 (or `needs-human`) again rather than silently round 1. Both
+      # labels must already exist on the caller repo — see the caller
+      # checklist at the bottom of this file.
       - name: Set round labels
         id: labels
         # always(): the round state must not be lost because an EARLIER step
@@ -876,7 +896,8 @@ jobs:
         # to label.
         if: >-
           always() && steps.findings.outcome == 'success' &&
-          (needs.gate.outputs.round == '1' || needs.gate.outputs.round == '2')
+          (needs.gate.outputs.round == '1' || needs.gate.outputs.round == '2' ||
+           needs.gate.outputs.round == 'needs-human')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ROUND: ${{ needs.gate.outputs.round }}
@@ -890,10 +911,24 @@ jobs:
               -f "labels[]=$1" --silent
             echo "labelled: $1"
           }
+          remove_label() {
+            # 404s if already absent (e.g. a human beat the review to it) --
+            # that is the goal state, not a failure. ':' must be
+            # percent-encoded in the URL path, or GitHub's API 404s on the
+            # literal character — done here, not at the call site, so the
+            # log line stays the plain label name.
+            encoded="${1/:/%3A}"
+            gh api -X DELETE \
+              "repos/${{ github.repository }}/issues/${{ needs.gate.outputs.pr_number }}/labels/$encoded" \
+              --silent || true
+            echo "un-labelled: $1"
+          }
           if [ "$ROUND" = "1" ] && [ "${FINDINGS_COUNT:-0}" -gt 0 ]; then
             add_label "devteam:awaiting-fixes"
           elif [ "$ROUND" = "2" ] && [ "${BLOCKING_COUNT:-0}" -gt 0 ]; then
             add_label "devteam:needs-human"
+          elif [ "$ROUND" = "needs-human" ] && [ "${BLOCKING_COUNT:-0}" -eq 0 ]; then
+            remove_label "devteam:needs-human"
           else
             echo "no label change (round=$ROUND findings=${FINDINGS_COUNT:-0} blocking=${BLOCKING_COUNT:-0})"
           fi
@@ -918,7 +953,8 @@ jobs:
         id: event
         if: >-
           always() && steps.findings.outcome == 'success' &&
-          (needs.gate.outputs.round == '1' || needs.gate.outputs.round == '2')
+          (needs.gate.outputs.round == '1' || needs.gate.outputs.round == '2' ||
+           needs.gate.outputs.round == 'needs-human')
         continue-on-error: true
         env:
           AW_DEVTEAM_EVENT_SECRET: ${{ secrets.AW_DEVTEAM_EVENT_SECRET }}
@@ -946,13 +982,20 @@ jobs:
             event=findings
           elif [ "$round" = "2" ] && [ "${BLOCKING_COUNT:-0}" -gt 0 ]; then
             event=escalate
+          elif [ "$round" = "needs-human" ] && [ "${BLOCKING_COUNT:-0}" -gt 0 ]; then
+            # Still blocking on an already-escalated PR: this is not new
+            # news, `escalate` already fired on the round that set the
+            # label. Re-posting it on every push/`/aw-review` would just
+            # re-ping a human who already knows.
+            echo "still blocking on an escalated PR — no new event"
+            exit 0
           else
             # Eligible: still report, as `cleared`. A round-1-clean PR sends
             # an EMPTY findings digest (devteam_findings.json is already []
-            # at this point); a round-2-clean PR sends whatever non-blocking
-            # findings survived, `blocks_merge` flags included. The `merged`
-            # event (from the merged-event job, when the PR actually closes)
-            # looks this row up by head_sha.
+            # at this point); a round-2/needs-human-clean PR sends whatever
+            # non-blocking findings survived, `blocks_merge` flags included.
+            # The `merged` event (from the merged-event job, when the PR
+            # actually closes) looks this row up by head_sha.
             event=cleared
           fi
           python3 - "$event" <<'PYEOF'

@@ -329,14 +329,46 @@ def test_round2_clean_is_eligible(eligibility_script, tmp_path, fake_gh):
     assert got["eligible"] == "true"
 
 
-@pytest.mark.parametrize("round_", ["needs-human", "informational"])
-def test_terminal_and_informational_rounds_never_merge(
-    eligibility_script, tmp_path, fake_gh, round_
-):
+def test_informational_round_never_merges(eligibility_script, tmp_path, fake_gh):
+    """`/aw-improve` suggestion runs are not a review round at all — they
+    must never merge, whatever they found."""
     got = _run_eligibility(
-        eligibility_script, tmp_path, fake_gh, findings=[], counts={}, round_=round_
+        eligibility_script, tmp_path, fake_gh, findings=[], counts={}, round_="informational"
     )
     assert got["eligible"] == "false"
+
+
+def test_needs_human_round_merges_only_when_nothing_blocks(
+    eligibility_script, tmp_path, fake_gh
+):
+    """An already-escalated PR is judged exactly like round 2, not treated
+    as permanently informational: a clean verdict is eligible, a real
+    `blocks_merge` finding still is not, and severity alone still isn't the
+    gate."""
+    clean = _run_eligibility(
+        eligibility_script, tmp_path, fake_gh, findings=[], counts={}, round_="needs-human"
+    )
+    assert clean["eligible"] == "true"
+
+    still_blocking = _run_eligibility(
+        eligibility_script,
+        tmp_path,
+        fake_gh,
+        findings=[MEDIUM_BLOCKING],
+        counts={"medium": 1},
+        round_="needs-human",
+    )
+    assert still_blocking["eligible"] == "false"
+
+    severity_is_not_the_gate = _run_eligibility(
+        eligibility_script,
+        tmp_path,
+        fake_gh,
+        findings=[HIGH_NON_BLOCKING],
+        counts={"high": 1},
+        round_="needs-human",
+    )
+    assert severity_is_not_the_gate["eligible"] == "true"
 
 
 @pytest.mark.parametrize("draft", ["true", "True", "TRUE"])
@@ -414,18 +446,33 @@ def test_the_eligible_status_is_published_on_the_head_sha(
     assert "state=success" in posts[0]
 
 
+def test_the_eligible_status_is_published_when_an_escalated_pr_clears(
+    eligibility_script, tmp_path, fake_gh
+):
+    """The merge half of the needs-human re-arm: a clean `needs-human`-round
+    verdict must leave the SAME hand-off a clean round 1/2 would, or
+    `merge-attempt` has nothing to read even though the label comes off."""
+    got = _run_eligibility(
+        eligibility_script, tmp_path, fake_gh, findings=[], counts={}, round_="needs-human"
+    )
+    assert got["eligible"] == "true"
+    posts = _status_posts(tmp_path)
+    assert len(posts) == 1, f"expected exactly one status post, got {posts}"
+    assert f"statuses/{'a' * 40}" in posts[0]
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
         {"findings": [MINOR], "counts": {"low": 1}, "round_": "1"},
         {"findings": [MEDIUM_BLOCKING], "counts": {"medium": 1}, "round_": "2"},
         {"findings": [NO_BLOCKS_FIELD], "counts": {"low": 1}, "round_": "2"},
-        {"findings": [], "counts": {}, "round_": "needs-human"},
+        {"findings": [MEDIUM_BLOCKING], "counts": {"medium": 1}, "round_": "needs-human"},
         {"findings": [], "counts": {}, "round_": "informational"},
         {"findings": [], "counts": {}, "round_": "1", "is_draft": "true"},
     ],
     ids=["round1-finding", "round2-blocking", "round2-missing-field",
-         "needs-human", "informational", "draft"],
+         "needs-human-still-blocking", "informational", "draft"],
 )
 def test_the_eligible_status_is_never_published_when_not_eligible(
     eligibility_script, tmp_path, fake_gh, kwargs
@@ -542,6 +589,92 @@ def test_an_unreadable_label_set_fails_loud_instead_of_defaulting_to_round_1(rou
 
 
 # --------------------------------------------------------------------------
+# `Set round labels` — the state machine's one write to the PR, now with a
+# subtraction: a clean `needs-human`-round verdict removes the label itself.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def labels_script(tmp_path_factory) -> Path:
+    """The `Set round labels` step's bash, extracted and made runnable by
+    substituting the two `${{ }}` expressions it references. `fake_gh`
+    answers every `*/labels*` call (POST to add, DELETE to remove) with
+    exit 0, so assertions below read `GH_LOG` to see what was actually
+    called rather than relying on real GitHub state."""
+    text = WORKFLOW.read_text()
+    start = text.index("          add_label() {")
+    end = text.index("      - name: Report round outcome to the platform")
+    body = (
+        text[start:end]
+        .replace("${{ github.repository }}", "tekflox/aw-app-template")
+        .replace("${{ needs.gate.outputs.pr_number }}", "42")
+    )
+    assert "remove_label" in body, "extracted the wrong fragment"
+    path = tmp_path_factory.mktemp("wf") / "labels.sh"
+    path.write_text("set -euo pipefail\n" + body)
+    return path
+
+
+def _run_labels(
+    script: Path, fake_gh, tmp_path, *, round_: str, findings_count: int = 0, blocking_count: int = 0
+):
+    log = tmp_path / "gh_calls.log"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_gh}{os.pathsep}{os.environ['PATH']}",
+        "ROUND": round_,
+        "FINDINGS_COUNT": str(findings_count),
+        "BLOCKING_COUNT": str(blocking_count),
+        "GH_TOKEN": "fake",
+        "GH_LOG": str(log),
+        "FAKE_LABELS": "",
+    }
+    proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, f"label step failed:\n{proc.stderr[-2000:]}"
+    calls = log.read_text().splitlines() if log.exists() else []
+    return proc.stdout, calls
+
+
+def test_round1_findings_add_awaiting_fixes(labels_script, fake_gh, tmp_path):
+    out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="1", findings_count=1)
+    assert "labelled: devteam:awaiting-fixes" in out
+    assert any("-X POST" in c and "/labels" in c for c in calls)
+
+
+def test_round2_blocking_adds_needs_human(labels_script, fake_gh, tmp_path):
+    out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="2", blocking_count=1)
+    assert "labelled: devteam:needs-human" in out
+    assert any("-X POST" in c and "/labels" in c for c in calls)
+
+
+def test_a_clean_needs_human_round_removes_its_own_label(labels_script, fake_gh, tmp_path):
+    """The re-arm: an escalated PR that comes back clean has the label
+    pulled by the review itself, the same re-arm a human removing it by
+    hand would have produced."""
+    out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="needs-human", blocking_count=0)
+    assert "un-labelled: devteam:needs-human" in out
+    deletes = [c for c in calls if "-X DELETE" in c]
+    assert len(deletes) == 1, f"expected exactly one DELETE, got {calls}"
+    assert "labels/devteam%3Aneeds-human" in deletes[0], (
+        "the colon in the label name must be percent-encoded in the URL path "
+        "or GitHub's API 404s on the literal string"
+    )
+
+
+def test_a_still_blocking_needs_human_round_leaves_the_label_alone(labels_script, fake_gh, tmp_path):
+    out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="needs-human", blocking_count=1)
+    assert "no label change" in out
+    assert calls == [], f"no gh call should have been made, got {calls}"
+
+
+def test_a_clean_round1_or_round2_makes_no_label_call(labels_script, fake_gh, tmp_path):
+    for round_ in ("1", "2"):
+        out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_=round_)
+        assert "no label change" in out
+        assert calls == [], f"round {round_}: no gh call should have been made, got {calls}"
+
+
+# --------------------------------------------------------------------------
 # `synchronize` is round 2's automatic trigger, and ONLY round 2's
 # --------------------------------------------------------------------------
 #
@@ -552,8 +685,9 @@ def test_an_unreadable_label_set_fails_loud_instead_of_defaulting_to_round_1(rou
 # of real subscription budget, and PR-Agent already reviews every push. So
 # the gate has to refuse a synchronize on anything that is not round 2 —
 # round 1 (the author is still iterating before any review has run), and
-# `needs-human` (terminal until a human clears the label; pushing more
-# commits must not re-arm it).
+# `needs-human` (re-arming it still takes a clean `/aw-review` verdict or a
+# human removing the label; pushing more commits must not re-trigger a paid
+# run by itself).
 
 
 @pytest.fixture(scope="module")
@@ -608,7 +742,7 @@ def _decide_allowed(script: Path, fake_gh, tmp_path, *, labels: str, action: str
         ("devteam:awaiting-fixes", "true"),          # round 2 — the whole point
         ("", "false"),                               # round 1, author iterating
         ("bug", "false"),
-        ("devteam:needs-human", "false"),            # terminal, must stay terminal
+        ("devteam:needs-human", "false"),            # no auto re-review from a push
         ("devteam:awaiting-fixes devteam:needs-human", "false"),
     ],
 )
@@ -1852,6 +1986,32 @@ def test_non_eligible_rounds_are_unaffected_by_the_cleared_change(
         findings=findings, blocking=blocking, counts={"x": 1}, round_=round_,
     )
     assert sent["event"] == expected_event
+
+
+def test_needs_human_round_sends_cleared_when_it_clears(report_round_script, tmp_path, fake_curl):
+    """The platform-event half of the re-arm: a clean `needs-human` round
+    reports exactly like any other eligible round, so the close-gate's
+    head_sha lookup finds it the same way."""
+    sent = _run_report_round(
+        report_round_script, tmp_path, fake_curl,
+        findings=[], blocking=[], counts={}, round_="needs-human",
+    )
+    assert sent["event"] == "cleared"
+    assert sent["round"] == "needs-human"
+
+
+def test_needs_human_round_still_blocking_sends_no_new_event(
+    report_round_script, tmp_path, fake_curl
+):
+    """`escalate` already fired on the round that set the label — a repeat
+    push/`/aw-review` that is still blocking must not re-ping a human who
+    already knows."""
+    sent = _run_report_round(
+        report_round_script, tmp_path, fake_curl,
+        findings=[MEDIUM_BLOCKING], blocking=[MEDIUM_BLOCKING], counts={"medium": 1},
+        round_="needs-human",
+    )
+    assert sent == {}, f"expected nothing posted, got {sent}"
 
 
 def test_an_unset_secret_still_skips_cleanly_without_posting(
