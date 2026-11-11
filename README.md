@@ -24,7 +24,7 @@ workflow cuts a tag the others' callers simply don't have to bump.
 embedded step scripts by text-scanning them and execute them, so they assert
 against the bytes CI actually runs. The first moved here from
 `tekflox/aw-app-template` along with the logic it guards. **Run them before
-tagging** — `python -m pytest tests/ -q` (157 tests).
+tagging** — `python -m pytest tests/ -q` (166 tests).
 
 ## Pin an exact tag. Never a moving ref.
 
@@ -388,6 +388,7 @@ the review→merge loop is driven by explicit rounds.
 | Input | Required | Default | Notes |
 |---|---|---|---|
 | `api_base` | no | `https://agents-platform.aw.tekflox.com/v1` | Fed to `OPENAI__API_BASE`. An input only so a staging Agents Platform can be pointed at without forking the file; every caller today uses the default. |
+| `runs_on` | no | `'"ubuntu-latest"'` | JSON-encoded `runs-on`, consumed as `fromJSON(...)`. A JSON string or a JSON array both work (`'["self-hosted","aw-baremetal"]'`). **Private callers only** — see below. |
 
 That is the whole input surface. The model (`openai/agent/pr-agent-llm`), the
 empty fallback list, the token/timeout values, the auto-flags
@@ -396,15 +397,39 @@ empty fallback list, the token/timeout values, the auto-flags
 vary per repo, and parameterizing a thing that does not vary is how
 `code-review.yml`'s three copies drifted 554 lines apart.
 
-`runs-on: ubuntu-latest` is hardcoded too, in all three jobs, and there is no
-`runs_on` input. This workflow has an open `pull_request` trigger, so on a
-public caller anyone can open a fork PR, and a fork PR on
-`[self-hosted, aw-baremetal]` is arbitrary code execution on the bare-metal
-host that runs the whole workspace. There is also no `actions/checkout` —
-PR-Agent reads the diff through the GitHub API, so untrusted code never
-reaches the runner at all. A private caller therefore pays GitHub-hosted
-minutes (~3–5 min/PR), which also keeps this workflow off the single
-self-hosted runner AP-MT's CI, deploy and code-review loop already share.
+#### `runs_on` defaults to GitHub-hosted, and a public caller must leave it alone
+
+All three jobs read `${{ fromJSON(inputs.runs_on) }}`, defaulting to the JSON
+string `"ubuntu-latest"` — byte-identical to the hardcoded `ubuntu-latest`
+this file shipped with, for any caller that does not pass the input.
+
+> **A public caller must never pass a self-hosted value.** This workflow has
+> an open `pull_request` trigger, so on a public caller anyone can open a
+> fork PR, and a fork PR on `[self-hosted, aw-baremetal]` is arbitrary code
+> execution on the bare-metal host that runs the whole workspace.
+> `fredericowu/aw-workspace` is public and keeps the default deliberately.
+
+The input is for **private** callers, which have no untrusted-fork-PR surface.
+This account is on the Free plan, capped at **20 concurrent GitHub-hosted jobs
+account-wide** across every repo regardless of visibility, and on 2026-11-11
+that cap was measurably starving `aw-workspace`: three of its runs sat
+`queued` with zero jobs created for ~50 minutes while AP-MT (private, with its
+own idle 3-runner `aw-baremetal` pool) held 8 hosted slots. AP-MT therefore
+passes `runs_on: '["self-hosted","aw-baremetal"]'`, the same literal its
+`code-review.yml` already passed.
+
+What actually defends this workflow is not the `runs-on` literal: there is no
+`actions/checkout` — PR-Agent reads the diff through the GitHub API, so
+untrusted code never reaches the runner at all. That discipline is unchanged.
+On a `pull_request` event a fork can rewrite the *caller* workflow wholesale
+and add a self-hosted job of its own, so a hosted-default input adds no
+exposure that did not already exist; it is the same trade
+`code-review-reusable.yml` has accepted since its first commit while serving
+public callers.
+
+The old note that hosting these jobs "keeps this workflow off the single
+congested self-hosted runner AP-MT's CI, deploy and code-review loop already
+share" went stale when AP-MT grew from 1 to 3 `aw-baremetal` runners.
 
 ### Permissions
 
@@ -530,12 +555,15 @@ Trivy's scanner set, the three categories and the report-only posture. They
 do not vary per repo, and parameterizing a thing that does not vary is how
 `code-review.yml`'s three copies drifted 554 lines apart.
 
-### `runs_on` defaults to self-hosted — the opposite of `ai-review-reusable.yml`
+### `runs_on` defaults to self-hosted — the opposite DEFAULT of `ai-review`'s
 
-That difference is load-bearing, not an inconsistency. The AI review has an
-open `pull_request` trigger, so a fork PR on `[self-hosted, aw-baremetal]`
-would be arbitrary code execution on the bare-metal host. This workflow
-declares **only `workflow_call`** and is reachable just from the caller's
+Both workflows take the same JSON-encoded `runs_on` input; they differ only in
+which way it defaults, and that difference is load-bearing rather than an
+inconsistency. The AI review has an open `pull_request` trigger, so a fork PR
+on `[self-hosted, aw-baremetal]` would be arbitrary code execution on the
+bare-metal host — it therefore defaults to hosted and a public caller leaves
+it there. This workflow declares **only `workflow_call`** and is reachable
+just from the caller's
 `schedule`/`workflow_dispatch`, which can run nothing but trusted
 default-branch code.
 

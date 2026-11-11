@@ -393,16 +393,35 @@ def test_the_pr_agent_action_is_sha_pinned():
     )
 
 
-def test_every_job_runs_on_a_github_hosted_runner():
-    """`runs-on` is hardcoded in all three jobs and is NOT an input, unlike
-    the sibling workflow's `runs_on`. This workflow has an open
-    `pull_request` trigger, so on a public caller anyone can open a fork PR,
-    and a fork PR on `[self-hosted, aw-baremetal]` is arbitrary code
-    execution on the bare-metal host that runs the whole workspace."""
+def test_every_job_consumes_the_runs_on_input():
+    """All three jobs take `runs-on` from the `runs_on` input, same contract
+    as the sibling workflow. A job left on a hardcoded literal would silently
+    ignore a private caller's override and keep burning the hosted
+    account-wide concurrency cap this input exists to stop burning."""
     runs_on = re.findall(r"^\s+runs-on:\s*(.+?)\s*$", WORKFLOW.read_text(), re.MULTILINE)
     assert len(runs_on) == 3, f"expected one runs-on per job, found {runs_on}"
-    assert set(runs_on) == {"ubuntu-latest"}, (
-        f"every job must be GitHub-hosted and unconditional, got {runs_on}"
+    assert set(runs_on) == {"${{ fromJSON(inputs.runs_on) }}"}, (
+        f"every job must consume fromJSON(inputs.runs_on), got {runs_on}"
+    )
+
+
+def test_the_runs_on_input_defaults_to_a_github_hosted_runner():
+    """The DEFAULT is what protects a public caller, so it is pinned here.
+    This workflow has an open `pull_request` trigger, so on a public caller
+    anyone can open a fork PR, and a fork PR on `[self-hosted, aw-baremetal]`
+    is arbitrary code execution on the bare-metal host that runs the whole
+    workspace. A caller must opt INTO self-hosted, never inherit it — and the
+    value is JSON, so the quotes are part of it (a bare `ubuntu-latest` fails
+    `fromJSON` at expression evaluation)."""
+    m = re.search(
+        r"^      runs_on:\n(?:.*\n)*?        default:\s*(.+?)\s*$",
+        WORKFLOW.read_text(),
+        re.MULTILINE,
+    )
+    assert m, "the `runs_on` input no longer declares a default"
+    assert m.group(1) == "'\"ubuntu-latest\"'", (
+        "runs_on must default to the JSON string '\"ubuntu-latest\"', got "
+        f"{m.group(1)!r}"
     )
 
 
