@@ -25,35 +25,58 @@ name: AI Review (reusable)
 # repo-wide tag, and the other file's callers simply don't bump.
 #
 # ── WHAT IS, AND IS NOT, AN INPUT ─────────────────────────────────────────
-# Exactly one input: `api_base`. Everything else that varied per repo in the
-# original — nothing, as it happens, since there was only one copy — stays
-# hardcoded on purpose. The model slug, the empty fallback list, the token
-# and timeout values, the auto_* flags and the SHA-pinned action version are
-# all invariants of "how this estate reviews a PR", and parameterizing a
-# thing that does not vary is precisely how `code-review.yml`'s three copies
-# drifted 554 lines apart before they were converged.
+# Two inputs: `api_base` and `runs_on`. Everything else that varied per repo
+# in the original — nothing, as it happens, since there was only one copy —
+# stays hardcoded on purpose. The model slug, the empty fallback list, the
+# token and timeout values, the auto_* flags and the SHA-pinned action
+# version are all invariants of "how this estate reviews a PR", and
+# parameterizing a thing that does not vary is precisely how
+# `code-review.yml`'s three copies drifted 554 lines apart before they were
+# converged.
 #
-# `runs_on` is deliberately NOT an input either; see the next block.
+# ── runs-on: GITHUB-HOSTED BY DEFAULT, OVERRIDABLE BY A PRIVATE CALLER ────
+# All three jobs read `${{ fromJSON(inputs.runs_on) }}`, and the DEFAULT is
+# the JSON string `"ubuntu-latest"` — byte-identical behaviour to the
+# hardcoded `ubuntu-latest` this file shipped with, for every caller that
+# does not pass the input. That default is the load-bearing half: it is what
+# keeps a PUBLIC caller safe without the caller having to know anything.
 #
-# ── runs-on: ubuntu-latest, UNCONDITIONALLY ───────────────────────────────
-# Hardcoded in all three jobs, and not negotiable per caller. The original
-# carried this note and it survives the extraction intact:
+#   A PUBLIC CALLER MUST NEVER PASS A SELF-HOSTED VALUE. This workflow has
+#   an open `pull_request` trigger, so on a public caller anyone can open a
+#   PR from a fork, and a fork PR on a `[self-hosted, aw-baremetal]` runner
+#   is arbitrary code execution on the bare-metal host that runs the whole
+#   workspace. GitHub-hosted runners are disposable, and free on a public
+#   repo. Nothing is worth that trade. (Same warning shape as the
+#   security-scan workflow's README section, which defaults the other way
+#   for the opposite reason: it declares only `workflow_call`.)
 #
-#   this workflow has an open `pull_request` trigger, so on a PUBLIC caller
-#   anyone can open a PR from a fork, and a fork PR on a `[self-hosted,
-#   aw-baremetal]` runner is arbitrary code execution on the bare-metal host
-#   that runs the whole workspace. GitHub-hosted runners are disposable, and
-#   free on a public repo. Nothing here is worth that trade.
+# The input exists for PRIVATE callers, which have no untrusted-fork-PR
+# surface at all. AP-MT is the motivating one: this personal account is on
+# the Free plan, capped at 20 concurrent GitHub-hosted jobs ACCOUNT-WIDE
+# across every repo regardless of visibility, and on 2026-11-11 that cap was
+# measurably starving `aw-workspace` — three of its runs sat `queued` with
+# zero jobs created for ~50 minutes while AP-MT held 8 slots. AP-MT has its
+# own 3-runner `aw-baremetal` pool sitting idle for those reviews.
 #
-# There is also deliberately NO actions/checkout step. PR-Agent reads the
-# diff through the GitHub API, so untrusted PR code is never fetched onto,
-# let alone executed by, the runner. Adding a checkout would hand a fork PR a
-# foothold it currently does not have.
+# This is the contract `code-review-reusable.yml` has carried since its first
+# commit, while serving public callers, and the sibling file is the precedent
+# rather than a divergence.
 #
-# A private caller therefore pays GitHub-hosted minutes (~3-5 min/PR). That
-# is accepted, and it has a second benefit: it keeps this workflow off the
-# single congested self-hosted runner AP-MT's own CI, deploy and code-review
-# loop already share.
+# WHAT ACTUALLY DEFENDS THIS WORKFLOW is unchanged, and it is not the
+# `runs-on` literal: there is deliberately NO actions/checkout step. PR-Agent
+# reads the diff through the GitHub API, so untrusted PR code is never
+# fetched onto, let alone executed by, the runner. Adding a checkout would
+# hand a fork PR a foothold it currently does not have. Fork-PR secret
+# stripping and the runner-group/repo settings are the other two. An input
+# with a hosted default adds no exposure a fork PR does not already have —
+# on `pull_request` a fork can rewrite the CALLER workflow wholesale and add
+# a self-hosted job of its own.
+#
+# The old rationale's second half — that hosted runners "keep this workflow
+# off the single congested self-hosted runner AP-MT's CI, deploy and
+# code-review loop already share" — WENT STALE when AP-MT grew from 1 to 3
+# `aw-baremetal` runners (2026-11-11). The scarce resource is now the hosted
+# account cap, not that runner.
 #
 # ── SECRETS: DECLARED, AND PASSED EXPLICITLY ──────────────────────────────
 # `AW_PRAGENT_V1_KEY` is declared under `on.workflow_call.secrets:` below as
@@ -148,6 +171,18 @@ on:
         required: false
         type: string
         default: 'https://agents-platform.aw.tekflox.com/v1'
+      runs_on:
+        description: >-
+          JSON-encoded `runs-on` value, consumed as
+          `fromJSON(inputs.runs_on)`. A JSON string ("ubuntu-latest") or a
+          JSON array (["self-hosted","aw-baremetal"]) both work. A bare
+          unquoted string is NOT valid JSON and fails the whole job at
+          expression evaluation — the quotes are part of the value. PUBLIC
+          callers must keep the hosted default; see this file's runs-on
+          header block for why.
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
     secrets:
       # `required: false` deliberately. A caller missing it gets a precise,
       # fail-loud error from the step that needs it, naming the repo and the
@@ -209,7 +244,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name != github.repository
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     steps:
       - name: Explain why no AI review ran
         run: |
@@ -277,7 +312,7 @@ jobs:
           )
         )
       )
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     outputs:
       allowed: ${{ steps.decide.outputs.allowed }}
       sha: ${{ steps.decide.outputs.sha }}
@@ -338,7 +373,7 @@ jobs:
   ai-review:
     needs: gate
     if: needs.gate.outputs.allowed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     # Must strictly NEST the inference budget, not overlap it:
     # CONFIG__AI_TIMEOUT below is 600s per model call and a `/review` pass
     # makes more than one, so a job budget at or near 2x that would kill the
