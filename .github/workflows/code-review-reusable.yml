@@ -99,7 +99,7 @@ name: Code Review (reusable)
 #                                                 POST `escalate`.
 #   devteam:needs-human        -> round "needs-human": the SAME lenient
 #                                `blocks_merge` lens as round 2, run again on
-#                                every `/aw-review`.
+#                                every push or `/aw-review`.
 #                                none blocking -> label REMOVED, merge, same
 #                                                 as any other eligible round.
 #                                any blocking  -> label stays, no new event
@@ -116,9 +116,9 @@ name: Code Review (reusable)
 # re-runs. The gate reads them LIVE via `gh api` — never from the event
 # payload, whose `issue_comment` form carries a stale label snapshot.
 #
-# Round 2 is entered AUTOMATICALLY, on `pull_request: synchronize` — i.e. the
-# coder's fix push — and only then. A `synchronize` on a PR that is not
-# already carrying `devteam:awaiting-fixes` is refused by the gate after one
+# The fix-cycle rounds — 2 and `needs-human` — are entered AUTOMATICALLY, on
+# `pull_request: synchronize` — i.e. the coder's fix push. A `synchronize` on
+# a PR carrying neither label is round 1 and is refused by the gate after one
 # label read, before any paid judge run: a full deep review costs real
 # subscription budget and PR-Agent already reviews every push, so "review
 # every push" was never the ask. `/aw-review` survives untouched as the
@@ -447,23 +447,37 @@ jobs:
           echo "is_draft=${is_draft:-false}" >> "$GITHUB_OUTPUT"
           echo "round=$round is_draft=${is_draft:-false} (labels: $(printf '%s' "$labels" | tr '\n' ' '))"
 
-          # ---- `synchronize` is round 2's automatic trigger, and ONLY that ----
-          # The coder pushing fixes is exactly the event round 2 was waiting
-          # for, and making it automatic removes the one manual step left in
-          # the loop. Making it a review of EVERY push is a different and
-          # much more expensive thing: one judge run plus up to 3 research
-          # runs of real subscription budget, on a diff PR-Agent has already
-          # reviewed. So a synchronize is refused here unless the PR is
-          # genuinely mid-fix-cycle (`devteam:awaiting-fixes` present ->
-          # round 2).
+          # ---- `synchronize` is the fix-cycle rounds' automatic trigger ----
+          # The coder pushing fixes is exactly the event rounds 2 and
+          # `needs-human` are waiting for, and making it automatic removes
+          # the one manual step left in the loop. Making it a review of
+          # EVERY push is a different and much more expensive thing: one
+          # judge run plus up to 3 research runs of real subscription
+          # budget, on a diff PR-Agent has already reviewed. So a
+          # synchronize is refused here unless the PR is genuinely
+          # mid-fix-cycle (`devteam:awaiting-fixes` -> round 2, or
+          # `devteam:needs-human` -> round needs-human).
           #
-          # Refused AFTER the label read and BEFORE anything paid: that one
-          # `gh api` call is the whole cost of a push to a round-1 or
-          # escalated PR. `/aw-review` still forces a review from any state,
-          # which is what makes this safe to be strict about.
-          if [ "${{ github.event.action }}" = "synchronize" ] && [ "$round" != "2" ]; then
+          # `needs-human` admits a push for the same reason round 2 does,
+          # and v1.10.0 added it because refusing it was the worse of the
+          # two costs: the PR's `devteam/code-review` status is per-commit,
+          # so a silently-skipped synchronize leaves the PREVIOUS commit's
+          # pass on display, which reads as "the escalated finding is
+          # resolved" when nothing looked at the fix at all. The window is
+          # self-closing — the first clean `blocks_merge` verdict removes
+          # the label — and a still-blocking re-run posts no new escalate
+          # event, so repeated pushes cost budget but never re-ping a human.
+          #
+          # Round 1 is still refused AFTER the label read and BEFORE
+          # anything paid: that one `gh api` call is the whole cost of a
+          # push to a PR no review has ever run on, which is the
+          # high-volume case this strictness was written for. `/aw-review`
+          # still forces a review from any state.
+          if [ "${{ github.event.action }}" = "synchronize" ] \
+             && [ "$round" != "2" ] && [ "$round" != "needs-human" ]; then
             echo "synchronize on a round-$round PR — not re-reviewing. \
-            Automatic re-review is round 2 only (label devteam:awaiting-fixes); \
+            Automatic re-review is for the fix-cycle rounds only (labels \
+            devteam:awaiting-fixes, devteam:needs-human); \
             comment /aw-review to force one."
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -1946,11 +1960,12 @@ jobs:
 # Three things about that block, each of which has a way of going wrong
 # silently:
 #
-#   `synchronize` is what makes round 2 automatic. Without it the loop still
-#   works, it just needs a `/aw-review` comment after every fix push, which
-#   is what v1.2.1 and earlier required. The gate refuses a synchronize that
-#   is not round 2 after a single label read, so adding it does not spend
-#   review budget on round-1 pushes.
+#   `synchronize` is what makes the fix-cycle rounds — 2 and `needs-human`
+#   — automatic. Without it the loop still works, it just needs a
+#   `/aw-review` comment after every fix push, which is what v1.2.1 and
+#   earlier required. The gate refuses a round-1 synchronize after a single
+#   label read, so adding it does not spend review budget on the pushes of
+#   a PR no review has run on yet.
 #
 #   `workflow_run.workflows:` takes the CI workflow's `name:` — the human
 #   string at the top of that file, NOT its filename and NOT its job id.

@@ -675,7 +675,7 @@ def test_a_clean_round1_or_round2_makes_no_label_call(labels_script, fake_gh, tm
 
 
 # --------------------------------------------------------------------------
-# `synchronize` is round 2's automatic trigger, and ONLY round 2's
+# `synchronize` is the fix-cycle rounds' automatic trigger, and ONLY theirs
 # --------------------------------------------------------------------------
 #
 # v1.3.0 adds `synchronize` to the callers' trigger surface so the coder's
@@ -683,11 +683,18 @@ def test_a_clean_round1_or_round2_makes_no_label_call(labels_script, fake_gh, tm
 # budget rationale that kept `synchronize` out for four releases has not
 # changed though: one deep review is a judge run plus up to 3 research runs
 # of real subscription budget, and PR-Agent already reviews every push. So
-# the gate has to refuse a synchronize on anything that is not round 2 —
-# round 1 (the author is still iterating before any review has run), and
-# `needs-human` (re-arming it still takes a clean `/aw-review` verdict or a
-# human removing the label; pushing more commits must not re-trigger a paid
-# run by itself).
+# the gate has to refuse a synchronize on round 1 — the author is still
+# iterating, before any review has run, which is the high-volume case that
+# rationale was written for.
+#
+# v1.10.0 admits `needs-human` too. Refusing it was the worse of the two
+# costs: `devteam/code-review` is a per-commit status, so a silently-skipped
+# synchronize leaves the PREVIOUS commit's pass on display, reading as "the
+# escalated finding is resolved" when nothing reviewed the fix at all (hit
+# live on AP-MT PR #72). The window is self-closing — the first clean
+# `blocks_merge` verdict removes the label — and a still-blocking re-run
+# posts no new escalate event, so repeated pushes spend budget but never
+# re-ping a human.
 
 
 @pytest.fixture(scope="module")
@@ -742,11 +749,11 @@ def _decide_allowed(script: Path, fake_gh, tmp_path, *, labels: str, action: str
         ("devteam:awaiting-fixes", "true"),          # round 2 — the whole point
         ("", "false"),                               # round 1, author iterating
         ("bug", "false"),
-        ("devteam:needs-human", "false"),            # no auto re-review from a push
-        ("devteam:awaiting-fixes devteam:needs-human", "false"),
+        ("devteam:needs-human", "true"),             # escalated: a fix push IS reviewed
+        ("devteam:awaiting-fixes devteam:needs-human", "true"),
     ],
 )
-def test_synchronize_is_admitted_only_on_round_2(
+def test_synchronize_is_admitted_on_the_fix_cycle_rounds_only(
     synchronize_script, fake_gh, tmp_path, labels, expected
 ):
     got = _decide_allowed(
