@@ -1280,6 +1280,39 @@ def test_the_newest_commit_with_a_trailer_wins(
     assert outputs["run_id"] == newer_id
 
 
+def test_the_agent_slug_trailer_is_extracted(
+    provenance_script, provenance_gh, tmp_path
+):
+    """The fourth trailer, self-stamped by the same hook as the other
+    three (agents-platform-runners' prepare-commit-msg) — extracted the
+    same way, not looked up via any API."""
+    proc, outputs, calls = _run_provenance(
+        provenance_script,
+        provenance_gh,
+        tmp_path,
+        commits=[_commit(f"fix: thing\n\nAW-Run-Id: {REAL_RUN_ID}\n"
+                          f"AW-Agent-Slug: coder-sonnet\n")],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert outputs["agent_slug"] == "coder-sonnet"
+
+
+def test_a_missing_agent_slug_trailer_is_simply_absent(
+    provenance_script, provenance_gh, tmp_path
+):
+    """No API fallback exists for this field — an older runner/AP-MT
+    version, or a not-yet-recycled warm container, just means the field is
+    empty, same as a run with no card."""
+    proc, outputs, calls = _run_provenance(
+        provenance_script,
+        provenance_gh,
+        tmp_path,
+        commits=[_commit(f"AW-Run-Id: {REAL_RUN_ID}\n")],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert outputs["agent_slug"] == ""
+
+
 # --------------------------------------------------------------------------
 # provenance-gate's footer step — idempotent PR body + sticky comment
 # --------------------------------------------------------------------------
@@ -1342,7 +1375,10 @@ def footer_gh(tmp_path_factory) -> Path:
     return bin_dir
 
 
-def _run_footer(footer_script, footer_gh, tmp_path, *, run_id, session_id="", card_id=""):
+def _run_footer(
+    footer_script, footer_gh, tmp_path, *, run_id, session_id="", card_id="",
+    agent_slug="",
+):
     d = tmp_path / "ghfix"
     d.mkdir(exist_ok=True)
     env = {
@@ -1355,6 +1391,7 @@ def _run_footer(footer_script, footer_gh, tmp_path, *, run_id, session_id="", ca
         "RUN_ID": run_id,
         "SESSION_ID": session_id,
         "CARD_ID": card_id,
+        "AGENT_SLUG": agent_slug,
     }
     proc = subprocess.run(
         [sys.executable, str(footer_script)], capture_output=True, text=True, env=env
@@ -1383,6 +1420,223 @@ def test_a_second_round_replaces_the_footer_in_place(footer_script, footer_gh, t
     assert "s" * 32 in state["pr_body"]
     assert len(state["comments"]) == 1, "a second round created a second comment"
     assert "s" * 32 in state["comments"][0]["body"]
+
+
+def test_the_footer_includes_the_agent_line_when_resolved(
+    footer_script, footer_gh, tmp_path
+):
+    proc, state = _run_footer(
+        footer_script, footer_gh, tmp_path, run_id="r" * 32, agent_slug="coder-sonnet"
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "**Agent:** `coder-sonnet`" in state["pr_body"]
+
+
+def test_the_footer_omits_the_agent_line_when_absent(footer_script, footer_gh, tmp_path):
+    """Matches the existing Session/Card treatment — absence is silent, not
+    a placeholder line."""
+    proc, state = _run_footer(footer_script, footer_gh, tmp_path, run_id="r" * 32)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "**Agent:**" not in state["pr_body"]
+
+
+# --------------------------------------------------------------------------
+# the label-apply step — trailer-derived PR labels, never allowed to fail
+# --------------------------------------------------------------------------
+
+_LABELS_STEP = "- name: Apply provenance labels"
+
+
+@pytest.fixture(scope="module")
+def provenance_labels_script(tmp_path_factory) -> Path:
+    src = _extract_heredoc(_LABELS_STEP)
+    assert "aw-run" in src and "aw-card" in src and "aw-agent" in src, (
+        "extracted the wrong block — no label mapping in it"
+    )
+    path = tmp_path_factory.mktemp("wf") / "labels.py"
+    path.write_text(src)
+    return path
+
+
+@pytest.fixture(scope="module")
+def provenance_label_gh(tmp_path_factory) -> Path:
+    """A stateful fake `gh` that plays both the repo's label list and a
+    PR's applied labels, persisted in `$FAKE_GH_DIR/state.json` so the same
+    tmp_path can drive the script twice (replace-by-prefix, already-applied).
+    `FAKE_GH_ALWAYS_FAIL=1` makes every call fail, for the never-fails test.
+    """
+    bin_dir = tmp_path_factory.mktemp("labelbin")
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys, urllib.parse\n"
+        "args = sys.argv[1:]\n"
+        'd = os.environ["FAKE_GH_DIR"]\n'
+        'with open(os.path.join(d, "calls.log"), "a") as f:\n'
+        '    f.write(" ".join(args) + "\\n")\n'
+        'if os.environ.get("FAKE_GH_ALWAYS_FAIL"):\n'
+        '    print("gh: simulated hard failure", file=sys.stderr)\n'
+        '    sys.exit(1)\n'
+        'sf = os.path.join(d, "state.json")\n'
+        'state = json.load(open(sf)) if os.path.exists(sf) else '
+        '{"pr_labels": [], "repo_labels": []}\n'
+        "def save():\n"
+        "    json.dump(state, open(sf, 'w'))\n"
+        "rest = args[1:]\n"
+        "if rest[:2] == ['-X', 'DELETE']:\n"
+        "    name = urllib.parse.unquote(rest[2].rsplit('/', 1)[-1])\n"
+        "    state['pr_labels'] = [n for n in state['pr_labels'] if n != name]\n"
+        "    save(); sys.exit(0)\n"
+        "if rest[:2] == ['-X', 'POST']:\n"
+        "    name = next(a.split('=', 1)[1] for a in rest if a.startswith('name='))\n"
+        "    if name in state['repo_labels']:\n"
+        "        print('already_exists (HTTP 422)', file=sys.stderr); sys.exit(1)\n"
+        "    state['repo_labels'].append(name); save(); sys.exit(0)\n"
+        "if '--paginate' in rest:\n"
+        "    print(json.dumps([{'name': n} for n in state['pr_labels']])); sys.exit(0)\n"
+        "name = next(a.split('=', 1)[1] for a in rest if a.startswith('labels[]='))\n"
+        "if name not in state['pr_labels']:\n"
+        "    state['pr_labels'].append(name)\n"
+        "save(); sys.exit(0)\n"
+    )
+    gh.chmod(0o755)
+    return bin_dir
+
+
+def _run_provenance_labels(
+    provenance_labels_script, provenance_label_gh, tmp_path, *, run_id="", card_id="", agent_slug="",
+    existing_pr_labels=None, existing_repo_labels=None, always_fail=False,
+):
+    d = tmp_path / "ghfix"
+    d.mkdir(exist_ok=True)
+    (d / "state.json").write_text(json.dumps({
+        "pr_labels": existing_pr_labels or [],
+        "repo_labels": existing_repo_labels or [],
+    }))
+    env = {
+        **os.environ,
+        "PATH": f"{provenance_label_gh}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_GH_DIR": str(d),
+        "GH_TOKEN": "fake",
+        "REPO": "tekflox/aw-app-template",
+        "PR_NUMBER": "42",
+        "RUN_ID": run_id,
+        "CARD_ID": card_id,
+        "AGENT_SLUG": agent_slug,
+    }
+    if always_fail:
+        env["FAKE_GH_ALWAYS_FAIL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, str(provenance_labels_script)], capture_output=True, text=True, env=env
+    )
+    state = json.loads((d / "state.json").read_text())
+    calls = (d / "calls.log").read_text() if (d / "calls.log").exists() else ""
+    return proc, state, calls
+
+
+def test_all_three_labels_are_applied_when_everything_resolves(
+    provenance_labels_script, provenance_label_gh, tmp_path
+):
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path,
+        run_id="r" * 32, card_id="card1", agent_slug="coder-sonnet",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"aw-run:{'r' * 32}" in state["pr_labels"]
+    assert "aw-card:card1" in state["pr_labels"]
+    assert "aw-agent:coder-sonnet" in state["pr_labels"]
+
+
+def test_an_empty_value_produces_no_label_for_that_prefix(
+    provenance_labels_script, provenance_label_gh, tmp_path
+):
+    """A run with no card (today's reality for a card-less run) must not
+    become a literal `aw-card:` label — same silent-absence treatment as
+    the footer's Card/Agent lines."""
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path, run_id="r" * 32,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert any(n.startswith("aw-run:") for n in state["pr_labels"])
+    assert not any(n.startswith("aw-card:") for n in state["pr_labels"])
+    assert not any(n.startswith("aw-agent:") for n in state["pr_labels"])
+
+
+def test_the_card_id_has_its_dashes_stripped(provenance_labels_script, provenance_label_gh, tmp_path):
+    """Notion page ids are dashed; the label-name convention strips them."""
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path, run_id="r" * 32,
+        card_id="4175bf3b-9510-81f6-978c-ccf444809ccb",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "aw-card:4175bf3b951081f6978cccf444809ccb" in state["pr_labels"]
+
+
+def test_a_stale_same_prefix_label_is_replaced(provenance_labels_script, provenance_label_gh, tmp_path):
+    """Round 2 (or a later `/aw-review`) can resolve a different agent slug
+    than round 1 did — the old `aw-agent:` label must not linger alongside
+    the new one."""
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path, run_id="r" * 32, agent_slug="coder-opus",
+        existing_pr_labels=["aw-run:" + "r" * 32, "aw-agent:coder-sonnet"],
+        existing_repo_labels=["aw-run:" + "r" * 32, "aw-agent:coder-sonnet"],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "aw-agent:coder-opus" in state["pr_labels"]
+    assert "aw-agent:coder-sonnet" not in state["pr_labels"]
+    assert "DELETE" in calls and "aw-agent" in calls
+
+
+def test_an_already_applied_label_is_left_alone(provenance_labels_script, provenance_label_gh, tmp_path):
+    """No redundant create/add call when the exact label is already on the
+    PR — idempotent across every push and `/aw-review` round."""
+    existing = ["aw-run:" + "r" * 32]
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path, run_id="r" * 32,
+        existing_pr_labels=existing, existing_repo_labels=existing,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert state["pr_labels"] == existing
+    assert "-X POST" not in calls, "re-created or re-added an unchanged label"
+
+
+def test_a_label_create_422_already_exists_is_treated_as_success(
+    provenance_labels_script, provenance_label_gh, tmp_path
+):
+    """The repo-level label already exists (another PR created it first) —
+    that 422 must not stop this PR from getting it applied."""
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path, run_id="r" * 32,
+        existing_repo_labels=["aw-run:" + "r" * 32],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"aw-run:{'r' * 32}" in state["pr_labels"]
+
+
+def test_an_oversized_label_is_skipped_not_truncated(provenance_labels_script, provenance_label_gh, tmp_path):
+    """GitHub caps label names at 50 chars. A label that would exceed it is
+    dropped with a warning, never silently truncated into a lie."""
+    long_slug = "a" * 45  # "aw-agent:" + 45 chars = 54, over the limit
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path, run_id="r" * 32, agent_slug=long_slug,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not any(n.startswith("aw-agent:") for n in state["pr_labels"])
+    assert "::warning::" in proc.stdout
+    assert f"aw-run:{'r' * 32}" in state["pr_labels"], "the oversized field must not block the others"
+
+
+def test_the_step_never_exits_nonzero_even_when_gh_hard_fails(
+    provenance_labels_script, provenance_label_gh, tmp_path
+):
+    """`merge-attempt` needs `provenance-gate` to succeed — a hiccup in this
+    purely-cosmetic enrichment step must never turn into a blocked merge."""
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path, run_id="r" * 32, card_id="card1",
+        agent_slug="coder-sonnet", always_fail=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "::warning::" in proc.stdout
 
 
 # --------------------------------------------------------------------------

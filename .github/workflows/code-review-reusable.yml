@@ -1147,6 +1147,7 @@ jobs:
           TRAILER_RE = re.compile(r"^AW-Run-Id:\s*([0-9a-f]{32})\s*$", re.MULTILINE)
           SESSION_RE = re.compile(r"^AW-Session-Id:\s*(\S+)\s*$", re.MULTILINE)
           CARD_RE = re.compile(r"^AW-Card:\s*(\S+)\s*$", re.MULTILINE)
+          AGENT_RE = re.compile(r"^AW-Agent-Slug:\s*([A-Za-z0-9._-]+)\s*$", re.MULTILINE)
 
           def first_match(regex, message):
               m = regex.search(message)
@@ -1164,6 +1165,7 @@ jobs:
                       "run_id": run_id,
                       "session_id": first_match(SESSION_RE, message) or "",
                       "card_id": first_match(CARD_RE, message) or "",
+                      "agent_slug": first_match(AGENT_RE, message) or "",
                       "commit_sha": commit.get("sha", "")[:7],
                   }
                   break
@@ -1194,6 +1196,7 @@ jobs:
           RUN_ID: ${{ steps.provenance.outputs.run_id }}
           SESSION_ID: ${{ steps.provenance.outputs.session_id }}
           CARD_ID: ${{ steps.provenance.outputs.card_id }}
+          AGENT_SLUG: ${{ steps.provenance.outputs.agent_slug }}
         run: |
           set -euo pipefail
           python3 <<'PYEOF'
@@ -1213,6 +1216,8 @@ jobs:
               lines.append(f"**Session:** `{os.environ['SESSION_ID']}`")
           if os.environ.get("CARD_ID"):
               lines.append(f"**Card:** `{os.environ['CARD_ID']}`")
+          if os.environ.get("AGENT_SLUG"):
+              lines.append(f"**Agent:** `{os.environ['AGENT_SLUG']}`")
           footer = (
               f"{START}\n---\n\U0001F9FE **Provenance** — this PR carries the "
               f"agent run that created it, stamped by a `prepare-commit-msg` "
@@ -1247,6 +1252,110 @@ jobs:
           else:
               gh("api", f"repos/{REPO}/issues/{PR_NUMBER}/comments", "-f", f"body={footer}")
           print("provenance footer recorded on the PR body and a sticky comment")
+          PYEOF
+
+      # ---- enrichment, not a gate: apply the resolved ids as PR labels ----
+      # Pure trailer-to-label mapping, no network dependency beyond GitHub's
+      # own API — agent_slug is self-stamped by the same hook as run_id/
+      # card_id (agents-platform-runners' prepare-commit-msg), so there is no
+      # AP-MT lookup here (that shape was designed and explicitly superseded —
+      # see Architect card 4165bf3b-9510-8138-b764-ea10a9f79e9c). `needs:
+      # [gate, code-review, provenance-gate]` on `merge-attempt` below means a
+      # red step here would block real merges over pure enrichment, so this
+      # step is structured to never surface a non-zero exit: every failure
+      # mode (missing trailer, a GitHub API hiccup, a label that already
+      # exists) becomes a `::warning::` and the script always finishes with
+      # `sys.exit(0)`. `continue-on-error` is additional belt-and-braces for
+      # a failure mode even that can't anticipate (e.g. python3 itself
+      # missing on the runner image).
+      - name: Apply provenance labels
+        if: steps.provenance.outputs.run_id != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          RUN_ID: ${{ steps.provenance.outputs.run_id }}
+          CARD_ID: ${{ steps.provenance.outputs.card_id }}
+          AGENT_SLUG: ${{ steps.provenance.outputs.agent_slug }}
+        run: |
+          python3 <<'PYEOF'
+          import json, os, subprocess, sys, urllib.parse
+
+          def main():
+              REPO = os.environ["REPO"]
+              PR_NUMBER = os.environ["PR_NUMBER"]
+
+              # Data-driven: {label prefix: (value, color, description)}. A
+              # future `aw-plan` entry is one line here, not a redesign.
+              LABELS = {
+                  "aw-run": (os.environ.get("RUN_ID", ""), "0e8a16",
+                             "Dev Team provenance: the agent run that created this PR"),
+                  "aw-card": (os.environ.get("CARD_ID", "").replace("-", ""), "1d76db",
+                              "Dev Team provenance: the Kanban card this PR implements"),
+                  "aw-agent": (os.environ.get("AGENT_SLUG", ""), "5319e7",
+                               "Dev Team provenance: the agent slug that created this PR"),
+              }
+
+              def gh(*args):
+                  return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=30)
+
+              existing = gh("api", f"repos/{REPO}/issues/{PR_NUMBER}/labels", "--paginate")
+              existing_names = []
+              if existing.returncode == 0:
+                  try:
+                      existing_names = [l.get("name", "") for l in json.loads(existing.stdout or "[]")]
+                  except json.JSONDecodeError:
+                      print(f"::warning::could not parse existing PR labels: {existing.stdout[:200]}")
+              else:
+                  print(f"::warning::could not list PR #{PR_NUMBER} labels: {existing.stderr[:200]}")
+
+              for prefix, (value, color, description) in LABELS.items():
+                  if not value:
+                      continue
+                  label_name = f"{prefix}:{value}"
+                  if len(label_name) > 50:
+                      print(f"::warning::skipping {prefix} label — {label_name!r} exceeds "
+                            f"GitHub's 50-char label-name limit")
+                      continue
+
+                  # Replace-by-prefix: drop any stale same-prefix label whose
+                  # value changed (the colon needs URL-encoding in the path).
+                  stale_names = [n for n in existing_names
+                                 if n.startswith(f"{prefix}:") and n != label_name]
+                  for stale in stale_names:
+                      encoded = urllib.parse.quote(stale, safe="")
+                      d = gh("api", "-X", "DELETE",
+                             f"repos/{REPO}/issues/{PR_NUMBER}/labels/{encoded}")
+                      if d.returncode != 0:
+                          print(f"::warning::could not remove stale label {stale!r}: "
+                                f"{d.stderr[:200]}")
+
+                  if label_name in existing_names:
+                      continue  # already applied, nothing to do
+
+                  # Ensure the label exists on the repo — create-on-demand,
+                  # treating "already exists" (422) as success.
+                  create = gh("api", "-X", "POST", f"repos/{REPO}/labels",
+                               "-f", f"name={label_name}", "-f", f"color={color}",
+                               "-f", f"description={description}")
+                  if create.returncode != 0 and "already_exists" not in create.stderr:
+                      print(f"::warning::could not ensure label {label_name!r} exists on "
+                            f"{REPO}: {create.stderr[:200]}")
+
+                  add = gh("api", f"repos/{REPO}/issues/{PR_NUMBER}/labels",
+                            "-f", f"labels[]={label_name}")
+                  if add.returncode != 0:
+                      print(f"::warning::could not apply label {label_name!r} to PR "
+                            f"#{PR_NUMBER}: {add.stderr[:200]}")
+                  else:
+                      print(f"applied label {label_name!r}")
+
+          try:
+              main()
+          except Exception as e:
+              print(f"::warning::provenance label step failed unexpectedly: {e!r}")
+          sys.exit(0)
           PYEOF
 
   # ---------------------------------------------------------------------------

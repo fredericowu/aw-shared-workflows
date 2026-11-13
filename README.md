@@ -24,7 +24,7 @@ workflow cuts a tag the others' callers simply don't have to bump.
 embedded step scripts by text-scanning them and execute them, so they assert
 against the bytes CI actually runs. The first moved here from
 `tekflox/aw-app-template` along with the logic it guards. **Run them before
-tagging** — `python -m pytest tests/ -q` (166 tests).
+tagging** — `python -m pytest tests/ -q` (178 tests).
 
 ## Pin an exact tag. Never a moving ref.
 
