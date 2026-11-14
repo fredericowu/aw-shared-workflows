@@ -28,11 +28,28 @@ name: Code Review (reusable)
 #                    Defaults to the production deployment; separate inputs so a
 #                    staging AP-MT could be reviewed by production, or vice
 #                    versa, without forking this file.
+#   `agent_slug`     (optional, default `code-reviewer-sonnet`) which Agents
+#                    Platform agent gets dispatched for the review. The ONE
+#                    deliberate exception to the "not parameterized" rule
+#                    below — added for `code-reviewer-pipeline`, a
+#                    flow-detached twin of `code-reviewer-sonnet` that exists
+#                    purely so a CI-dispatched review (no Kanban card, no
+#                    caller session) stops sharing a slug with a node on the
+#                    `software-engineering` Agents Flow. Before the split,
+#                    every GitHub-CI review was ALSO subject to that flow's
+#                    reprompt/escalation contract, because
+#                    `_agents_flow_context` keys purely on agent identity —
+#                    which is how run `8137817bf28841ee8a3643d2a769f12c` got
+#                    reprompted and escalated to a sysadmin page for a review
+#                    that had already completed cleanly. `agent_slug` lets a
+#                    caller repoint at the flow-detached twin without forking
+#                    this file; every other caller is unaffected by the
+#                    default.
 #
-# Everything else is deliberately NOT parameterized. The agent slug, the label
-# names, the status context, the round state machine, the fail-closed
-# `blocks_merge` rule, the HMAC scheme — varying any of those between repos is
-# how the three copies drifted in the first place.
+# Everything else is deliberately NOT parameterized. The label names, the
+# status context, the round state machine, the fail-closed `blocks_merge`
+# rule, the HMAC scheme — varying any of those between repos is how the
+# three copies drifted in the first place.
 #
 # ── PINNING: EXACT TAGS ONLY ──────────────────────────────────────────────
 # Callers MUST pin an exact, immutable tag (`@v1.0.0`), never `@master` and
@@ -215,6 +232,16 @@ on:
         required: false
         type: string
         default: 'https://agents-platform.aw.tekflox.com'
+      agent_slug:
+        description: >-
+          Agents Platform agent slug to dispatch for the review. Default is
+          the flow-attached `code-reviewer-sonnet`; a caller passes
+          `code-reviewer-pipeline` (its flow-detached twin) to keep a
+          CI-only dispatch off the `software-engineering` Agents Flow's
+          reprompt/escalation contract. See the PROVENANCE note above.
+        required: false
+        type: string
+        default: 'code-reviewer-sonnet'
     secrets:
       # All `required: false`, deliberately. A caller missing one gets a
       # precise, fail-loud error from the step that needs it, naming the repo
@@ -549,11 +576,12 @@ jobs:
       # output schema, comment-placement rule, bot-identity banner) lives in
       # the aw-agent-code-reviewer skill's "PR deep-review entry path"
       # section, not here.
-      - name: Dispatch Code Reviewer - Sonnet
+      - name: Dispatch Code Reviewer
         id: dispatch
         env:
           AW_CODEREVIEW_V1_KEY: ${{ secrets.AW_CODEREVIEW_V1_KEY }}
           DISPATCH_URL: ${{ inputs.dispatch_url }}
+          AGENT_SLUG: ${{ inputs.agent_slug }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           HEAD_SHA: ${{ needs.gate.outputs.sha }}
@@ -565,15 +593,15 @@ jobs:
           if [ -z "${AW_CODEREVIEW_V1_KEY:-}" ]; then
             echo "::error::AW_CODEREVIEW_V1_KEY is not set on ${REPO}. Either the \
             secret is missing or the caller did not pass \`secrets: inherit\`. It must \
-            be a WORKSPACE-BOUND Agents Platform ApiKey scoped to code-reviewer-sonnet."
+            be a WORKSPACE-BOUND Agents Platform ApiKey scoped to ${AGENT_SLUG}."
             exit 1
           fi
           payload="$(jq -n \
             --arg repo "$REPO" --arg pr "$PR_NUMBER" \
             --arg sha "$HEAD_SHA" --arg base "$BASE_REF" --arg mode "$MODE" \
-            --arg round "$ROUND" \
+            --arg round "$ROUND" --arg agent_slug "$AGENT_SLUG" \
             '{
-              model: "agent/code-reviewer-sonnet",
+              model: ("agent/" + $agent_slug),
               messages: [{role: "user", content: (
                 "PR deep review. Repo: " + $repo + ". PR #" + $pr +
                 ". Head SHA: " + $sha + ". Base ref: " + $base +
@@ -641,6 +669,7 @@ jobs:
           ROUND: ${{ needs.gate.outputs.round }}
           IS_DRAFT: ${{ needs.gate.outputs.is_draft }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AGENT_SLUG: ${{ inputs.agent_slug }}
         run: |
           set -euo pipefail
           python3 <<'PYEOF'
@@ -681,9 +710,10 @@ jobs:
           repo = os.environ["REPO"]
           pr = os.environ["PR_NUMBER"]
           sha = os.environ["HEAD_SHA"]
+          agent_slug = os.environ["AGENT_SLUG"]
           banner = (
               "\U0001F50E **Dev Team Code Review** — automated deep "
-              "review by `code-reviewer-sonnet`."
+              f"review by `{agent_slug}`."
           )
 
           findings = data.get("findings") or []
@@ -2031,7 +2061,9 @@ jobs:
 #
 # Per consumer repo, once:
 #   - secrets: AW_CODEREVIEW_V1_KEY (workspace-bound, scoped to
-#     code-reviewer-sonnet), AW_DEVTEAM_MERGE_TOKEN, AW_DEVTEAM_EVENT_SECRET
+#     code-reviewer-sonnet — or to whatever `agent_slug` the caller passes,
+#     see the PROVENANCE note above), AW_DEVTEAM_MERGE_TOKEN,
+#     AW_DEVTEAM_EVENT_SECRET
 #   - labels: devteam:awaiting-fixes (#FBCA04), devteam:needs-human (#B60205),
 #     provenance-exempt (#0E8A16) — human-applied only, see `provenance-gate`
 #       gh label create devteam:awaiting-fixes --color FBCA04 --repo <owner/repo> \

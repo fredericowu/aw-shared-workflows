@@ -167,7 +167,15 @@ def fake_gh(tmp_path_factory) -> Path:
 
 
 def _run_eligibility(
-    script: Path, tmp_path, fake_gh, *, findings, counts, round_: str, is_draft: str = "false"
+    script: Path,
+    tmp_path,
+    fake_gh,
+    *,
+    findings,
+    counts,
+    round_: str,
+    is_draft: str = "false",
+    agent_slug: str = "code-reviewer-sonnet",
 ) -> dict:
     """Drive the real step script and return its GITHUB_OUTPUT as a dict.
 
@@ -211,6 +219,7 @@ def _run_eligibility(
         "RUNNER_TEMP": str(tmp_path),
         "RUN_URL": "https://example.invalid/run/1",
         "GH_LOG": str(tmp_path / "gh_calls.log"),
+        "AGENT_SLUG": agent_slug,
     }
     proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env)
     assert proc.returncode == 0, f"step script failed:\n{proc.stderr[-2000:]}"
@@ -279,6 +288,25 @@ def test_round1_counts_a_cross_cutting_finding(eligibility_script, tmp_path, fak
     )
     assert got["eligible"] == "false"
     assert got["findings_count"] == "1"
+
+
+def test_the_review_banner_names_the_dispatched_agent_slug(eligibility_script, tmp_path, fake_gh):
+    """The posted comment's banner must name whichever agent_slug the caller
+    passed, not a slug hardcoded at the default — a canary dispatching
+    `code-reviewer-pipeline` must not post a comment claiming
+    `code-reviewer-sonnet` did the review."""
+    _run_eligibility(
+        eligibility_script,
+        tmp_path,
+        fake_gh,
+        findings=[CROSS_CUTTING],
+        counts={"info": 1},
+        round_="1",
+        agent_slug="code-reviewer-pipeline",
+    )
+    log = (tmp_path / "gh_calls.log").read_text()
+    assert "code-reviewer-pipeline" in log
+    assert "code-reviewer-sonnet" not in log
 
 
 def test_round2_gate_is_blocks_merge_and_not_severity(eligibility_script, tmp_path, fake_gh):
