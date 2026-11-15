@@ -1,8 +1,8 @@
 name: Code Review (reusable)
 
 # The canonical two-round PR review -> merge loop, as a `workflow_call`
-# reusable workflow. Deep PR review by the Dev Team's own reviewer agent
-# (`code-reviewer` by default), published as the commit status
+# reusable workflow. Deep PR review by the Dev Team's pipeline reviewer agent
+# (`code-reviewer-pipeline` by default), published as the commit status
 # `devteam/code-review` on the PR's head SHA.
 # ADVISORY BY DESIGN: no single automated reviewer is the authority, and this
 # is never promoted to a required check on its own.
@@ -28,12 +28,13 @@ name: Code Review (reusable)
 #                    Defaults to the production deployment; separate inputs so a
 #                    staging AP-MT could be reviewed by production, or vice
 #                    versa, without forking this file.
-#   `agent_slug`     (optional, default `code-reviewer`) which Agents
+#   `agent_slug`     (optional, default `code-reviewer-pipeline`) which Agents
 #                    Platform agent gets dispatched for the review. Model-agnostic
-#                    by default so switching the underlying model in AP-MT does
-#                    not require changing the reusable workflow. Callers can still
-#                    override it (e.g. `code-reviewer-pipeline` or
-#                    `code-reviewer-sonnet` for flow-attached legacy keys).
+#                    and flow-detached so CI-dispatched reviews stay off the
+#                    `software-engineering` Agents Flow's reprompt/escalation
+#                    contract and the underlying model can be changed in AP-MT
+#                    without editing this workflow. Callers can still override
+#                    it (e.g. `code-reviewer-sonnet`).
 #                    purely so a CI-dispatched review (no Kanban card, no
 #                    caller session) stops sharing a slug with a node on the
 #                    `software-engineering` Agents Flow. Before the split,
@@ -236,11 +237,11 @@ on:
       agent_slug:
         description: >-
           Agents Platform agent slug to dispatch for the review. Default is
-          the model-agnostic `code-reviewer`; callers may override it (e.g.
-          `code-reviewer-pipeline` or `code-reviewer-sonnet`).
+          the flow-detached, model-agnostic `code-reviewer-pipeline`; callers
+          may override it (e.g. `code-reviewer-sonnet`).
         required: false
         type: string
-        default: 'code-reviewer'
+        default: 'code-reviewer-pipeline'
     secrets:
       # All `required: false`, deliberately. A caller missing one gets a
       # precise, fail-loud error from the step that needs it, naming the repo
@@ -251,7 +252,7 @@ on:
       AW_CODEREVIEW_V1_KEY:
         description: >-
           Agents Platform ApiKey for the reviewer dispatch. MUST be
-          WORKSPACE-BOUND and scoped to `code-reviewer` (or whichever
+          WORKSPACE-BOUND and scoped to `code-reviewer-pipeline` (or whichever
           `agent_slug` is configured) — an unbound key gives an opaque 500 at
           the /v1 door, not a 401.
         required: false
