@@ -1231,7 +1231,7 @@ jobs:
           publish_cleared(f"AW-Run-Id {found['run_id'][:12]}… verified")
           PYEOF
 
-      - name: Record the provenance footer on the PR body and a sticky comment
+      - name: Record the provenance footer on the PR body
         if: steps.provenance.outputs.run_id != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1285,17 +1285,7 @@ jobs:
           else:
               body = body.rstrip() + "\n\n" + footer
           gh("api", "-X", "PATCH", f"repos/{REPO}/pulls/{PR_NUMBER}", "-f", f"body={body}")
-
-          # ---- sticky comment: find-and-update, or create ----
-          comments = json.loads(gh("api", f"repos/{REPO}/issues/{PR_NUMBER}/comments",
-                                    "--paginate"))
-          existing = next((c for c in comments if START in (c.get("body") or "")), None)
-          if existing:
-              gh("api", "-X", "PATCH", f"repos/{REPO}/issues/comments/{existing['id']}",
-                 "-f", f"body={footer}")
-          else:
-              gh("api", f"repos/{REPO}/issues/{PR_NUMBER}/comments", "-f", f"body={footer}")
-          print("provenance footer recorded on the PR body and a sticky comment")
+          print("provenance footer recorded on the PR body")
           PYEOF
 
       # ---- enrichment, not a gate: apply the resolved ids as PR labels ----
