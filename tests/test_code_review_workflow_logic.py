@@ -1349,10 +1349,10 @@ def test_a_missing_agent_slug_trailer_is_simply_absent(
 
 
 # --------------------------------------------------------------------------
-# provenance-gate's footer step — idempotent PR body + sticky comment
+# provenance-gate's footer step — idempotent PR body only
 # --------------------------------------------------------------------------
 
-_FOOTER_STEP = "- name: Record the provenance footer on the PR body and a sticky comment"
+_FOOTER_STEP = "- name: Record the provenance footer on the PR body"
 
 
 @pytest.fixture(scope="module")
@@ -1366,9 +1366,7 @@ def footer_script(tmp_path_factory) -> Path:
 
 @pytest.fixture(scope="module")
 def footer_gh(tmp_path_factory) -> Path:
-    """A stateful fake `gh` that plays PR body + comment store, so the same
-    tmp_path can drive this script twice and prove the SECOND call replaces
-    the first footer in place rather than appending a second one."""
+    """A stateful fake `gh` that plays a PR body and rejects comment calls."""
     bin_dir = tmp_path_factory.mktemp("footerbin")
     gh = bin_dir / "gh"
     gh.write_text(
@@ -1392,17 +1390,6 @@ def footer_gh(tmp_path_factory) -> Path:
         "    print(json.dumps({'body': state['pr_body']})); sys.exit(0)\n"
         "if path.endswith('/pulls/42') and is_patch:\n"
         "    state['pr_body'] = body_arg(); save(); sys.exit(0)\n"
-        "if path.endswith('/comments') and '--paginate' in rest:\n"
-        "    print(json.dumps(state['comments'])); sys.exit(0)\n"
-        "if path.endswith('/comments') and not is_patch:\n"
-        "    state['comments'].append({'id': len(state['comments']) + 1, 'body': body_arg()})\n"
-        "    save(); sys.exit(0)\n"
-        "if '/issues/comments/' in path and is_patch:\n"
-        "    cid = int(path.rsplit('/', 1)[-1])\n"
-        "    for c in state['comments']:\n"
-        "        if c['id'] == cid:\n"
-        "            c['body'] = body_arg()\n"
-        "    save(); sys.exit(0)\n"
         "print('gh: unexpected call ' + repr(args), file=sys.stderr)\n"
         "sys.exit(1)\n"
     )
@@ -1412,10 +1399,13 @@ def footer_gh(tmp_path_factory) -> Path:
 
 def _run_footer(
     footer_script, footer_gh, tmp_path, *, run_id, session_id="", card_id="",
-    agent_slug="",
+    agent_slug="", initial_comments=None,
 ):
     d = tmp_path / "ghfix"
     d.mkdir(exist_ok=True)
+    state_path = d / "state.json"
+    if not state_path.exists() and initial_comments is not None:
+        state_path.write_text(json.dumps({"pr_body": "", "comments": initial_comments}))
     env = {
         **os.environ,
         "PATH": f"{footer_gh}{os.pathsep}{os.environ['PATH']}",
@@ -1440,21 +1430,33 @@ def test_the_footer_is_appended_once(footer_script, footer_gh, tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert state["pr_body"].count("<!-- devteam:provenance:start -->") == 1
     assert "r" * 32 in state["pr_body"]
-    assert len(state["comments"]) == 1
-    assert "r" * 32 in state["comments"][0]["body"]
+    assert state["comments"] == []
 
 
 def test_a_second_round_replaces_the_footer_in_place(footer_script, footer_gh, tmp_path):
-    """Round 2 (or a later `/aw-review`) on the same PR must not pile up a
-    second footer/comment — it must update the one already there."""
+    """Round 2 (or a later `/aw-review`) replaces the body footer in place."""
     _run_footer(footer_script, footer_gh, tmp_path, run_id="r" * 32)
     proc, state = _run_footer(footer_script, footer_gh, tmp_path, run_id="s" * 32)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert state["pr_body"].count("<!-- devteam:provenance:start -->") == 1
     assert "r" * 32 not in state["pr_body"]
     assert "s" * 32 in state["pr_body"]
-    assert len(state["comments"]) == 1, "a second round created a second comment"
-    assert "s" * 32 in state["comments"][0]["body"]
+    assert state["comments"] == []
+
+
+def test_the_footer_does_not_create_or_modify_comments(
+    footer_script, footer_gh, tmp_path
+):
+    historical = [{"id": 7, "body": "existing substantive review comment"}]
+    proc, state = _run_footer(
+        footer_script,
+        footer_gh,
+        tmp_path,
+        run_id="r" * 32,
+        initial_comments=historical,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert state["comments"] == historical
 
 
 def test_the_footer_includes_the_agent_line_when_resolved(
