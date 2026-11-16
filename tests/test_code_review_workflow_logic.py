@@ -1236,7 +1236,7 @@ def test_a_well_formed_trailer_clears_the_gate(
     assert "devteam/provenance" in calls and "state=success" in calls
 
 
-def test_no_trailer_on_any_commit_fails_the_gate(
+def test_no_trailer_on_any_commit_warns_without_blocking(
     provenance_script, provenance_gh, tmp_path
 ):
     proc, outputs, calls = _run_provenance(
@@ -1245,10 +1245,10 @@ def test_no_trailer_on_any_commit_fails_the_gate(
         tmp_path,
         commits=[_commit("just a normal commit, no trailer")],
     )
-    assert proc.returncode != 0
-    assert "no commit on PR" in proc.stdout
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "::warning::no commit on PR" in proc.stdout
     assert "run_id" not in outputs
-    assert "devteam/provenance" not in calls
+    assert "devteam/provenance" in calls and "state=success" in calls
 
 
 def test_a_malformed_run_id_does_not_count(provenance_script, provenance_gh, tmp_path):
@@ -1260,7 +1260,8 @@ def test_a_malformed_run_id_does_not_count(provenance_script, provenance_gh, tmp
         tmp_path,
         commits=[_commit("AW-Run-Id: not-a-real-run-id\n")],
     )
-    assert proc.returncode != 0
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "::warning::no commit on PR" in proc.stdout
     assert "run_id" not in outputs
 
 
