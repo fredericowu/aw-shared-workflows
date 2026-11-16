@@ -236,12 +236,21 @@ on:
         default: 'https://agents-platform.aw.tekflox.com'
       agent_slug:
         description: >-
-          Agents Platform agent slug to dispatch for the review. Default is
-          the flow-detached, model-agnostic `code-reviewer-pipeline`; callers
-          may override it (e.g. `code-reviewer-sonnet`).
+          Agents Platform agent slug to dispatch for the review when
+          `workflow_slug` is empty, and displayed in the PR review comment
+          banner. Default is `code-reviewer-pipeline`.
         required: false
         type: string
         default: 'code-reviewer-pipeline'
+      workflow_slug:
+        description: >-
+          Agents Platform workflow slug to dispatch for the review
+          (`model: "workflow/<workflow_slug>"`). Default is
+          `code-review-pipeline`; set to `""` to dispatch
+          `agent/<agent_slug>` directly instead.
+        required: false
+        type: string
+        default: 'code-review-pipeline'
     secrets:
       # All `required: false`, deliberately. A caller missing one gets a
       # precise, fail-loud error from the step that needs it, naming the repo
@@ -583,6 +592,7 @@ jobs:
           AW_CODEREVIEW_V1_KEY: ${{ secrets.AW_CODEREVIEW_V1_KEY }}
           DISPATCH_URL: ${{ inputs.dispatch_url }}
           AGENT_SLUG: ${{ inputs.agent_slug }}
+          WORKFLOW_SLUG: ${{ inputs.workflow_slug }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           HEAD_SHA: ${{ needs.gate.outputs.sha }}
@@ -592,17 +602,19 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${AW_CODEREVIEW_V1_KEY:-}" ]; then
+            target="${WORKFLOW_SLUG:-$AGENT_SLUG}"
             echo "::error::AW_CODEREVIEW_V1_KEY is not set on ${REPO}. Either the \
             secret is missing or the caller did not pass \`secrets: inherit\`. It must \
-            be a WORKSPACE-BOUND Agents Platform ApiKey scoped to ${AGENT_SLUG}."
+            be a WORKSPACE-BOUND Agents Platform ApiKey scoped to ${target}."
             exit 1
           fi
           payload="$(jq -n \
             --arg repo "$REPO" --arg pr "$PR_NUMBER" \
             --arg sha "$HEAD_SHA" --arg base "$BASE_REF" --arg mode "$MODE" \
             --arg round "$ROUND" --arg agent_slug "$AGENT_SLUG" \
+            --arg workflow_slug "$WORKFLOW_SLUG" \
             '{
-              model: ("agent/" + $agent_slug),
+              model: (if $workflow_slug != "" then ("workflow/" + $workflow_slug) else ("agent/" + $agent_slug) end),
               messages: [{role: "user", content: (
                 "PR deep review. Repo: " + $repo + ". PR #" + $pr +
                 ". Head SHA: " + $sha + ". Base ref: " + $base +
