@@ -205,12 +205,13 @@ on:
 # it is an explicit `none`, and it silently caps every caller to zero no
 # matter what they grant. A caller-side grant alone buys nothing.
 #
-# `security-events: write` is the one that matters here: without it on BOTH
-# sides, every `upload-sarif` step 403s on a caller that does have Advanced
-# Security — which looks exactly like the no-GHAS failure `sarif_upload`
-# exists for, and sends you to flip the wrong switch. Guarded by
+# `security-events: write` and `actions: read` both matter here. The former
+# authorizes the upload; the latter lets `upload-sarif` read workflow-run
+# metadata on private repositories. Without either scope on BOTH sides, the
+# upload 403s with "Resource not accessible by integration". Guarded by
 # `test_the_reusable_requests_every_scope_the_caller_checklist_demands`.
 permissions:
+  actions: read
   contents: read
   security-events: write
 
@@ -329,6 +330,7 @@ jobs:
 #       security-scan:
 #         uses: fredericowu/aw-shared-workflows/.github/workflows/security-scan-reusable.yml@v1.6.0
 #         permissions:
+#           actions: read
 #           contents: read
 #           security-events: write
 #
@@ -361,6 +363,7 @@ jobs:
 #
 # In the caller's `uses:` job, REQUIRED — both:
 #     permissions:
+#       actions: read
 #       contents: read
 #       security-events: write
 #
@@ -385,6 +388,7 @@ jobs:
 #         security-scan:
 #           uses: fredericowu/aw-shared-workflows/.github/workflows/security-scan-reusable.yml@v1.6.0
 #           permissions:
+#             actions: read
 #             contents: read
 #             security-events: write
 #           with:

@@ -367,6 +367,7 @@ jobs:
   security-scan:
     uses: fredericowu/aw-shared-workflows/.github/workflows/security-scan-reusable.yml@v1.6.0
     permissions:
+      actions: read
       contents: read
       security-events: write
 ```
