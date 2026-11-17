@@ -1496,7 +1496,7 @@ jobs:
           # aw-stack). Present AND passing is required — "absent" must not
           # read as "fine", or deleting the CI job would silently re-open
           # this merge window.
-          REQUIRED = {os.environ["CI_CHECK_NAME"]}
+          REQUIRED = {c for c in [os.environ["CI_CHECK_NAME"].strip()] if c}
 
           # Our own review surfaces are advisory by standing rule and must
           # not gate the merge. Names are listed even for repos that don't
