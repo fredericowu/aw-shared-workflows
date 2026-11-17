@@ -458,7 +458,7 @@ def test_there_are_exactly_two_inputs_and_no_secrets():
     would hand a scheduled job on a self-hosted runner a credential it has no
     use for, and every added input is a new axis for 61 callers to drift on."""
     text = WORKFLOW.read_text()
-    call = text[text.index("  workflow_call:"):text.index("permissions:\n  contents: read")]
+    call = text[text.index("  workflow_call:"):text.index("permissions:\n  actions: read")]
     inputs = re.findall(r"^      (\w+):\s*$", call, re.MULTILINE)
     assert inputs == ["runs_on", "sarif_upload"], f"unexpected input set: {inputs}"
     assert "secrets:" not in call, "this workflow must declare no secrets"
@@ -539,11 +539,12 @@ def test_the_requested_scopes_are_exactly_what_the_scan_needs():
     two lists that happen to match — including two that are both wrong.
 
     `contents: read` is the checkout; `security-events: write` is the SARIF
-    upload. Nothing else: this workflow opens no PR, writes no status, reads
-    no check. In particular it needs none of the `pull-requests`/`issues`/
-    `statuses`/`checks`/`actions` scopes the two sibling review workflows do.
+    upload; `actions: read` lets upload-sarif read workflow-run metadata on
+    private repositories. Nothing else: this workflow opens no PR, writes no
+    status, and reads no check.
     """
     assert _own_permissions() == {
+        "actions": "read",
         "contents": "read",
         "security-events": "write",
     }
