@@ -174,6 +174,7 @@ def _run_eligibility(
     findings,
     counts,
     round_: str,
+    verdict=None,
     is_draft: str = "false",
     agent_slug: str = "code-reviewer-sonnet",
 ) -> dict:
@@ -189,6 +190,8 @@ def _run_eligibility(
     tmp_path is already unique per call, so this isolates each invocation
     the same way RUNNER_TEMP isolates each real job.
     """
+    if verdict is None:
+        verdict = {"findings": findings, "counts": counts}
     (tmp_path / "dispatch_response.json").write_text(
         json.dumps(
             {
@@ -196,7 +199,7 @@ def _run_eligibility(
                     {
                         "message": {
                             "content": "Here is my review:\n```json\n"
-                            + json.dumps({"findings": findings, "counts": counts})
+                            + json.dumps(verdict)
                             + "\n```"
                         }
                     }
@@ -259,6 +262,22 @@ NO_BLOCKS_FIELD = {
     "body": "x",
 }
 CROSS_CUTTING = {"severity": "info", "title": "architecture note", "body": "no file/line"}
+
+
+@pytest.mark.parametrize("verdict", [
+    {"output": '{"findings": [], "counts": {}}', "completed": 2, "total": 2},
+    {"findings": []},
+    {"findings": None, "counts": {}},
+    {"findings": [], "counts": None},
+])
+def test_invalid_verdict_fails_before_posting(eligibility_script, tmp_path, fake_gh, verdict):
+    with pytest.raises(AssertionError, match="invalid review verdict"):
+        _run_eligibility(
+            eligibility_script, tmp_path, fake_gh,
+            findings=[], counts={}, round_="1", verdict=verdict,
+        )
+    assert _gh_calls(tmp_path) == []
+    assert (tmp_path / "gh_output").read_text() == ""
 
 
 def test_round1_merges_only_on_zero_findings(eligibility_script, tmp_path, fake_gh):
@@ -1763,17 +1782,17 @@ OTHER_SHA = "c" * 40
 # Sentinel: write no fixture file at all, so the fake `gh` fails that call the
 # way a real 403 from a missing `checks: read` does.
 _MISSING = object()
+_REVIEW_URL = "https://example.invalid/actions/runs/42/attempts/1"
+_REVIEW_CLEARANCE = [
+    {"context": "devteam/merge-eligible", "state": "success", "target_url": _REVIEW_URL},
+    {"context": "devteam/code-review", "state": "success", "target_url": _REVIEW_URL},
+]
 _ELIGIBLE = {"statuses": [
-    {"context": "devteam/merge-eligible", "state": "success"},
+    *_REVIEW_CLEARANCE,
     {"context": "devteam/provenance", "state": "success"},
 ]}
 _NOT_ELIGIBLE: dict = {"statuses": []}
-# Eligible per the review, but no commit ever carried a verified AW-Run-Id
-# trailer (or the provenance-exempt label) — the case `provenance-gate`
-# exists to create.
-_PROVENANCE_NOT_CLEARED = {
-    "statuses": [{"context": "devteam/merge-eligible", "state": "success"}]
-}
+_PROVENANCE_NOT_CLEARED = {"statuses": _REVIEW_CLEARANCE}
 _GREEN = [{"name": "coverage", "state": "SUCCESS", "bucket": "pass"}]
 
 
@@ -1888,6 +1907,24 @@ def test_a_workflow_run_with_no_eligible_status_exits_neutral(
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not merged
     assert "has not cleared this head" in proc.stdout
+
+
+@pytest.mark.parametrize(("review_state", "review_url"), [
+    ("pending", _REVIEW_URL),
+    ("failure", _REVIEW_URL),
+    ("success", "https://example.invalid/actions/runs/42/attempts/2"),
+])
+def test_merge_requires_success_and_clearance_from_the_same_attempt(
+    merge_script, merge_gh, tmp_path, review_state, review_url,
+):
+    statuses = [dict(status) for status in _ELIGIBLE["statuses"]]
+    statuses[1].update(state=review_state, target_url=review_url)
+    proc, merged = _run_merge(
+        merge_script, merge_gh, tmp_path, status={"statuses": statuses},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not merged
+    assert "latest code review attempt" in proc.stdout
 
 
 def test_eligible_pr_with_no_provenance_status_does_not_merge(
@@ -2428,3 +2465,373 @@ def test_a_pathologically_long_body_is_truncated_not_crashed(
     assert len(sent["unchecked_items"]) == 50
     assert all(len(item) <= 300 for item in sent["unchecked_items"])
     assert sent["unchecked_items"][0].startswith("item 0")
+
+
+# --------------------------------------------------------------------------
+# verdict-validation bypasses (independent review f6736d08)
+# --------------------------------------------------------------------------
+
+
+def _run_raw_content(script, tmp_path, fake_gh, content, round_="1"):
+    """Like `_run_eligibility`, but the judge's message is `content` verbatim."""
+    (tmp_path / "dispatch_response.json").write_text(
+        json.dumps({"choices": [{"message": {"content": content}}]})
+    )
+    out = tmp_path / "gh_output"
+    out.write_text("")
+    env = {
+        **os.environ,
+        "PATH": f"{fake_gh}{os.pathsep}{os.environ['PATH']}",
+        "REPO": "tekflox/aw-app-template", "PR_NUMBER": "42", "HEAD_SHA": "a" * 40,
+        "ROUND": round_, "IS_DRAFT": "false", "GITHUB_OUTPUT": str(out),
+        "GH_TOKEN": "fake", "RUNNER_TEMP": str(tmp_path),
+        "RUN_URL": "https://example.invalid/run/1",
+        "GH_LOG": str(tmp_path / "gh_calls.log"), "AGENT_SLUG": "code-reviewer-sonnet",
+    }
+    return subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env)
+
+
+def _assert_rejected(proc, tmp_path):
+    assert proc.returncode != 0, "a malformed verdict must fail the step"
+    assert "invalid review verdict" in proc.stdout + proc.stderr
+    assert not any("statuses" in c for c in _gh_calls(tmp_path)), "no status may be published"
+    assert (tmp_path / "gh_output").read_text() == ""
+
+
+@pytest.mark.parametrize("round_", ["2", "needs-human"])
+@pytest.mark.parametrize("bad", [None, "false", 0, 1, "true", []])
+def test_blocks_merge_must_be_a_json_boolean(eligibility_script, tmp_path, fake_gh, round_, bad):
+    finding = {**MINOR, "blocks_merge": bad}
+    proc = _run_raw_content(
+        eligibility_script, tmp_path, fake_gh,
+        json.dumps({"findings": [finding], "counts": {"low": 1}}), round_=round_,
+    )
+    _assert_rejected(proc, tmp_path)
+
+
+def test_blocks_merge_booleans_still_work(eligibility_script, tmp_path, fake_gh):
+    got = _run_eligibility(
+        eligibility_script, tmp_path, fake_gh,
+        findings=[HIGH_NON_BLOCKING], counts={"high": 1}, round_="2",
+    )
+    assert got["eligible"] == "true"
+
+
+@pytest.mark.parametrize("findings,counts", [
+    ([], {"high": 1}),
+    ([], {"low": 2}),
+    ([MINOR], {}),
+    ([MINOR], {"low": 2}),
+    ([MINOR], {"high": 1}),
+    ([MINOR], {"low": "1"}),
+    ([MINOR], {"low": True}),
+    ([MINOR], {"low": -1}),
+])
+@pytest.mark.parametrize("round_", ["1", "2"])
+def test_counts_that_contradict_findings_are_rejected(
+    eligibility_script, tmp_path, fake_gh, findings, counts, round_,
+):
+    proc = _run_raw_content(
+        eligibility_script, tmp_path, fake_gh,
+        json.dumps({"findings": findings, "counts": counts}), round_=round_,
+    )
+    _assert_rejected(proc, tmp_path)
+
+
+def test_a_valid_empty_verdict_with_zero_counts_stays_eligible(eligibility_script, tmp_path, fake_gh):
+    for counts in ({}, {"high": 0, "low": 0}):
+        got = _run_eligibility(
+            eligibility_script, tmp_path, fake_gh, findings=[], counts=counts, round_="1"
+        )
+        assert got["eligible"] == "true"
+
+
+@pytest.mark.parametrize("content", [
+    '```json\n[{"findings": [], "counts": {}}]\n```',
+    '[{"findings": [], "counts": {}}]',
+    '```json\n{"findings": [], "counts": {}} trailing {"x": 1}\n```',
+    '{"findings": [], "counts": {}} {"findings": [], "counts": {}}',
+    '```json\nnot json {"findings": [], "counts": {}}\n```',
+])
+def test_the_verdict_must_be_one_complete_top_level_object(
+    eligibility_script, tmp_path, fake_gh, content,
+):
+    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content)
+    assert proc.returncode != 0
+    assert not any("statuses" in c for c in _gh_calls(tmp_path))
+    assert (tmp_path / "gh_output").read_text() == ""
+
+
+def test_prose_before_a_fenced_object_still_parses(eligibility_script, tmp_path, fake_gh):
+    proc = _run_raw_content(
+        eligibility_script, tmp_path, fake_gh,
+        'Here you go:\n```json\n{"findings": [], "counts": {}}\n```\nThanks',
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert any("merge-eligible" in c for c in _gh_calls(tmp_path))
+
+
+def test_an_unfenced_bare_object_still_parses(eligibility_script, tmp_path, fake_gh):
+    proc = _run_raw_content(
+        eligibility_script, tmp_path, fake_gh, '{"findings": [], "counts": {}}'
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+# --------------------------------------------------------------------------
+# the final status publisher, driven from a rejected verdict
+# --------------------------------------------------------------------------
+
+
+def _extract_run(step_name: str) -> str:
+    """The bash `run: |` block of the step called `step_name`."""
+    text = WORKFLOW.read_text()
+    anchor = text.index(f"- name: {step_name}")
+    run = text.index("        run: |\n", anchor)
+    body_start = run + len("        run: |\n")
+    # the block ends at the next line indented less than 10 spaces
+    lines, out = text[body_start:].split("\n"), []
+    for line in lines:
+        if line.strip() and not line.startswith(" " * 10):
+            break
+        out.append(line)
+    block = _dedent_block("\n".join(out))
+    # GitHub expressions are expanded before bash ever sees them; stand in.
+    return re.sub(r"\$\{\{[^}]*\}\}", "x", block)
+
+
+def test_a_rejected_verdict_publishes_failure_and_never_eligibility(
+    eligibility_script, tmp_path, fake_gh,
+):
+    # 1) the findings step rejects the verdict ...
+    proc = _run_raw_content(
+        eligibility_script, tmp_path, fake_gh,
+        json.dumps({"findings": [], "counts": {"high": 1}}),
+    )
+    assert proc.returncode != 0
+    # 2) ... so its outcome is `failure`; drive the real publisher with that.
+    script = tmp_path / "publish.sh"
+    script.write_text(_extract_run("Publish code-review status"))
+    log = tmp_path / "publish.log"
+    env = {
+        **os.environ, "PATH": f"{fake_gh}{os.pathsep}{os.environ['PATH']}",
+        "GH_LOG": str(log), "GH_TOKEN": "fake",
+        "DISPATCH_OUTCOME": "success", "FINDINGS_OUTCOME": "failure", "DESC": "",
+    }
+    subprocess.run(["bash", str(script)], check=True, capture_output=True, text=True, env=env)
+    calls = log.read_text()
+    assert "state=failure" in calls and "context=devteam/code-review" in calls
+    assert "state=success" not in calls
+    assert "merge-eligible" not in calls
+    assert not any("merge-eligible" in c for c in _gh_calls(tmp_path))
+
+
+# --------------------------------------------------------------------------
+# dispatch retry on transient failure
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def dispatch_env(tmp_path, fake_gh):
+    """Run the real Dispatch step with a scripted `curl` and a recording `sleep`.
+
+    `codes` is the HTTP code (or `CURLFAIL:<exit>`) each successive curl call
+    yields; the last one repeats.
+    """
+    bindir = tmp_path / "dbin"
+    bindir.mkdir()
+    (bindir / "sleep").write_text('#!/bin/bash\necho "$1" >> "$SLEEP_LOG"\n')
+    (bindir / "curl").write_text(
+        "#!/bin/bash\n"
+        'n=$(cat "$CURL_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$CURL_COUNT"\n'
+        'IFS=, read -ra c <<< "$CURL_CODES"\n'
+        'i=$((n-1)); [ $i -ge ${#c[@]} ] && i=$((${#c[@]}-1)); code="${c[$i]}"\n'
+        'out=""; while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\n'
+        'if [[ "$code" == CURLFAIL:* ]]; then echo "curl: (7) refused" >&2; exit "${code#CURLFAIL:}"; fi\n'
+        '[ -n "$out" ] && echo \'{"choices":[]}\' > "$out"\n'
+        'if [[ "$code" == *:* ]]; then printf "%s" "${code%%:*}"; exit "${code##*:}"; fi\n'
+        'printf "%s" "$code"\n'
+    )
+    for f in ("sleep", "curl"):
+        (bindir / f).chmod(0o755)
+    script = tmp_path / "dispatch.sh"
+    script.write_text(_extract_run("Dispatch Code Reviewer"))
+
+    def run(codes: str):
+        env = {
+            **os.environ, "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+            "CURL_CODES": codes, "CURL_COUNT": str(tmp_path / "n"),
+            "SLEEP_LOG": str(tmp_path / "sleeps"), "RUNNER_TEMP": str(tmp_path),
+            "AW_CODEREVIEW_V1_KEY": "k", "DISPATCH_URL": "https://example.invalid",
+            "AGENT_SLUG": "code-reviewer-sonnet", "WORKFLOW_SLUG": "", "REPO": "o/r",
+            "PR_NUMBER": "1", "HEAD_SHA": "a" * 40, "BASE_REF": "master",
+            "MODE": "review", "ROUND": "1",
+        }
+        proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+        n = int((tmp_path / "n").read_text()) if (tmp_path / "n").exists() else 0
+        sl = tmp_path / "sleeps"
+        return proc, n, (sl.read_text().split() if sl.exists() else [])
+
+    return run
+
+
+def test_dispatch_retries_502_then_succeeds(dispatch_env):
+    proc, n, sleeps = dispatch_env("502,503,200")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert n == 3 and sleeps == ["15", "30"]
+
+
+def test_dispatch_retries_a_connection_failure_then_succeeds(dispatch_env):
+    proc, n, sleeps = dispatch_env("CURLFAIL:7,200")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert n == 2 and sleeps == ["15"]
+
+
+def test_dispatch_gives_up_after_four_retries_with_backoff(dispatch_env):
+    proc, n, sleeps = dispatch_env("504")
+    assert proc.returncode != 0
+    assert n == 5 and sleeps == ["15", "30", "60", "90"]
+    assert "dispatch failed" in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("code", ["400", "401", "403", "404", "422"])
+def test_dispatch_does_not_retry_a_4xx(dispatch_env, code):
+    proc, n, sleeps = dispatch_env(code)
+    assert proc.returncode != 0
+    assert n == 1 and sleeps == []
+
+
+def test_a_failed_dispatch_never_sets_success_or_eligibility(dispatch_env, tmp_path, fake_gh):
+    proc, _, _ = dispatch_env("502")
+    assert proc.returncode != 0
+    script = tmp_path / "publish.sh"
+    script.write_text(_extract_run("Publish code-review status"))
+    log = tmp_path / "publish.log"
+    env = {
+        **os.environ, "PATH": f"{fake_gh}{os.pathsep}{os.environ['PATH']}",
+        "GH_LOG": str(log), "GH_TOKEN": "fake",
+        "DISPATCH_OUTCOME": "failure", "FINDINGS_OUTCOME": "skipped", "DESC": "",
+    }
+    subprocess.run(["bash", str(script)], check=True, capture_output=True, text=True, env=env)
+    calls = log.read_text()
+    assert "state=failure" in calls and "state=success" not in calls
+
+
+# --------------------------------------------------------------------------
+# second re-review (run b7197ae0): five more fail-closed gaps
+# --------------------------------------------------------------------------
+
+_EMPTY = '{"findings": [], "counts": {}}'
+_HIGH = json.dumps({"findings": [{**MINOR, "severity": "high"}], "counts": {"high": 1}})
+
+
+def test_two_fenced_verdicts_are_rejected(eligibility_script, tmp_path, fake_gh):
+    content = f"```json\n{_EMPTY}\n```\nand also\n```json\n{_HIGH}\n```"
+    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content)
+    assert proc.returncode != 0
+    assert not any("statuses" in c for c in _gh_calls(tmp_path))
+
+
+def test_a_single_fence_with_prose_around_it_still_parses(eligibility_script, tmp_path, fake_gh):
+    content = f"Review done.\n```json\n{_EMPTY}\n```\nHope that helps."
+    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content)
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize("round_", ["2", "needs-human"])
+def test_duplicate_blocks_merge_keys_are_rejected(eligibility_script, tmp_path, fake_gh, round_):
+    content = (
+        '{"findings": [{"severity": "high", "title": "t", "blocks_merge": true, '
+        '"blocks_merge": false}], "counts": {"high": 1}}'
+    )
+    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content, round_=round_)
+    _assert_rejected(proc, tmp_path)
+
+
+@pytest.mark.parametrize("content", [
+    '{"findings": [], "counts": {}, "findings": []}',
+    '{"findings": [], "counts": {"high": 0, "high": 0}}',
+])
+def test_duplicate_top_level_and_count_keys_are_rejected(
+    eligibility_script, tmp_path, fake_gh, content,
+):
+    _assert_rejected(_run_raw_content(eligibility_script, tmp_path, fake_gh, content), tmp_path)
+
+
+def _run_with_envelope(script, tmp_path, fake_gh, envelope):
+    (tmp_path / "dispatch_response.json").write_text(json.dumps(envelope))
+    out = tmp_path / "gh_output"
+    out.write_text("")
+    env = {
+        **os.environ, "PATH": f"{fake_gh}{os.pathsep}{os.environ['PATH']}",
+        "REPO": "o/r", "PR_NUMBER": "42", "HEAD_SHA": "a" * 40, "ROUND": "1",
+        "IS_DRAFT": "false", "GITHUB_OUTPUT": str(out), "GH_TOKEN": "fake",
+        "RUNNER_TEMP": str(tmp_path), "RUN_URL": "https://example.invalid/run/1",
+        "GH_LOG": str(tmp_path / "gh_calls.log"), "AGENT_SLUG": "code-reviewer-sonnet",
+    }
+    return subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env)
+
+
+def _envelope(**extra):
+    return {"choices": [{"message": {"content": _EMPTY}}], **extra}
+
+
+@pytest.mark.parametrize("extra", [
+    {"aw_status": "error"}, {"aw_status": "cancelled"}, {"aw_status": None},
+    {"aw_status": ""}, {"error": {"message": "boom"}},
+])
+def test_a_non_success_run_status_in_a_2xx_body_is_rejected(
+    eligibility_script, tmp_path, fake_gh, extra,
+):
+    proc = _run_with_envelope(eligibility_script, tmp_path, fake_gh, _envelope(**extra))
+    assert proc.returncode != 0
+    assert "invalid review verdict" in proc.stdout + proc.stderr
+    assert not any("statuses" in c for c in _gh_calls(tmp_path))
+    assert (tmp_path / "gh_output").read_text() == ""
+
+
+def test_an_explicit_success_status_is_accepted(eligibility_script, tmp_path, fake_gh):
+    proc = _run_with_envelope(
+        eligibility_script, tmp_path, fake_gh, _envelope(aw_status="success"))
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_a_body_without_aw_status_is_accepted_until_the_door_deploys(
+    eligibility_script, tmp_path, fake_gh,
+):
+    # Compatibility: AP-MT PR 108 adds the field; older doors omit it.
+    proc = _run_with_envelope(eligibility_script, tmp_path, fake_gh, _envelope())
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize("counts", [
+    {"HIGH": 2, "high": 1},
+    {"High": 1},
+    {" high": 1},
+    {"HIGH": 1},
+])
+def test_non_canonical_count_keys_are_rejected(eligibility_script, tmp_path, fake_gh, counts):
+    high = {**HIGH_NON_BLOCKING}
+    proc = _run_raw_content(
+        eligibility_script, tmp_path, fake_gh,
+        json.dumps({"findings": [high], "counts": counts}), round_="2",
+    )
+    _assert_rejected(proc, tmp_path)
+
+
+def test_a_4xx_with_an_interrupted_body_is_not_retried(dispatch_env):
+    proc, n, sleeps = dispatch_env("401:18,200")
+    assert proc.returncode != 0
+    assert n == 1 and sleeps == []
+
+
+def test_a_5xx_with_an_interrupted_body_is_retried(dispatch_env):
+    proc, n, sleeps = dispatch_env("502:18,200")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert n == 2 and sleeps == ["15"]
+
+
+def test_an_interrupted_2xx_body_is_retried_not_accepted(dispatch_env):
+    proc, n, sleeps = dispatch_env("200:18,200")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert n == 2 and sleeps == ["15"]
