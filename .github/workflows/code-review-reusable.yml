@@ -650,16 +650,52 @@ jobs:
                 "object described there."
               )}]
             }')"
-          http_code="$(curl -sS --max-time 960 -o "$RUNNER_TEMP/dispatch_response.json" \
-            -w '%{http_code}' \
-            -X POST "${DISPATCH_URL%/}/v1/chat/completions" \
-            -H "Authorization: Bearer $AW_CODEREVIEW_V1_KEY" \
-            -H "Content-Type: application/json" \
-            --data-binary "$payload")"
-          echo "dispatch HTTP $http_code"
-          cat "$RUNNER_TEMP/dispatch_response.json"
+          # Retry ONLY transient failures: HTTP 502/503/504 (the platform is
+          # mid-deploy or its edge lost the upstream) and a curl transport
+          # failure (connection refused/reset, DNS, timeout). Any other
+          # status, 4xx included, is a real answer and fails at once. One try
+          # plus four retries, backing off 15s/30s/60s/90s (195s of waiting;
+          # the job's 25-minute ceiling still bounds the worst case). A dispatch that
+          # never succeeds exits non-zero, so the `findings` step is skipped
+          # and `Publish code-review status` writes `failure` -- never
+          # success, never `devteam/merge-eligible`.
+          delays=(15 30 60 90)
+          max_tries=5
+          attempt=1
+          while :; do
+            rc=0
+            http_code="$(curl -sS --max-time 960 -o "$RUNNER_TEMP/dispatch_response.json" \
+              -w '%{http_code}' \
+              -X POST "${DISPATCH_URL%/}/v1/chat/completions" \
+              -H "Authorization: Bearer $AW_CODEREVIEW_V1_KEY" \
+              -H "Content-Type: application/json" \
+              --data-binary "$payload")" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "dispatch attempt $attempt/$max_tries: curl failed (exit $rc)"
+              http_code=curl-failure
+            else
+              echo "dispatch attempt $attempt/$max_tries: HTTP $http_code"
+            fi
+            case "$http_code" in
+              502|503|504|curl-failure) ;;
+              *) break ;;
+            esac
+            if [ "$attempt" -ge "$max_tries" ]; then
+              break
+            fi
+            delay="${delays[$((attempt - 1))]}"
+            echo "::warning::transient dispatch failure ($http_code); retrying in ${delay}s"
+            sleep "$delay"
+            attempt=$((attempt + 1))
+          done
+          cat "$RUNNER_TEMP/dispatch_response.json" 2>/dev/null || true
+          case "$http_code" in
+            ''|*[!0-9]*)
+              echo "::error::dispatch failed after $attempt attempt(s): $http_code"
+              exit 1 ;;
+          esac
           if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "::error::dispatch failed with HTTP $http_code"
+            echo "::error::dispatch failed with HTTP $http_code after $attempt attempt(s)"
             exit 1
           fi
 
@@ -706,24 +742,58 @@ jobs:
           # backtick run against the CLOSING one, not a naive text[3:-3]
           # slice -- a fence can open with 4+ backticks. re.search, not
           # re.match: the judge routinely prefixes the fence with a sentence
-          # of prose. Falls back to scanning for the outermost {...} only
-          # when there is truly no fence anywhere in the message.
+          # of prose. With no fence anywhere the whole message is the body.
+          #
+          # The body must then be ONE COMPLETE JSON value that is a top-level
+          # object. It is deliberately NOT trimmed to the first `{` / last `}`:
+          # that made `[{"findings":[],"counts":{}}]` (an array) or two
+          # concatenated objects parse as an eligible empty verdict.
           body = content
           fence = re.search(r"(`{3,})[^\n]*\n(.*?)\n\1`*", content, re.S)
           if fence:
               body = fence.group(2)
-          start, end = body.find("{"), body.rfind("}")
-          if start == -1 or end == -1:
-              print("::error::no JSON object found in the judge's response")
-              print(content[:2000], file=sys.stderr)
-              sys.exit(1)
-          data = json.loads(body[start:end + 1])
+
+          def _reject(why):
+              print(content[:1500], file=sys.stderr)
+              sys.exit(f"::error::invalid review verdict: {why}")
+
+          try:
+              data = json.loads(body.strip())
+          except ValueError as exc:
+              _reject(f"not one complete JSON value ({exc})")
           if (not isinstance(data, dict)
                   or not isinstance(data.get("findings"), list)
                   or not isinstance(data.get("counts"), dict)):
-              sys.exit("::error::invalid review verdict: expected a findings array and a counts object")
+              _reject("expected a top-level object with a findings array and a counts object")
           findings = data["findings"]
           counts = data["counts"]
+          if not all(isinstance(f, dict) for f in findings):
+              _reject("every finding must be an object")
+
+          # `counts` must AGREE with `findings`: for every severity, the
+          # count is a non-negative integer (not a bool) equal to the number
+          # of findings of that severity. `{"findings": [], "counts":
+          # {"high": 1}}` otherwise passed as an eligible round-1 verdict.
+          tally = {}
+          for f in findings:
+              sev = str(f.get("severity", "info")).lower()
+              tally[sev] = tally.get(sev, 0) + 1
+          for k, v in counts.items():
+              if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                  _reject(f"count for {k!r} is not a non-negative integer")
+          declared = {str(k).lower(): v for k, v in counts.items() if v}
+          if declared != tally:
+              _reject(f"counts {declared} contradict findings {tally}")
+
+          # In round 2 / needs-human `blocks_merge` is the merge gate, so a
+          # PRESENT value must be a JSON boolean: `null`, "false", 0 are all
+          # falsy-or-truthy by accident under bool(). (A MISSING field is
+          # still counted as blocking below -- fail closed.)
+          if os.environ.get("ROUND", "1") in ("2", "needs-human"):
+              for f in findings:
+                  if "blocks_merge" in f and not isinstance(f["blocks_merge"], bool):
+                      _reject("`blocks_merge` must be a JSON boolean "
+                              f"(got {f['blocks_merge']!r})")
 
           repo = os.environ["REPO"]
           pr = os.environ["PR_NUMBER"]
@@ -832,7 +902,7 @@ jobs:
                   if "blocks_merge" not in f:
                       missing_field += 1
                       blocking.append(f)
-                  elif bool(f.get("blocks_merge")):
+                  elif f["blocks_merge"] is True:
                       blocking.append(f)
 
           if round_ == "1":
