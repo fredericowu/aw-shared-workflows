@@ -670,9 +670,19 @@ jobs:
               -H "Authorization: Bearer $AW_CODEREVIEW_V1_KEY" \
               -H "Content-Type: application/json" \
               --data-binary "$payload")" || rc=$?
+            # curl still prints %{http_code} when the transfer dies part-way
+            # (exit 18, 56...), so a status that WAS received is classified
+            # first: a 4xx is a real answer and must never be retried into a
+            # later 200. Only a missing/000 status, a 502/503/504, or a 2xx
+            # whose body was cut off count as transient.
             if [ "$rc" -ne 0 ]; then
-              echo "dispatch attempt $attempt/$max_tries: curl failed (exit $rc)"
-              http_code=curl-failure
+              echo "dispatch attempt $attempt/$max_tries: curl exit $rc (HTTP ${http_code:-none})"
+              case "$http_code" in
+                4[0-9][0-9]) ;;
+                502|503|504) ;;
+                ''|000|2[0-9][0-9]) http_code=curl-failure ;;
+                *) ;;
+              esac
             else
               echo "dispatch attempt $attempt/$max_tries: HTTP $http_code"
             fi
@@ -735,7 +745,31 @@ jobs:
           # unique per job even on a self-hosted runner.
           TMP = os.environ["RUNNER_TEMP"]
 
+          def _reject(why, content=""):
+              print(str(content)[:1500], file=sys.stderr)
+              sys.exit(f"::error::invalid review verdict: {why}")
+
+          def _no_duplicate_keys(pairs):
+              # json.loads keeps the LAST of two equal keys, so
+              # {"blocks_merge": true, "blocks_merge": false} would read as
+              # false. Reject instead of letting the last one win.
+              keys = [k for k, _ in pairs]
+              dupes = sorted({k for k in keys if keys.count(k) > 1})
+              if dupes:
+                  raise ValueError(f"duplicate JSON key(s) {dupes}")
+              return dict(pairs)
+
           raw = json.load(open(os.path.join(TMP, "dispatch_response.json")))
+          # A 2xx is not proof the run SUCCEEDED: the /v1 door used to return a
+          # failed run's text unchanged inside a 200. AP-MT adds a top-level
+          # `aw_status` ("success" or the executor's non-success status). If
+          # present it must be exactly "success"; an absent field is accepted
+          # so this keeps working against a door that predates the field. Any
+          # OpenAI-style top-level `error` object is a failure too.
+          if "error" in raw:
+              _reject("the response carries an error object", raw["error"])
+          if "aw_status" in raw and raw["aw_status"] != "success":
+              _reject(f"the run did not succeed (aw_status={raw['aw_status']!r})")
           content = raw["choices"][0]["message"]["content"]
 
           # Strip a markdown fence by matching the OPENING fence's own
@@ -743,28 +777,28 @@ jobs:
           # slice -- a fence can open with 4+ backticks. re.search, not
           # re.match: the judge routinely prefixes the fence with a sentence
           # of prose. With no fence anywhere the whole message is the body.
+          # More than ONE fence is rejected outright: taking the first and
+          # ignoring the rest let a clean fenced verdict hide a second one.
           #
           # The body must then be ONE COMPLETE JSON value that is a top-level
           # object. It is deliberately NOT trimmed to the first `{` / last `}`:
           # that made `[{"findings":[],"counts":{}}]` (an array) or two
           # concatenated objects parse as an eligible empty verdict.
           body = content
-          fence = re.search(r"(`{3,})[^\n]*\n(.*?)\n\1`*", content, re.S)
-          if fence:
-              body = fence.group(2)
-
-          def _reject(why):
-              print(content[:1500], file=sys.stderr)
-              sys.exit(f"::error::invalid review verdict: {why}")
+          fences = list(re.finditer(r"(`{3,})[^\n]*\n(.*?)\n\1`*", content, re.S))
+          if len(fences) > 1:
+              _reject(f"{len(fences)} fenced blocks; expected exactly one verdict", content)
+          if fences:
+              body = fences[0].group(2)
 
           try:
-              data = json.loads(body.strip())
+              data = json.loads(body.strip(), object_pairs_hook=_no_duplicate_keys)
           except ValueError as exc:
-              _reject(f"not one complete JSON value ({exc})")
+              _reject(f"not one complete JSON value ({exc})", content)
           if (not isinstance(data, dict)
                   or not isinstance(data.get("findings"), list)
                   or not isinstance(data.get("counts"), dict)):
-              _reject("expected a top-level object with a findings array and a counts object")
+              _reject("expected a top-level object with a findings array and a counts object", content)
           findings = data["findings"]
           counts = data["counts"]
           if not all(isinstance(f, dict) for f in findings):
@@ -779,9 +813,11 @@ jobs:
               sev = str(f.get("severity", "info")).lower()
               tally[sev] = tally.get(sev, 0) + 1
           for k, v in counts.items():
+              if k != k.strip().lower():
+                  _reject(f"count key {k!r} is not a canonical lowercase severity")
               if isinstance(v, bool) or not isinstance(v, int) or v < 0:
                   _reject(f"count for {k!r} is not a non-negative integer")
-          declared = {str(k).lower(): v for k, v in counts.items() if v}
+          declared = {k: v for k, v in counts.items() if v}
           if declared != tally:
               _reject(f"counts {declared} contradict findings {tally}")
 
