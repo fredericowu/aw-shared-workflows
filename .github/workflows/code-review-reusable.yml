@@ -790,6 +790,16 @@ jobs:
               _reject(f"{len(fences)} fenced blocks; expected exactly one verdict", content)
           if fences:
               body = fences[0].group(2)
+          elif not content.lstrip().startswith("["):
+              # No fence: the judge often wraps a bare verdict in prose
+              # ("I reviewed ... {json}"). Take the span from the FIRST `{`
+              # to the LAST `}`, then still demand that span be ONE complete
+              # JSON object below: two concatenated objects, trailing
+              # fragments and duplicate keys all still fail to parse. A
+              # leading `[` (a wrapped array) is never sliced into an object.
+              lo, hi = content.find("{"), content.rfind("}")
+              if lo != -1 and hi > lo and not content[:lo].rstrip().endswith("["):
+                  body = content[lo:hi + 1]
 
           try:
               data = json.loads(body.strip(), object_pairs_hook=_no_duplicate_keys)
