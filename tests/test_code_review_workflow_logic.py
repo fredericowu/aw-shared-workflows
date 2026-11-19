@@ -2835,3 +2835,38 @@ def test_an_interrupted_2xx_body_is_retried_not_accepted(dispatch_env):
     proc, n, sleeps = dispatch_env("200:18,200")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert n == 2 and sleeps == ["15"]
+
+
+# --------------------------------------------------------------------------
+# unfenced verdict wrapped in prose: extract first `{` .. last `}`
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("content", [
+    'I reviewed the PR and found nothing.\n\n' + _EMPTY,
+    _EMPTY + '\n\nLet me know if you want more detail.',
+    'All tests passed.\n\n' + _EMPTY + '\n\nDone.',
+])
+def test_an_unfenced_verdict_wrapped_in_prose_parses(eligibility_script, tmp_path, fake_gh, content):
+    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content)
+    assert proc.returncode == 0, proc.stderr
+    assert any("merge-eligible" in c for c in _gh_calls(tmp_path))
+
+
+def test_an_unfenced_prose_wrapped_blocking_verdict_still_blocks(eligibility_script, tmp_path, fake_gh):
+    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, "Found issues.\n" + _HIGH + "\nBye")
+    assert proc.returncode == 0, proc.stderr
+    assert not any("merge-eligible" in c and "success" in c for c in _gh_calls(tmp_path))
+
+
+@pytest.mark.parametrize("content", [
+    'first ' + _EMPTY + ' then ' + _HIGH,
+    'prose ' + _EMPTY + ' and {"x": 1}',
+    'prose [' + _EMPTY + ']',
+    'no verdict here',
+    'prose {"findings": [], "counts": {}, "findings": []} end',
+])
+def test_prose_wrapped_extraction_stays_fail_closed(eligibility_script, tmp_path, fake_gh, content):
+    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content)
+    assert proc.returncode != 0
+    assert not any("statuses" in c for c in _gh_calls(tmp_path))
