@@ -174,6 +174,7 @@ def _run_eligibility(
     findings,
     counts,
     round_: str,
+    verdict=None,
     is_draft: str = "false",
     agent_slug: str = "code-reviewer-sonnet",
 ) -> dict:
@@ -189,6 +190,8 @@ def _run_eligibility(
     tmp_path is already unique per call, so this isolates each invocation
     the same way RUNNER_TEMP isolates each real job.
     """
+    if verdict is None:
+        verdict = {"findings": findings, "counts": counts}
     (tmp_path / "dispatch_response.json").write_text(
         json.dumps(
             {
@@ -196,7 +199,7 @@ def _run_eligibility(
                     {
                         "message": {
                             "content": "Here is my review:\n```json\n"
-                            + json.dumps({"findings": findings, "counts": counts})
+                            + json.dumps(verdict)
                             + "\n```"
                         }
                     }
@@ -259,6 +262,22 @@ NO_BLOCKS_FIELD = {
     "body": "x",
 }
 CROSS_CUTTING = {"severity": "info", "title": "architecture note", "body": "no file/line"}
+
+
+@pytest.mark.parametrize("verdict", [
+    {"output": '{"findings": [], "counts": {}}', "completed": 2, "total": 2},
+    {"findings": []},
+    {"findings": None, "counts": {}},
+    {"findings": [], "counts": None},
+])
+def test_invalid_verdict_fails_before_posting(eligibility_script, tmp_path, fake_gh, verdict):
+    with pytest.raises(AssertionError, match="invalid review verdict"):
+        _run_eligibility(
+            eligibility_script, tmp_path, fake_gh,
+            findings=[], counts={}, round_="1", verdict=verdict,
+        )
+    assert _gh_calls(tmp_path) == []
+    assert (tmp_path / "gh_output").read_text() == ""
 
 
 def test_round1_merges_only_on_zero_findings(eligibility_script, tmp_path, fake_gh):

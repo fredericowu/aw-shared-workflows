@@ -719,6 +719,12 @@ jobs:
               print(content[:2000], file=sys.stderr)
               sys.exit(1)
           data = json.loads(body[start:end + 1])
+          if (not isinstance(data, dict)
+                  or not isinstance(data.get("findings"), list)
+                  or not isinstance(data.get("counts"), dict)):
+              sys.exit("::error::invalid review verdict: expected a findings array and a counts object")
+          findings = data["findings"]
+          counts = data["counts"]
 
           repo = os.environ["REPO"]
           pr = os.environ["PR_NUMBER"]
@@ -729,7 +735,6 @@ jobs:
               f"review by `{agent_slug}`."
           )
 
-          findings = data.get("findings") or []
           for f in findings:
               sev = str(f.get("severity", "info")).upper()
               conf = f.get("confidence", "possible")
@@ -791,7 +796,6 @@ jobs:
                       check=True,
                   )
 
-          counts = data.get("counts") or {}
           parts = [f"{v} {k}" for k, v in counts.items() if v]
           desc = ("; ".join(parts) or "no findings")[:140]
 
