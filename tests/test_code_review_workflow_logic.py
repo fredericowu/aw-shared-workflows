@@ -2940,3 +2940,131 @@ def test_a_second_empty_reviewer_message_fails_the_dispatch(dispatch_env):
     assert proc.returncode != 0
     assert n == 2 and sleeps == ["15"]
     assert "empty-reviewer-message" in proc.stdout + proc.stderr
+
+
+# --------------------------------------------------------------------------
+# review caps (v1.11.0): one automatic needs-human re-review, and verdict
+# reuse for an unchanged (sha, round, mode). Drives the gate's real tail.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def gate_tail_script(tmp_path_factory) -> Path:
+    text = WORKFLOW.read_text()
+    start = text.index("          if [ \"${{ github.event.action }}\" = \"synchronize\" ] \\\n             && [ \"$round\" != \"2\"")
+    end = text.index("  code-review:\n    needs: gate")
+    body = (
+        text[start:end]
+        .replace("${{ github.repository }}", "tekflox/aw-app-template")
+        .replace('"$GITHUB_OUTPUT"', '"$OUTF"')
+        .replace("${{ github.event.action }}", "${ACTION}")
+    )
+    path = tmp_path_factory.mktemp("wf") / "gate_tail.sh"
+    path.write_text(
+        "set -uo pipefail\n"
+        'is_trusted() { return 0; }\n'
+        'has_label() { printf "%s\\n" "$LABELS" | grep -Fxq "$1"; }\n'
+        'pr_number=42; sha=aaaa; author=x\n'
+        + body
+    )
+    return path
+
+
+@pytest.fixture(scope="module")
+def cap_gh(tmp_path_factory) -> Path:
+    d = tmp_path_factory.mktemp("capbin")
+    gh = d / "gh"
+    gh.write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$*" >> "$GH_LOG"\n'
+        'if [[ "$*" == *"/statuses"* ]]; then\n'
+        '  if [ "${STATUSES_FAIL:-0}" = "1" ]; then exit 1; fi\n'
+        '  cat "$STATUSES_FILE"; exit 0\n'
+        "fi\n"
+        'if [[ "$*" == *"-X POST"* && "${LABEL_POST_FAIL:-0}" = "1" ]]; then exit 1; fi\n'
+        "exit 0\n"
+    )
+    gh.chmod(0o755)
+    return d
+
+
+def _gate(script, cap_gh, tmp_path, *, round_, action="synchronize", mode="review",
+          labels="", statuses=None, statuses_fail=False, label_post_fail=False):
+    (tmp_path / "st.json").write_text(json.dumps(statuses or []))
+    out = tmp_path / "out"
+    out.write_text("")
+    env = {
+        **os.environ,
+        "PATH": f"{cap_gh}{os.pathsep}{os.environ['PATH']}",
+        "round": round_, "mode": mode, "ACTION": action, "LABELS": labels,
+        "STATUSES_FILE": str(tmp_path / "st.json"),
+        "STATUSES_FAIL": "1" if statuses_fail else "0",
+        "LABEL_POST_FAIL": "1" if label_post_fail else "0",
+        "GH_LOG": str(tmp_path / "calls.log"), "OUTF": str(out), "GH_TOKEN": "x",
+        "GITHUB_STEP_SUMMARY": "/dev/null",
+    }
+    proc = subprocess.run(["bash", "-c", f"round={round_}; mode={mode}; source {script}"],
+                          capture_output=True, text=True, env=env)
+    calls = (tmp_path / "calls.log").read_text().splitlines() if (tmp_path / "calls.log").exists() else []
+    return proc, out.read_text(), calls
+
+
+def _st(state, desc, ctx="devteam/code-review"):
+    return {"context": ctx, "state": state, "description": desc}
+
+
+def test_first_needs_human_push_is_reviewed_and_stamped(gate_tail_script, cap_gh, tmp_path):
+    _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="needs-human",
+                          labels="devteam:needs-human")
+    assert "allowed=true" in out
+    assert any("labels[]=devteam:review-capped" in c for c in calls)
+
+
+def test_second_needs_human_push_is_refused(gate_tail_script, cap_gh, tmp_path):
+    _, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="needs-human",
+                      labels="devteam:needs-human\ndevteam:review-capped")
+    assert "allowed=false" in out and "allowed=true" not in out
+
+
+def test_aw_review_comment_rearms_the_cap_and_still_reviews(gate_tail_script, cap_gh, tmp_path):
+    _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="needs-human",
+                          action="created", labels="devteam:needs-human\ndevteam:review-capped")
+    assert "allowed=true" in out
+    assert any("-X DELETE" in c and "review-capped" in c for c in calls)
+
+
+def test_a_failed_stamp_write_fails_open_to_review(gate_tail_script, cap_gh, tmp_path):
+    _, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="needs-human",
+                      labels="devteam:needs-human", label_post_fail=True)
+    assert "allowed=true" in out
+
+
+def test_unchanged_sha_round_mode_reuses_the_verdict(gate_tail_script, cap_gh, tmp_path):
+    _, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="created",
+                      statuses=[_st("success", "2 findings [rk r=1 m=review]")])
+    assert "allowed=false" in out and "allowed=true" not in out
+
+
+@pytest.mark.parametrize("case", ["round", "mode", "failure", "pending", "eligible", "unstamped", "lookup"])
+def test_reuse_never_applies_when_any_key_part_differs_or_lookup_is_unsafe(
+    gate_tail_script, cap_gh, tmp_path, case
+):
+    sts = [_st("success", "x [rk r=1 m=review]")]
+    kw = {}
+    if case == "round":
+        sts = [_st("success", "x [rk r=2 m=review]")]
+    elif case == "mode":
+        sts = [_st("success", "x [rk r=1 m=improve]")]
+    elif case == "failure":
+        sts = [_st("failure", "x [rk r=1 m=review]")]
+    elif case == "pending":
+        sts = [_st("pending", "Dev Team deep review in progress"), _st("success", "x [rk r=1 m=review]")]
+    elif case == "eligible":
+        sts = [_st("success", "x [rk r=1 m=review]"), _st("success", "cleared", "devteam/merge-eligible")]
+    elif case == "unstamped":
+        sts = [_st("success", "legacy verdict")]
+    elif case == "lookup":
+        kw["statuses_fail"] = True
+    _, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="created",
+                      statuses=sts, **kw)
+    assert "allowed=true" in out, case

@@ -123,6 +123,13 @@ name: Code Review (reusable)
 #                                                 as any other eligible round.
 #                                any blocking  -> label stays, no new event
 #                                                 (already escalated once).
+#                                A PUSH gets ONE automatic re-review here,
+#                                stamped by label `devteam:review-capped`;
+#                                later pushes are refused until a human
+#                                comments `/aw-review` (v1.11.0). An
+#                                unchanged (sha, round, mode) with a
+#                                finished, non-eligible verdict is not
+#                                re-dispatched either.
 #                                A human can still remove the label directly
 #                                to force round 1's full lens on the next
 #                                push/`/aw-review`, instead of waiting for a
@@ -520,6 +527,32 @@ jobs:
             exit 0
           fi
 
+          # ---- review caps (v1.11.0): bound the repeat reviews ----
+          # (1) After escalation, ONE automatic `needs-human` re-review per
+          # `/aw-review`: the first push to an escalated PR is reviewed and
+          # stamps `devteam:review-capped`; further pushes are refused here,
+          # before anything paid, until a human comments `/aw-review` (which
+          # clears the stamp and grants one more). State is a label, like
+          # the rest of this machine, never a count.
+          # A failed label write FAILS OPEN to "review it": the cap exists
+          # to save budget, never to leave a push unreviewed.
+          cap_label="devteam:review-capped"
+          label_api="repos/${{ github.repository }}/issues/$pr_number/labels"
+          if [ "$round" = "needs-human" ] && [ "${{ github.event.action }}" = "synchronize" ]; then
+            if has_label "$cap_label"; then
+              echo "synchronize on an escalated PR that already had its one automatic \
+              re-review — not re-reviewing. Comment /aw-review to force one."
+              echo "allowed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            gh api -X POST "$label_api" -f "labels[]=$cap_label" --silent \
+              || echo "::warning::could not stamp $cap_label; reviewing anyway"
+          elif has_label "$cap_label" && { [ "$round" != "needs-human" ] \
+               || [ "${{ github.event.action }}" != "synchronize" ]; }; then
+            # Re-arm: `/aw-review`, or the PR left needs-human.
+            gh api -X DELETE "$label_api/devteam%3Areview-capped" --silent || true
+          fi
+
           if ! is_trusted "$author"; then
             {
               echo "### Deep review skipped: \`$author\` is not a trusted author"
@@ -530,6 +563,30 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          # ---- (2) reuse the verdict for an unchanged (sha, round, mode) ----
+          # A finished, NOT merge-eligible verdict is stamped on the sha's
+          # `devteam/code-review` status as `[rk r=<round> m=<mode>]`. If the
+          # latest status on this sha is that stamp for this same round and
+          # mode, a second dispatch would reproduce the same review for
+          # another judge run of budget, so it is skipped and the standing
+          # verdict stays. Never reused: anything that is not a completed
+          # success (failure, error, pending), any sha holding a
+          # `devteam/merge-eligible` success (a retry there must reach the
+          # merge job), and any lookup failure — all fall through to a fresh
+          # review, so this can only ever save a run, never clear a PR.
+          if statuses="$(gh api "repos/${{ github.repository }}/commits/$sha/statuses?per_page=100" 2>/dev/null)"; then
+            latest="$(printf '%s' "$statuses" | jq -r \
+              '[.[] | select(.context=="devteam/code-review")][0] | "\(.state)|\(.description)"' 2>/dev/null || true)"
+            eligible_seen="$(printf '%s' "$statuses" | jq -r \
+              '[.[] | select(.context=="devteam/merge-eligible" and .state=="success")] | length' 2>/dev/null || echo 1)"
+            if [ "$eligible_seen" = "0" ] && [ "${latest%%|*}" = "success" ] \
+               && printf '%s' "$latest" | grep -Fq "[rk r=$round m=$mode]"; then
+              echo "verdict reused: sha $sha already has a completed review for round=$round mode=$mode — not dispatching again."
+              echo "allowed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
           echo "allowed=true" >> "$GITHUB_OUTPUT"
 
@@ -1080,11 +1137,15 @@ jobs:
           DISPATCH_OUTCOME: ${{ steps.dispatch.outcome }}
           FINDINGS_OUTCOME: ${{ steps.findings.outcome }}
           DESC: ${{ steps.findings.outputs.desc }}
+          ROUND: ${{ needs.gate.outputs.round }}
+          MODE: ${{ needs.gate.outputs.mode }}
         run: |
           set -euo pipefail
           if [ "$DISPATCH_OUTCOME" = "success" ] && [ "$FINDINGS_OUTCOME" = "success" ]; then
             state=success
-            description="${DESC:-review complete}"
+            # Reuse stamp (see the gate): 140 is GitHub's description cap.
+            stamp=" [rk r=${ROUND} m=${MODE}]"
+            description="$(printf '%s' "${DESC:-review complete}" | cut -c1-$((140 - ${#stamp})))$stamp"
           elif [ "$DISPATCH_OUTCOME" = "cancelled" ] || [ "$FINDINGS_OUTCOME" = "cancelled" ]; then
             state=error
             description="code review cancelled"
