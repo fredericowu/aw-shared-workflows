@@ -1782,17 +1782,17 @@ OTHER_SHA = "c" * 40
 # Sentinel: write no fixture file at all, so the fake `gh` fails that call the
 # way a real 403 from a missing `checks: read` does.
 _MISSING = object()
+_REVIEW_URL = "https://example.invalid/actions/runs/42/attempts/1"
+_REVIEW_CLEARANCE = [
+    {"context": "devteam/merge-eligible", "state": "success", "target_url": _REVIEW_URL},
+    {"context": "devteam/code-review", "state": "success", "target_url": _REVIEW_URL},
+]
 _ELIGIBLE = {"statuses": [
-    {"context": "devteam/merge-eligible", "state": "success"},
+    *_REVIEW_CLEARANCE,
     {"context": "devteam/provenance", "state": "success"},
 ]}
 _NOT_ELIGIBLE: dict = {"statuses": []}
-# Eligible per the review, but no commit ever carried a verified AW-Run-Id
-# trailer (or the provenance-exempt label) — the case `provenance-gate`
-# exists to create.
-_PROVENANCE_NOT_CLEARED = {
-    "statuses": [{"context": "devteam/merge-eligible", "state": "success"}]
-}
+_PROVENANCE_NOT_CLEARED = {"statuses": _REVIEW_CLEARANCE}
 _GREEN = [{"name": "coverage", "state": "SUCCESS", "bucket": "pass"}]
 
 
@@ -1907,6 +1907,24 @@ def test_a_workflow_run_with_no_eligible_status_exits_neutral(
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not merged
     assert "has not cleared this head" in proc.stdout
+
+
+@pytest.mark.parametrize(("review_state", "review_url"), [
+    ("pending", _REVIEW_URL),
+    ("failure", _REVIEW_URL),
+    ("success", "https://example.invalid/actions/runs/42/attempts/2"),
+])
+def test_merge_requires_success_and_clearance_from_the_same_attempt(
+    merge_script, merge_gh, tmp_path, review_state, review_url,
+):
+    statuses = [dict(status) for status in _ELIGIBLE["statuses"]]
+    statuses[1].update(state=review_state, target_url=review_url)
+    proc, merged = _run_merge(
+        merge_script, merge_gh, tmp_path, status={"statuses": statuses},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not merged
+    assert "latest code review attempt" in proc.stdout
 
 
 def test_eligible_pr_with_no_provenance_status_does_not_merge(

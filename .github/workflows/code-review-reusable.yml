@@ -161,8 +161,8 @@ name: Code Review (reusable)
 #      PR head SHA at the exact moment it computes `eligible=true`, and never
 #      otherwise. That is the single place eligibility is decided — round
 #      rule, `blocks_merge` rule, draft rule, all unchanged.
-#   2. A `merge-attempt` job reads that status LIVE and merges. It has two
-#      entry points running ONE script:
+#   2. A `merge-attempt` job verifies that clearance and a successful review
+#      came from the same review attempt. It has two entry points:
 #        (a) same run, `needs: [gate, code-review]` — today's happy path,
 #            where CI was already green before the verdict landed;
 #        (b) a `workflow_run: types: [completed]` event on the CALLER's own
@@ -540,9 +540,8 @@ jobs:
     outputs:
       # Read by `merge-attempt`'s same-run entry point, purely to decide
       # whether spawning that job is worth a runner at all. It is NOT the
-      # authority: the job re-reads the `devteam/merge-eligible` status on
-      # the PR's LIVE head before merging, because that is the only form of
-      # the answer that is pinned to a SHA.
+      # authority: the job checks the latest review and clearance statuses
+      # on the PR's live head before merging.
       eligible: ${{ steps.findings.outputs.eligible }}
     # Hard ceiling on a dead/stalled judge — paired with the server-side 900s
     # runner timeout on the dispatch call below and the always()-finalize
@@ -567,7 +566,7 @@ jobs:
             -f state=pending \
             -f context=devteam/code-review \
             -f description="Dev Team deep review in progress" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}" \
             --silent
 
       # Agent-scoped Agents Platform ApiKey, workspace-bound, scoped to
@@ -681,7 +680,7 @@ jobs:
           HEAD_SHA: ${{ needs.gate.outputs.sha }}
           ROUND: ${{ needs.gate.outputs.round }}
           IS_DRAFT: ${{ needs.gate.outputs.is_draft }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
           AGENT_SLUG: ${{ inputs.agent_slug }}
         run: |
           set -euo pipefail
@@ -882,8 +881,8 @@ jobs:
           # WRITTEN ONLY WHEN ELIGIBLE, never as a `failure`/`pending`
           # counterpart. Three reasons, all load-bearing:
           #   - `merge-attempt` treats "no success status on this SHA" as
-          #     "not cleared", so absence already carries the negative. A
-          #     second state to keep in sync is a second thing to get wrong.
+          #     "not cleared". An old clearance only applies if its attempt
+          #     URL matches the latest successful devteam/code-review.
           #   - this context must never look like a failing check on a PR
           #     that is simply mid-fix-cycle, which is the normal state of
           #     every round-1 PR with findings.
@@ -933,7 +932,7 @@ jobs:
             -f state="$state" \
             -f context=devteam/code-review \
             -f description="$description" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}" \
             --silent
           echo "devteam/code-review -> $state ($description)"
 
@@ -1428,9 +1427,8 @@ jobs:
   #
   # `needs.code-review.outputs.eligible` on the same-run arm is an
   # optimisation, not the authority: it decides whether this job is worth a
-  # runner. The script re-reads `devteam/merge-eligible` live on the PR's
-  # CURRENT head before it merges anything, because that is the only form of
-  # the verdict that cannot be stale.
+  # runner. The script reads the latest review and clearance statuses on
+  # the PR's current head before merging.
   # ---------------------------------------------------------------------------
   merge-attempt:
     # `provenance-gate` added so entry point (a) WAITS for it to post its own
@@ -1481,11 +1479,10 @@ jobs:
           REPO = os.environ["REPO"]
           EVENT_NAME = os.environ["EVENT_NAME"]
 
-          # The status the review job writes the instant it computes
-          # eligible=true, and only then. Absence of a `success` here on a
-          # given SHA IS the negative verdict for that SHA — there is no
-          # failure-state counterpart to read.
+          # The findings step writes eligibility only for cleared heads.
+          # The finalizer records the outcome of every review attempt.
           ELIGIBLE_CONTEXT = "devteam/merge-eligible"
+          REVIEW_CONTEXT = "devteam/code-review"
 
           # Same shape, written by `provenance-gate` only when a commit on
           # this SHA carries a well-formed `AW-Run-Id` trailer (or a human
@@ -1667,12 +1664,18 @@ jobs:
                     f"refusing to merge")
               sys.exit(1)
           statuses = combined.get("statuses") or []
-          cleared = any(s.get("context") == ELIGIBLE_CONTEXT
-                        and s.get("state") == "success"
-                        for s in statuses)
-          if not cleared:
+          eligibility = next((s for s in statuses if s.get("context") == ELIGIBLE_CONTEXT), {})
+          if eligibility.get("state") != "success":
               neutral(f"{ELIGIBLE_CONTEXT} is not success on {live_sha[:7]} — the "
                       f"review has not cleared this head for merge")
+
+          # The same SHA can be reviewed more than once. The latest review
+          # attempt must have finished successfully and issued this clearance.
+          review = next((s for s in statuses if s.get("context") == REVIEW_CONTEXT), {})
+          attempt_url = review.get("target_url")
+          if (review.get("state") != "success" or not attempt_url
+                  or attempt_url != eligibility.get("target_url")):
+              neutral(f"the latest code review attempt has not cleared {live_sha[:7]} for merge")
 
           provenance_cleared = any(s.get("context") == PROVENANCE_CONTEXT
                                     and s.get("state") == "success"
