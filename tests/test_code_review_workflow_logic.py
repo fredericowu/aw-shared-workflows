@@ -2636,7 +2636,8 @@ def dispatch_env(tmp_path, fake_gh):
     """Run the real Dispatch step with a scripted `curl` and a recording `sleep`.
 
     `codes` is the HTTP code (or `CURLFAIL:<exit>`) each successive curl call
-    yields; the last one repeats.
+    yields; the last one repeats. An `E` prefix (`E200`) makes that call's
+    body a successful run whose final message is empty.
     """
     bindir = tmp_path / "dbin"
     bindir.mkdir()
@@ -2648,7 +2649,8 @@ def dispatch_env(tmp_path, fake_gh):
         'i=$((n-1)); [ $i -ge ${#c[@]} ] && i=$((${#c[@]}-1)); code="${c[$i]}"\n'
         'out=""; while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\n'
         'if [[ "$code" == CURLFAIL:* ]]; then echo "curl: (7) refused" >&2; exit "${code#CURLFAIL:}"; fi\n'
-        '[ -n "$out" ] && echo \'{"choices":[]}\' > "$out"\n'
+        'msg=\'{}\'; if [[ "$code" == E* ]]; then code="${code#E}"; msg=\'\'; fi\n'
+        '[ -n "$out" ] && jq -n --arg c "$msg" \'{aw_status: "success", choices: [{message: {content: $c}}]}\' > "$out"\n'
         'if [[ "$code" == *:* ]]; then printf "%s" "${code%%:*}"; exit "${code##*:}"; fi\n'
         'printf "%s" "$code"\n'
     )
@@ -2870,3 +2872,71 @@ def test_prose_wrapped_extraction_stays_fail_closed(eligibility_script, tmp_path
     proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content)
     assert proc.returncode != 0
     assert not any("statuses" in c for c in _gh_calls(tmp_path))
+
+
+# --------------------------------------------------------------------------
+# PR #46 (runs 44542807965 / 44544164333): narration before a bare verdict,
+# braces inside that narration, and an empty final message
+# --------------------------------------------------------------------------
+
+# Verbatim shape of what code-reviewer-pipeline returned on PR #46: two
+# narration paragraphs, then the unfenced verdict (findings trimmed).
+_PR46_REAL = (
+    "I\u2019ll use the `aw-agent-code-reviewer` skill and check the round-one "
+    "replies against the supplied commit.\n\nBoth round-one fixes passed the "
+    "targeted tests. I\u2019m checking how the new retries interact with forced "
+    "catalog refreshes.\n\n"
+    + json.dumps({
+        "findings": [{**HIGH_NON_BLOCKING, "severity": "medium",
+                      "evidence": "src/apps/catalog.py:436\u2013448"}],
+        "counts": {"critical": 0, "high": 0, "medium": 1, "low": 0, "info": 0},
+        "research_runs_used": 0,
+    }, indent=2)
+)
+
+
+@pytest.mark.parametrize("content", [
+    _PR46_REAL,
+    "I checked the `{key}` placeholder in f\"{x}\".\n\n" + _EMPTY,
+    _EMPTY + "\n\nNote: `config{}` stays as-is.",
+    "Returns `{}` or `[]` on a miss, `[1, 2]` otherwise.\n" + _EMPTY + "\n}",
+])
+def test_a_verdict_is_found_among_prose_braces(eligibility_script, tmp_path, fake_gh, content):
+    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content, round_="2")
+    assert proc.returncode == 0, proc.stderr
+    assert any("statuses" in c for c in _gh_calls(tmp_path))
+
+
+def test_the_pr46_verdict_keeps_its_finding(eligibility_script, tmp_path, fake_gh):
+    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, _PR46_REAL, round_="1")
+    assert proc.returncode == 0, proc.stderr
+    out = dict(l.split("=", 1) for l in (tmp_path / "gh_output").read_text().splitlines() if "=" in l)
+    assert out["findings_count"] == "1" and out["eligible"] == "false"
+
+
+@pytest.mark.parametrize("content", [
+    "Example: {\"findings\": [], \"counts\": {}} is clean.\n" + _HIGH,
+    _HIGH + "\nFor reference: {\"a\": 1}",
+])
+def test_two_json_objects_among_prose_are_rejected(eligibility_script, tmp_path, fake_gh, content):
+    _assert_rejected(_run_raw_content(eligibility_script, tmp_path, fake_gh, content), tmp_path)
+
+
+@pytest.mark.parametrize("content", ["", "   \n\t"])
+def test_an_empty_message_is_rejected_by_name(eligibility_script, tmp_path, fake_gh, content):
+    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content)
+    _assert_rejected(proc, tmp_path)
+    assert "empty message" in proc.stdout + proc.stderr
+
+
+def test_an_empty_reviewer_message_is_redispatched_once(dispatch_env):
+    proc, n, sleeps = dispatch_env("E200,200")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert n == 2 and sleeps == ["15"]
+
+
+def test_a_second_empty_reviewer_message_fails_the_dispatch(dispatch_env):
+    proc, n, sleeps = dispatch_env("E200")
+    assert proc.returncode != 0
+    assert n == 2 and sleeps == ["15"]
+    assert "empty-reviewer-message" in proc.stdout + proc.stderr

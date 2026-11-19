@@ -662,6 +662,7 @@ jobs:
           delays=(15 30 60 90)
           max_tries=5
           attempt=1
+          empty_retries=0
           while :; do
             rc=0
             http_code="$(curl -sS --max-time 960 -o "$RUNNER_TEMP/dispatch_response.json" \
@@ -685,9 +686,31 @@ jobs:
               esac
             else
               echo "dispatch attempt $attempt/$max_tries: HTTP $http_code"
+              # A complete 2xx whose run SUCCEEDED but produced no final
+              # message has nothing to judge; that is a flake of the run, not
+              # a verdict. Re-dispatch it ONCE (each try is a full review, so
+              # not up to max_tries); a second empty reply fails explicitly
+              # here rather than as a JSON decoder error in the next step.
+              # A failed run (`error` / non-success `aw_status`) is left to
+              # the findings step, which rejects it -- never retried.
+              case "$http_code" in
+                2[0-9][0-9])
+                  if jq -e '(has("error") | not)
+                      and (if has("aw_status") then .aw_status == "success" else true end)
+                      and ((.choices[0].message.content // "") | tostring | test("\\S") | not)' \
+                      "$RUNNER_TEMP/dispatch_response.json" >/dev/null 2>&1; then
+                    echo "::warning::the reviewer returned an empty message"
+                    if [ "$empty_retries" -ge 1 ]; then
+                      http_code=empty-reviewer-message
+                      break
+                    fi
+                    empty_retries=$((empty_retries + 1))
+                    http_code=empty-reviewer-message
+                  fi ;;
+              esac
             fi
             case "$http_code" in
-              502|503|504|curl-failure) ;;
+              502|503|504|curl-failure|empty-reviewer-message) ;;
               *) break ;;
             esac
             if [ "$attempt" -ge "$max_tries" ]; then
@@ -776,30 +799,55 @@ jobs:
           # backtick run against the CLOSING one, not a naive text[3:-3]
           # slice -- a fence can open with 4+ backticks. re.search, not
           # re.match: the judge routinely prefixes the fence with a sentence
-          # of prose. With no fence anywhere the whole message is the body.
+          # of prose. With no fence, see the candidate scan below.
           # More than ONE fence is rejected outright: taking the first and
           # ignoring the rest let a clean fenced verdict hide a second one.
           #
           # The body must then be ONE COMPLETE JSON value that is a top-level
-          # object. It is deliberately NOT trimmed to the first `{` / last `}`:
-          # that made `[{"findings":[],"counts":{}}]` (an array) or two
+          # object. Never a naive first-`{` / last-`}` trim on its own: that
+          # made `[{"findings":[],"counts":{}}]` (an array) or two
           # concatenated objects parse as an eligible empty verdict.
           body = content
           fences = list(re.finditer(r"(`{3,})[^\n]*\n(.*?)\n\1`*", content, re.S))
           if len(fences) > 1:
               _reject(f"{len(fences)} fenced blocks; expected exactly one verdict", content)
+          if not content.strip():
+              # Nothing to judge: the run "succeeded" without a final message.
+              # The Dispatch step already re-dispatched once for this; say so
+              # plainly instead of a JSON decoder's "line 1 column 1".
+              _reject("the reviewer returned an empty message (re-run the review)")
           if fences:
               body = fences[0].group(2)
-          elif not content.lstrip().startswith("["):
-              # No fence: the judge often wraps a bare verdict in prose
-              # ("I reviewed ... {json}"). Take the span from the FIRST `{`
-              # to the LAST `}`, then still demand that span be ONE complete
-              # JSON object below: two concatenated objects, trailing
-              # fragments and duplicate keys all still fail to parse. A
-              # leading `[` (a wrapped array) is never sliced into an object.
-              lo, hi = content.find("{"), content.rfind("}")
-              if lo != -1 and hi > lo and not content[:lo].rstrip().endswith("["):
-                  body = content[lo:hi + 1]
+          else:
+              # No fence: the /v1 door hands back the judge's whole turn, so
+              # the verdict usually arrives after narration ("I'll use the
+              # skill ... Both fixes passed ...\n\n{json}" -- PR #46's two
+              # failing runs). Prose can carry braces of its own (`{key}`,
+              # `config{}`), so a first-`{`..last-`}` slice is not enough.
+              # Instead, scan for every COMPLETE JSON value starting at a `{`
+              # or `[` and require exactly ONE: two objects (two verdicts, or
+              # a verdict plus a stray `{"x": 1}`) stay rejected, as does an
+              # array-wrapped verdict (it is the one candidate and is not an
+              # object). Empty `{}` / `[]` and lists of scalars are prose,
+              # never a verdict, so they don't count. Duplicate keys are
+              # caught by the strict re-parse below, not by this scan.
+              dec = json.JSONDecoder()
+              cands, i = [], 0
+              while (m := re.compile(r"[\[{]").search(content, i)):
+                  try:
+                      val, end = dec.raw_decode(content, m.start())
+                  except ValueError:
+                      i = m.start() + 1
+                      continue
+                  if (isinstance(val, dict) and val) or (
+                          isinstance(val, list)
+                          and any(isinstance(x, (dict, list)) for x in val)):
+                      cands.append(content[m.start():end])
+                  i = end
+              if len(cands) > 1:
+                  _reject(f"{len(cands)} JSON values in the message; expected exactly one verdict", content)
+              if cands:
+                  body = cands[0]
 
           try:
               data = json.loads(body.strip(), object_pairs_hook=_no_duplicate_keys)
