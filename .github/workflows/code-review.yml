@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@20b4041dacd185a286e72a27fa166ec62e9859d3
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@master
     with:
       ci_check_name: "tests"
     permissions:
