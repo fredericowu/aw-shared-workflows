@@ -553,10 +553,10 @@ jobs:
             # Re-arm: `/aw-review`, or the PR left needs-human. NEVER on
             # `/aw-improve`: it is a suggestion re-run, not a review round,
             # and must not grant the next push a free automatic review.
-            # A failed delete is loud, not silent: the cap then stays on,
-            # which only costs the next push its automatic review.
+            # A failed delete is loud, not silent (it can also be a 404 for
+            # an absent label, so the message states only what happened).
             gh api -X DELETE "$label_api/devteam%3Areview-capped" --silent \
-              || echo "::warning::could not clear $cap_label; the next push stays capped until /aw-review"
+              || echo "::warning::could not clear $cap_label (API call failed or label already absent)"
           fi
 
           if ! is_trusted "$author"; then

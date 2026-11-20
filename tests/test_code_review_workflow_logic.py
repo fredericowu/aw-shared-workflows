@@ -3072,7 +3072,8 @@ def test_reuse_never_applies_when_any_key_part_differs_or_lookup_is_unsafe(
 
 def test_aw_improve_never_rearms_the_cap(gate_tail_script, cap_gh, tmp_path):
     """/aw-improve is not a review round: it must not clear the cap stamp."""
-    _, _, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="informational",
-                        action="created", mode="improve",
-                        labels="devteam:needs-human\ndevteam:review-capped")
+    _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="informational",
+                          action="created", mode="improve",
+                          labels="devteam:needs-human\ndevteam:review-capped")
+    assert "allowed=true" in out, "a fresh /aw-improve must still reach dispatch"
     assert not any("-X DELETE" in c for c in calls), calls
