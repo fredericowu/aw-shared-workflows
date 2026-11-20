@@ -269,7 +269,7 @@ on:
           `escalate` event). `0` disables the ceiling.
         required: false
         type: number
-        default: 5
+        default: 3
     secrets:
       # All `required: false`, deliberately. A caller missing one gets a
       # precise, fail-loud error from the step that needs it, naming the repo
@@ -617,7 +617,7 @@ jobs:
           # reset: PR #15 on tekflox/aw-app-git got 7 paid reviews in 18
           # minutes that way. This is the identity-free hard stop. Every
           # dispatch that reaches this point spends one unit of a per-PR
-          # budget (`max_reviews`, default 5), recorded as a `devteam:review-N`
+          # budget (`max_reviews`, default 3), recorded as a `devteam:review-N`
           # label this job adds. The COUNT is read from the PR timeline's
           # `labeled` events authored by github-actions[bot] — an event log
           # nobody can edit — so removing the labels or force-pushing resets
@@ -632,8 +632,8 @@ jobs:
           # the ceiling exists to save budget, never to leave a push
           # unreviewed; the refusal itself is made visible by the
           # `Report review ceiling` step, never silent.
-          max_reviews="${MAX_REVIEWS:-5}"
-          case "$max_reviews" in ''|*[!0-9]*) max_reviews=5 ;; esac
+          max_reviews="${MAX_REVIEWS:-3}"
+          case "$max_reviews" in ''|*[!0-9]*) max_reviews=3 ;; esac
           if [ "$max_reviews" -gt 0 ]; then
             used=""
             for attempt in 1 2 3; do
