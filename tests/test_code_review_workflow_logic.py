@@ -609,8 +609,12 @@ def _detect_round(
         ("devteam:awaiting-fixes", "2"),
         ("devteam:needs-human", "needs-human"),
         ("devteam:awaiting-fixes devteam:needs-human", "2"),  # awaiting-fixes wins
-        ("devteam:review-1", "2"),  # a live review-N means past round 1
-        ("devteam:review-3 bug", "2"),
+        ("devteam:review-1", "1"),  # review-N is the ceiling counter, not round memory
+        ("devteam:review-3 bug", "1"),
+        ("devteam:fix-cycle", "2"),  # the durable round memory
+        ("devteam:fix-cycle devteam:review-1", "2"),
+        ("devteam:fix-cycle devteam:needs-human", "needs-human"),
+        ("devteam:fix-cycle devteam:awaiting-fixes devteam:needs-human", "2"),
         ("devteam:review-1 devteam:needs-human", "needs-human"),
         ("devteam:review-capped", "1"),  # not a review-N counter label
         ("devteam:review-exhausted", "1"),
@@ -623,12 +627,18 @@ def test_round_is_detected_from_live_labels(round_script, fake_gh, labels, expec
     assert round_ == expected
 
 
-@pytest.mark.parametrize("action", ["created", "opened"])
-def test_review_n_is_not_round_memory_outside_a_push(round_script, fake_gh, action):
-    """/aw-improve and a timed-out round-1 dispatch also stamp review-N, so a
-    manual /aw-review on review-N alone stays round 1 (full lens)."""
+@pytest.mark.parametrize("action", ["created", "opened", "synchronize"])
+def test_review_n_alone_is_round_1_on_every_trigger(round_script, fake_gh, action):
+    """/aw-improve and a timed-out dispatch stamp review-N without any round-1
+    verdict, so it must never read as round memory, push or /aw-review."""
     rc, round_, _ = _detect_round(round_script, fake_gh, labels="devteam:review-1", action=action)
     assert rc == 0 and round_ == "1"
+
+
+@pytest.mark.parametrize("action", ["created", "opened", "synchronize"])
+def test_fix_cycle_alone_is_round_2_on_every_trigger(round_script, fake_gh, action):
+    rc, round_, _ = _detect_round(round_script, fake_gh, labels="devteam:fix-cycle", action=action)
+    assert rc == 0 and round_ == "2"
 
 
 def test_a_stray_needs_human_beside_awaiting_fixes_is_deleted(round_script, fake_gh, tmp_path):
@@ -642,7 +652,7 @@ def test_a_stray_needs_human_beside_awaiting_fixes_is_deleted(round_script, fake
     assert "awaiting-fixes wins" in out
 
 
-@pytest.mark.parametrize("labels", ["devteam:awaiting-fixes", "devteam:needs-human", "devteam:review-1", ""])
+@pytest.mark.parametrize("labels", ["devteam:awaiting-fixes", "devteam:needs-human", "devteam:review-1", "devteam:fix-cycle", ""])
 def test_no_needs_human_delete_without_the_pair(round_script, fake_gh, tmp_path, labels):
     log = tmp_path / "gh.log"
     _detect_round(round_script, fake_gh, labels=labels, gh_log=log)
@@ -739,6 +749,76 @@ def test_round1_findings_add_awaiting_fixes(labels_script, fake_gh, tmp_path):
     out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="1", findings_count=1)
     assert "labelled: devteam:awaiting-fixes" in out
     assert any("-X POST" in c and "/labels" in c for c in calls)
+
+
+def test_round1_findings_write_fix_cycle_before_awaiting_fixes(labels_script, fake_gh, tmp_path):
+    out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="1", findings_count=1)
+    posts = [c for c in calls if "-X POST" in c]
+    assert "labels[]=devteam:fix-cycle" in posts[0], posts
+    assert "labels[]=devteam:awaiting-fixes" in posts[1], posts
+
+
+def _failing_gh(tmp_path, fail_marker: str, live: str = ""):
+    """A fake gh that fails exactly the calls whose argv contains fail_marker."""
+    bin_dir = tmp_path / "failbin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/bin/bash\n"
+        f'if [[ "$*" == *"{fail_marker}"* ]]; then exit 1; fi\n'
+        'if [[ "$*" == *"-X "* ]]; then echo "$*" >> "$GH_LOG"; exit 0; fi\n'
+        f"printf '%s\\n' {live or ''}\n"
+    )
+    gh.chmod(0o755)
+    return bin_dir
+
+
+def test_a_failed_fix_cycle_write_fails_the_step_before_awaiting_fixes(labels_script, tmp_path):
+    bin_dir = _failing_gh(tmp_path, "labels[]=devteam:fix-cycle")
+    log = tmp_path / "gh_calls.log"
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "ROUND": "1",
+           "FINDINGS_COUNT": "1", "BLOCKING_COUNT": "0", "GH_TOKEN": "x", "GH_LOG": str(log),
+           "GITHUB_OUTPUT": "/dev/null"}
+    proc = subprocess.run(["bash", str(labels_script)], capture_output=True, text=True, env=env)
+    assert proc.returncode != 0
+    assert "devteam:awaiting-fixes" not in (log.read_text() if log.exists() else "")
+
+
+def test_a_failed_needs_human_write_does_not_report_escalated(labels_script, tmp_path):
+    bin_dir = _failing_gh(tmp_path, "labels[]=devteam:needs-human")
+    outputs = tmp_path / "o"
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "ROUND": "2",
+           "FINDINGS_COUNT": "1", "BLOCKING_COUNT": "1", "GH_TOKEN": "x",
+           "GH_LOG": str(tmp_path / "l"), "GITHUB_OUTPUT": str(outputs)}
+    proc = subprocess.run(["bash", str(labels_script)], capture_output=True, text=True, env=env)
+    assert proc.returncode != 0
+    assert "escalated=true" not in (outputs.read_text() if outputs.exists() else "")
+
+
+def test_remove_label_does_not_claim_success_when_the_delete_fails(labels_script, tmp_path):
+    bin_dir = _failing_gh(tmp_path, "-X DELETE")
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "ROUND": "needs-human",
+           "FINDINGS_COUNT": "0", "BLOCKING_COUNT": "0", "GH_TOKEN": "x",
+           "GH_LOG": str(tmp_path / "l"), "GITHUB_OUTPUT": "/dev/null"}
+    proc = subprocess.run(["bash", str(labels_script)], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0
+    assert "un-labelled" not in proc.stdout
+    assert "could not remove devteam:needs-human" in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("escalated,expect_event", [("true", "escalate"), ("false", None), ("", None)])
+def test_event_step_escalates_only_when_escalated_is_exactly_true(tmp_path, escalated, expect_event):
+    text = WORKFLOW.read_text()
+    start = text.index('          round="$ROUND"\n          if [ "$round" = "1" ]')
+    end = text.index("          python3 - \"$event\" <<'PYEOF'")
+    body = "\n".join(l[10:] if l.startswith("          ") else l for l in text[start:end].splitlines())
+    path = tmp_path / "ev.sh"
+    path.write_text("set -euo pipefail\n" + body + '\necho "EVENT=$event"\n')
+    env = {**os.environ, "ROUND": "2", "FINDINGS_COUNT": "1", "BLOCKING_COUNT": "1", "ESCALATED": escalated}
+    proc = subprocess.run(["bash", str(path)], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, proc.stderr
+    got = [l for l in proc.stdout.splitlines() if l.startswith("EVENT=")]
+    assert (got[0] == f"EVENT={expect_event}") if expect_event else not got
 
 
 def test_round2_blocking_adds_needs_human(labels_script, fake_gh, tmp_path):
@@ -959,7 +1039,8 @@ def test_a_failed_drop_is_a_warning_not_a_failure(synchronize_script, tmp_path):
         ("bug", "false"),
         ("devteam:needs-human", "true"),             # escalated: a fix push IS reviewed
         ("devteam:awaiting-fixes devteam:needs-human", "true"),
-        ("devteam:review-1", "true"),                # past round 1 once awaiting-fixes was dropped
+        ("devteam:fix-cycle", "true"),               # durable round memory once awaiting-fixes was dropped
+        ("devteam:review-1", "false"),               # ceiling counter only: round 1, refused
         ("devteam:review-capped", "false"),          # not a counter label
     ],
 )
@@ -2419,6 +2500,7 @@ def _run_report_round(
         "PR_NUMBER": "42",
         "HEAD_SHA": "a" * 40,
         "ROUND": round_,
+        "ESCALATED": "true",  # the label step wrote needs-human
         "FINDINGS_COUNT": str(len(findings)),
         "BLOCKING_COUNT": str(len(blocking)),
         "MISSING_BLOCKS_MERGE": "0",
