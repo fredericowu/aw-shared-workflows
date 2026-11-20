@@ -2099,6 +2099,9 @@ def test_the_loops_own_checks_never_block_the_merge(merge_script, merge_gh, tmp_
             {"name": "review / provenance-gate", "state": "FAILURE",
              "bucket": "fail"},
             {"name": "CodeRabbit", "state": "IN_PROGRESS", "bucket": "pending"},
+            # v1.13.0: a red review-ceiling status (written on a REFUSED head,
+            # which `gh pr checks` lists like any commit status) is advisory.
+            {"name": "devteam/review-cap", "state": "FAILURE", "bucket": "fail"},
         ],
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -2952,7 +2955,7 @@ def test_a_second_empty_reviewer_message_fails_the_dispatch(dispatch_env):
 def gate_tail_script(tmp_path_factory) -> Path:
     text = WORKFLOW.read_text()
     start = text.index("          if [ \"${{ github.event.action }}\" = \"synchronize\" ] \\\n             && [ \"$round\" != \"2\"")
-    end = text.index("  code-review:\n    needs: gate")
+    end = text.index("      - name: Report review ceiling")
     body = (
         text[start:end]
         .replace("${{ github.repository }}", "tekflox/aw-app-template")
@@ -3076,4 +3079,169 @@ def test_aw_improve_never_rearms_the_cap(gate_tail_script, cap_gh, tmp_path):
                           action="created", mode="improve",
                           labels="devteam:needs-human\ndevteam:review-capped")
     assert "allowed=true" in out, "a fresh /aw-improve must still reach dispatch"
-    assert not any("-X DELETE" in c for c in calls), calls
+    assert not any("-X DELETE" in c and "review-capped" in c for c in calls), calls
+
+
+# --------------------------------------------------------------------------
+# per-PR review ceiling (v1.13.0): identity-free, counted from the timeline
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def ceil_gh(tmp_path_factory) -> Path:
+    """`gh` that emulates the PR timeline: every successful POST of a
+    `devteam:review-N` label appends one `labeled` event line to
+    $TIMELINE_FILE (as GitHub would, authored by github-actions[bot]);
+    label DELETEs never remove events. `--paginate .../timeline` prints one
+    id per event, which is what the script's own --jq produces."""
+    d = tmp_path_factory.mktemp("ceilbin")
+    gh = d / "gh"
+    gh.write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$*" >> "$GH_LOG"\n'
+        'if [[ "$*" == *"/timeline"* ]]; then\n'
+        '  if [ "${TIMELINE_FAIL:-0}" = "1" ]; then exit 1; fi\n'
+        '  cat "$TIMELINE_FILE"; exit 0\n'
+        "fi\n"
+        'if [[ "$*" == *"/statuses"* ]]; then echo "[]"; exit 0; fi\n'
+        'if [[ "$*" == *"-X POST"* ]]; then\n'
+        '  if [ "${LABEL_POST_FAIL:-0}" = "1" ]; then exit 1; fi\n'
+        '  if [[ "$*" == *"labels[]=devteam:review-"* && "$*" != *"review-capped"* && "$*" != *"review-exhausted"* ]]; then echo ev >> "$TIMELINE_FILE"; fi\n'
+        "fi\n"
+        "exit 0\n"
+    )
+    gh.chmod(0o755)
+    return d
+
+
+def _ceil(script, ceil_gh, tmp_path, *, used=0, max_reviews="5", labels="", action="created",
+          round_="needs-human", mode="review", timeline_fail=False, label_post_fail=False):
+    tl = tmp_path / "timeline"
+    if not tl.exists():
+        tl.write_text("ev\n" * used)
+    out = tmp_path / "out"
+    out.write_text("")
+    env = {
+        **os.environ,
+        "PATH": f"{ceil_gh}{os.pathsep}{os.environ['PATH']}",
+        "ACTION": action, "LABELS": labels, "MAX_REVIEWS": max_reviews,
+        "TIMELINE_FILE": str(tl), "TIMELINE_FAIL": "1" if timeline_fail else "0",
+        "LABEL_POST_FAIL": "1" if label_post_fail else "0",
+        "GH_LOG": str(tmp_path / "calls.log"), "OUTF": str(out), "GH_TOKEN": "x",
+        "GITHUB_STEP_SUMMARY": "/dev/null",
+    }
+    proc = subprocess.run(["bash", "-c", f"round={round_}; mode={mode}; source {script}"],
+                          capture_output=True, text=True, env=env)
+    calls = (tmp_path / "calls.log").read_text().splitlines() if (tmp_path / "calls.log").exists() else []
+    return proc, dict(l.split("=", 1) for l in out.read_text().splitlines() if "=" in l), calls
+
+
+def test_under_the_ceiling_dispatches_and_stamps_the_next_label(gate_tail_script, ceil_gh, tmp_path):
+    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=2)
+    assert out.get("allowed") == "true" and "capped" not in out, proc.stdout + proc.stderr
+    stamp = [i for i, c in enumerate(calls) if "labels[]=devteam:review-3" in c]
+    assert len(stamp) == 1, calls
+    # DELETE-then-POST so a pre-seeded label cannot swallow the `labeled` event
+    assert any("-X DELETE" in c and "devteam%3Areview-3" in c for c in calls[: stamp[0]]), calls
+
+
+def test_at_the_ceiling_every_trigger_is_refused_visibly(gate_tail_script, ceil_gh, tmp_path):
+    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=5)
+    assert out["allowed"] == "false" and out["capped"] == "true", proc.stdout + proc.stderr
+    assert out["first_cap"] == "true" and out["review_count"] == "5" and out["max_reviews"] == "5"
+    assert any("labels[]=devteam:review-exhausted" in c for c in calls)
+    assert not any("labels[]=devteam:review-6" in c for c in calls)
+
+
+def test_second_refusal_does_not_re_announce(gate_tail_script, ceil_gh, tmp_path):
+    _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=5,
+                          labels="devteam:review-exhausted")
+    assert out["capped"] == "true" and out["first_cap"] == "false"
+    assert not any("labels[]=devteam:review-exhausted" in c for c in calls)
+
+
+@pytest.mark.parametrize("action,round_", [
+    ("created", "needs-human"),      # a coder/anyone running /aw-review
+    ("synchronize", "needs-human"),
+    ("synchronize", "2"),
+    ("created", "1"),
+])
+def test_no_trigger_and_no_label_state_overrides_the_ceiling(
+    gate_tail_script, ceil_gh, tmp_path, action, round_
+):
+    # labels all removed (what a resetting coder would do): still refused
+    _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=7, labels="",
+                      action=action, round_=round_)
+    assert out["allowed"] == "false" and out["capped"] == "true"
+
+
+def test_pr15_replay_yields_at_most_max_reviews_dispatches(gate_tail_script, ceil_gh, tmp_path):
+    """Replay: 12 triggers (pushes and /aw-review), every devteam label
+    stripped between each one. Dispatches must stop at the ceiling."""
+    allowed = 0
+    for i in range(12):
+        action, round_ = ("created", "needs-human") if i % 2 else ("synchronize", "needs-human")
+        (tmp_path / "calls.log").write_text("")
+        _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0, labels="",
+                          action=action, round_=round_)
+        allowed += out.get("allowed") == "true"
+    assert allowed == 5, allowed
+
+
+def test_a_hand_added_label_cannot_dodge_the_count(gate_tail_script, ceil_gh, tmp_path):
+    """All five labels pre-seeded by a non-bot actor: the timeline holds no
+    bot `labeled` events, so the gate still stamps (DELETE first, so GitHub
+    emits a fresh event) rather than treating the PR as already counted."""
+    seeded = "\n".join(f"devteam:review-{n}" for n in range(1, 6))
+    _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0, labels=seeded)
+    assert out["allowed"] == "true"
+    assert any("-X DELETE" in c and "devteam%3Areview-1" in c for c in calls)
+    assert (tmp_path / "timeline").read_text().count("ev") == 1
+
+
+def test_unreadable_timeline_fails_open_loudly(gate_tail_script, ceil_gh, tmp_path):
+    proc, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=9, timeline_fail=True)
+    assert out["allowed"] == "true" and "capped" not in out
+    assert "review ceiling not enforced" in proc.stdout + proc.stderr
+
+
+def test_failed_label_write_fails_open(gate_tail_script, ceil_gh, tmp_path):
+    proc, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=1, label_post_fail=True)
+    assert out["allowed"] == "true"
+    assert "reviewing anyway" in proc.stdout + proc.stderr
+
+
+def test_zero_disables_the_ceiling_and_garbage_falls_back_to_five(gate_tail_script, ceil_gh, tmp_path):
+    _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=50, max_reviews="0")
+    assert out["allowed"] == "true"
+    for bad in ("", "abc", "-1"):
+        (tmp_path / "timeline").unlink()
+        _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=5, max_reviews=bad)
+        assert out.get("capped") == "true", bad
+
+
+def test_free_refusals_do_not_spend_budget(gate_tail_script, ceil_gh, tmp_path):
+    """An unchanged-verdict reuse refuses BEFORE the ceiling, so it must
+    neither stamp a label nor count."""
+    # gate_tail's own `gh .../statuses` stub returns []; use a synchronize on
+    # round 1 instead: refused by the earlier guard, no ceiling work at all.
+    _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0, action="synchronize",
+                          round_="1")
+    assert out["allowed"] == "false" and "capped" not in out
+    assert not any("labels[]=devteam:review-" in c for c in calls)
+
+
+def test_the_ceiling_status_is_advisory_to_the_merge_job():
+    text = WORKFLOW.read_text()
+    adv = text[text.index("ADVISORY = {"):]
+    adv = adv[: adv.index("}")]
+    assert '"devteam/review-cap"' in adv
+
+
+def test_report_step_runs_only_on_a_cap_and_marks_the_head():
+    text = WORKFLOW.read_text()
+    step = text[text.index("      - name: Report review ceiling"):text.index("  code-review:\n    needs: gate")]
+    assert "steps.decide.outputs.capped == 'true'" in step
+    assert "context=devteam/review-cap" in step and "state=failure" in step
+    assert "review_budget_exhausted" in step
+    assert '"first_cap=' not in step  # announced via the decide output, not recomputed here
