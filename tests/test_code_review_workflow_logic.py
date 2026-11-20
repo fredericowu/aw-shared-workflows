@@ -3114,7 +3114,7 @@ def ceil_gh(tmp_path_factory) -> Path:
     return d
 
 
-def _ceil(script, ceil_gh, tmp_path, *, used=0, max_reviews="5", labels="", action="created",
+def _ceil(script, ceil_gh, tmp_path, *, used=0, max_reviews="3", labels="", action="created",
           round_="needs-human", mode="review", timeline_fail=False, label_post_fail=False):
     tl = tmp_path / "timeline"
     if not tl.exists():
@@ -3146,16 +3146,16 @@ def test_under_the_ceiling_dispatches_and_stamps_the_next_label(gate_tail_script
 
 
 def test_at_the_ceiling_every_trigger_is_refused_visibly(gate_tail_script, ceil_gh, tmp_path):
-    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=5)
+    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=3)
     assert out["allowed"] == "false" and out["capped"] == "true", proc.stdout + proc.stderr
-    assert out["first_cap"] == "true" and out["review_count"] == "5" and out["max_reviews"] == "5"
+    assert out["first_cap"] == "true" and out["review_count"] == "3" and out["max_reviews"] == "3"
     # the marker is stamped by the report step AFTER delivery, never by the gate
     assert not any("labels[]=devteam:review-exhausted" in c for c in calls)
-    assert not any("labels[]=devteam:review-6" in c for c in calls)
+    assert not any("labels[]=devteam:review-4" in c for c in calls)
 
 
 def test_second_refusal_does_not_re_announce(gate_tail_script, ceil_gh, tmp_path):
-    _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=5,
+    _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=3,
                           labels="devteam:review-exhausted")
     assert out["capped"] == "true" and out["first_cap"] == "false"
     assert not any("labels[]=devteam:review-exhausted" in c for c in calls)
@@ -3163,9 +3163,9 @@ def test_second_refusal_does_not_re_announce(gate_tail_script, ceil_gh, tmp_path
 
 def test_a_missing_dispatch_key_does_not_charge_the_budget(gate_tail_script, ceil_gh, tmp_path, monkeypatch):
     monkeypatch.setenv("HAS_KEY", "false")
-    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=4)
+    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=2)
     assert out["allowed"] == "true" and "capped" not in out
-    assert not any("labels[]=devteam:review-5" in c for c in calls)
+    assert not any("labels[]=devteam:review-3" in c for c in calls)
     assert "not charging" in proc.stdout + proc.stderr
 
 
@@ -3201,14 +3201,14 @@ def test_pr15_replay_yields_at_most_max_reviews_dispatches(gate_tail_script, cei
         _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0, labels="",
                           action=action, round_=round_)
         allowed += out.get("allowed") == "true"
-    assert allowed == 5, allowed
+    assert allowed == 3, allowed
 
 
 def test_a_hand_added_label_cannot_dodge_the_count(gate_tail_script, ceil_gh, tmp_path):
-    """All five labels pre-seeded by a non-bot actor: the timeline holds no
+    """All three labels pre-seeded by a non-bot actor: the timeline holds no
     bot `labeled` events, so the gate still stamps (DELETE first, so GitHub
     emits a fresh event) rather than treating the PR as already counted."""
-    seeded = "\n".join(f"devteam:review-{n}" for n in range(1, 6))
+    seeded = "\n".join(f"devteam:review-{n}" for n in range(1, 4))
     _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0, labels=seeded)
     assert out["allowed"] == "true"
     assert any("-X DELETE" in c and "devteam%3Areview-1" in c for c in calls)
@@ -3227,12 +3227,12 @@ def test_failed_label_write_fails_open(gate_tail_script, ceil_gh, tmp_path):
     assert "reviewing anyway" in proc.stdout + proc.stderr
 
 
-def test_zero_disables_the_ceiling_and_garbage_falls_back_to_five(gate_tail_script, ceil_gh, tmp_path):
+def test_zero_disables_the_ceiling_and_garbage_falls_back_to_three(gate_tail_script, ceil_gh, tmp_path):
     _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=50, max_reviews="0")
     assert out["allowed"] == "true"
     for bad in ("", "abc", "-1"):
         (tmp_path / "timeline").unlink()
-        _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=5, max_reviews=bad)
+        _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=3, max_reviews=bad)
         assert out.get("capped") == "true", bad
 
 
