@@ -52,11 +52,11 @@ jobs:
           # default.
           python-version: '3.12'
 
-      # pytest is the ONLY dependency, and the test file's docstring explains
-      # why it is kept that way (it deliberately text-scans instead of
-      # parsing YAML, so a parser dependency would be incidental coupling).
-      - name: Install pytest
-        run: python -m pip install --quiet pytest
+      # pytest, plus PyYAML for scripts/check_master_pin.py (the @master pin
+      # lint parses workflows as YAML; its tests import it at collection).
+      # The workflow-logic tests themselves still text-scan and do not use it.
+      - name: Install pytest and PyYAML
+        run: python -m pip install --quiet pytest pyyaml
 
       - name: Workflow logic regression tests
         run: python -m pytest tests/ -q -p no:cacheprovider
