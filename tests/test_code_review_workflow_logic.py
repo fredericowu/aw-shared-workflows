@@ -2982,6 +2982,7 @@ def cap_gh(tmp_path_factory) -> Path:
         '  cat "$STATUSES_FILE"; exit 0\n'
         "fi\n"
         'if [[ "$*" == *"-X POST"* && "${LABEL_POST_FAIL:-0}" = "1" ]]; then exit 1; fi\n'
+        'if [[ "$*" == *"-X DELETE"* && "${LABEL_DELETE_FAIL:-0}" = "1" ]]; then exit 1; fi\n'
         "exit 0\n"
     )
     gh.chmod(0o755)
@@ -2989,7 +2990,8 @@ def cap_gh(tmp_path_factory) -> Path:
 
 
 def _gate(script, cap_gh, tmp_path, *, round_, action="synchronize", mode="review",
-          labels="", statuses=None, statuses_fail=False, label_post_fail=False):
+          labels="", statuses=None, statuses_fail=False, label_post_fail=False,
+          label_delete_fail=False):
     (tmp_path / "st.json").write_text(json.dumps(statuses or []))
     out = tmp_path / "out"
     out.write_text("")
@@ -3000,6 +3002,7 @@ def _gate(script, cap_gh, tmp_path, *, round_, action="synchronize", mode="revie
         "STATUSES_FILE": str(tmp_path / "st.json"),
         "STATUSES_FAIL": "1" if statuses_fail else "0",
         "LABEL_POST_FAIL": "1" if label_post_fail else "0",
+        "LABEL_DELETE_FAIL": "1" if label_delete_fail else "0",
         "GH_LOG": str(tmp_path / "calls.log"), "OUTF": str(out), "GH_TOKEN": "x",
         "GITHUB_STEP_SUMMARY": "/dev/null",
     }
@@ -3031,6 +3034,21 @@ def test_aw_review_comment_rearms_the_cap_and_still_reviews(gate_tail_script, ca
                           action="created", labels="devteam:needs-human\ndevteam:review-capped")
     assert "allowed=true" in out
     assert any("-X DELETE" in c and "review-capped" in c for c in calls)
+
+
+def test_aw_improve_does_not_clear_the_review_cap(gate_tail_script, cap_gh, tmp_path):
+    _, _, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="informational",
+                        action="created", mode="improve",
+                        labels="devteam:needs-human\ndevteam:review-capped")
+    assert not any("-X DELETE" in c for c in calls)
+
+
+def test_a_failed_rearm_delete_is_surfaced_not_swallowed(gate_tail_script, cap_gh, tmp_path):
+    proc, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="needs-human",
+                         action="created", label_delete_fail=True,
+                         labels="devteam:needs-human\ndevteam:review-capped")
+    assert "allowed=true" in out
+    assert "could not clear devteam:review-capped" in proc.stdout + proc.stderr
 
 
 def test_a_failed_stamp_write_fails_open_to_review(gate_tail_script, cap_gh, tmp_path):

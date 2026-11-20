@@ -547,10 +547,16 @@ jobs:
             fi
             gh api -X POST "$label_api" -f "labels[]=$cap_label" --silent \
               || echo "::warning::could not stamp $cap_label; reviewing anyway"
-          elif has_label "$cap_label" && { [ "$round" != "needs-human" ] \
-               || [ "${{ github.event.action }}" != "synchronize" ]; }; then
-            # Re-arm: `/aw-review`, or the PR left needs-human.
-            gh api -X DELETE "$label_api/devteam%3Areview-capped" --silent || true
+          elif [ "$mode" != "improve" ] && has_label "$cap_label" \
+               && { [ "$round" != "needs-human" ] \
+                    || [ "${{ github.event.action }}" != "synchronize" ]; }; then
+            # Re-arm: `/aw-review`, or the PR left needs-human. `/aw-improve`
+            # (mode=improve) is not a review round, so it must NOT clear the
+            # stamp: the next synchronize has to stay refused until a real
+            # `/aw-review`. A failed delete is surfaced, not swallowed: the
+            # stamp then stays and pushes are refused until it is cleared.
+            gh api -X DELETE "$label_api/devteam%3Areview-capped" --silent \
+              || echo "::warning::could not clear $cap_label; pushes stay refused until it is removed by hand"
           fi
 
           if ! is_trusted "$author"; then
@@ -576,6 +582,10 @@ jobs:
           # `devteam/merge-eligible` success (a retry there must reach the
           # merge job), and any lookup failure — all fall through to a fresh
           # review, so this can only ever save a run, never clear a PR.
+          # Scope limit: the key includes the sha, so an `/aw-review` on a NEW
+          # sha always gets a full review. Reusing a verdict across shas would
+          # be a delta/skip review, which the Architect rejected (a round-1
+          # finding on #117 sat in a tests-only change). Not attempted here.
           if statuses="$(gh api "repos/${{ github.repository }}/commits/$sha/statuses?per_page=100" 2>/dev/null)"; then
             latest="$(printf '%s' "$statuses" | jq -r \
               '[.[] | select(.context=="devteam/code-review")][0] | "\(.state)|\(.description)"' 2>/dev/null || true)"
