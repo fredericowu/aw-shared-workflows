@@ -390,6 +390,9 @@ jobs:
           # documented in the KB).
           TRUSTED_AUTHORS: ${{ vars.AW_REVIEW_TRUSTED_AUTHORS }}
           MAX_REVIEWS: ${{ inputs.max_reviews }}
+          # Only used to avoid CHARGING the ceiling for a run whose reviewer
+          # job will fail on a missing dispatch key before any request is sent.
+          HAS_KEY: ${{ secrets.AW_CODEREVIEW_V1_KEY != '' }}
         run: |
           set -euo pipefail
           allowlist="${TRUSTED_AUTHORS:-fredericowu}"
@@ -646,13 +649,12 @@ jobs:
               echo "::warning::could not read PR #$pr_number's timeline; review ceiling not enforced on this dispatch"
             elif [ "$used" -ge "$max_reviews" ]; then
               echo "review ceiling reached: $used of $max_reviews reviews already dispatched on PR #$pr_number — refusing."
-              first=false
-              exhausted_label="devteam:review-exhausted"
-              if ! has_label "$exhausted_label"; then
-                gh api -X POST "$label_api" -f "labels[]=$exhausted_label" --silent \
-                  && first=true \
-                  || echo "::warning::could not stamp $exhausted_label"
-              fi
+              # Announced once per PR. The `review-exhausted` label is the
+              # "already announced" marker and is stamped by the report step
+              # only AFTER the status and comment were delivered, so a
+              # transient failure there is retried by the next refused run.
+              first=true
+              if has_label "devteam:review-exhausted"; then first=false; fi
               {
                 echo "allowed=false"
                 echo "capped=true"
@@ -661,6 +663,10 @@ jobs:
                 echo "max_reviews=$max_reviews"
               } >> "$GITHUB_OUTPUT"
               exit 0
+            elif [ "${HAS_KEY:-true}" != "true" ]; then
+              # The reviewer job fails loudly on the missing key before any
+              # request is sent: nothing is spent, so nothing is charged.
+              echo "::warning::AW_CODEREVIEW_V1_KEY is not set; not charging the review ceiling for a dispatch that cannot start"
             else
               next_label="devteam:review-$(( used + 1 ))"
               # DELETE first: re-adding a label that is already present emits
@@ -701,7 +707,7 @@ jobs:
           gh api -X POST "repos/$REPO/statuses/$HEAD_SHA" \
             -f state=failure \
             -f context=devteam/review-cap \
-            -f description="Review ceiling reached ($USED/$MAX): this head was NOT reviewed" \
+            -f description="Review ceiling reached ($USED/$MAX): new review skipped" \
             -f target_url="$RUN_URL" --silent
           echo "devteam/review-cap -> failure on ${HEAD_SHA:0:7}"
           if [ "$FIRST" != "true" ]; then
@@ -711,6 +717,9 @@ jobs:
           gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="**Review ceiling reached** ($USED of $MAX paid reviews used on this PR).
 
           No further automatic review will run on this PR, and \`/aw-review\` will not run one either: the budget is counted from the PR timeline, so removing labels or re-pushing does not reset it. Each later head gets a failing \`devteam/review-cap\` status instead of a review. A human decides what happens next (merge, close, or raise \`max_reviews\` in this repo's \`code-review.yml\`)." --silent
+          # Marker stamped only now that status + comment are delivered.
+          gh api -X POST "repos/$REPO/issues/$PR_NUMBER/labels" -f "labels[]=devteam:review-exhausted" --silent \
+            || echo "::warning::could not stamp devteam:review-exhausted; the announcement may repeat"
           if [ -z "${AW_DEVTEAM_EVENT_SECRET:-}" ]; then
             echo "::warning::AW_DEVTEAM_EVENT_SECRET is not set — no escalate event sent."
             exit 0

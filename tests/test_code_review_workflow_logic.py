@@ -3149,7 +3149,8 @@ def test_at_the_ceiling_every_trigger_is_refused_visibly(gate_tail_script, ceil_
     proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=5)
     assert out["allowed"] == "false" and out["capped"] == "true", proc.stdout + proc.stderr
     assert out["first_cap"] == "true" and out["review_count"] == "5" and out["max_reviews"] == "5"
-    assert any("labels[]=devteam:review-exhausted" in c for c in calls)
+    # the marker is stamped by the report step AFTER delivery, never by the gate
+    assert not any("labels[]=devteam:review-exhausted" in c for c in calls)
     assert not any("labels[]=devteam:review-6" in c for c in calls)
 
 
@@ -3158,6 +3159,21 @@ def test_second_refusal_does_not_re_announce(gate_tail_script, ceil_gh, tmp_path
                           labels="devteam:review-exhausted")
     assert out["capped"] == "true" and out["first_cap"] == "false"
     assert not any("labels[]=devteam:review-exhausted" in c for c in calls)
+
+
+def test_a_missing_dispatch_key_does_not_charge_the_budget(gate_tail_script, ceil_gh, tmp_path, monkeypatch):
+    monkeypatch.setenv("HAS_KEY", "false")
+    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=4)
+    assert out["allowed"] == "true" and "capped" not in out
+    assert not any("labels[]=devteam:review-5" in c for c in calls)
+    assert "not charging" in proc.stdout + proc.stderr
+
+
+def test_exhausted_marker_is_stamped_only_after_delivery():
+    text = WORKFLOW.read_text()
+    step = text[text.index("      - name: Report review ceiling"):text.index("  code-review:\n    needs: gate")]
+    assert step.index("/comments") < step.index("labels[]=devteam:review-exhausted")
+    assert step.index("context=devteam/review-cap") < step.index("labels[]=devteam:review-exhausted")
 
 
 @pytest.mark.parametrize("action,round_", [
