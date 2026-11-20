@@ -786,6 +786,7 @@ jobs:
               "pr_number": int(os.environ["PR_NUMBER"]),
               "pr_url": os.environ["PR_URL"], "head_sha": os.environ["HEAD_SHA"],
               "round": os.environ["ROUND"] or "needs-human",
+              "nudge_follows": True,
               "reason": "review_budget_exhausted",
               "counts": {}, "findings": [], "blocking": [],
               "missing_blocks_merge": 0,
@@ -1554,6 +1555,9 @@ jobs:
               "findings": json.load(open(os.path.join(TMP, "devteam_findings.json"))),
               "blocking": json.load(open(os.path.join(TMP, "devteam_blocking.json"))),
               "missing_blocks_merge": int(os.environ.get("MISSING_BLOCKS_MERGE") or 0),
+              # The `nudge` job runs after this one and decides wake / ask /
+              # wait; the platform only stores this digest.
+              "nudge_follows": True,
           }
           # Sign the EXACT bytes that get posted — build once, write once,
           # sign the file's contents, send the file. Signed in python rather
@@ -1922,6 +1926,10 @@ jobs:
         needs.code-review.outputs.eligible == 'true'
       )
     runs-on: ${{ fromJSON(inputs.runs_on) }}
+    outputs:
+      # The PR this job resolved (empty when none). The `nudge` job reads it
+      # on workflow_run, where the gate is skipped and has no PR number.
+      pr_number: ${{ steps.merge.outputs.pr_number }}
     # Nothing here waits on anything: a handful of bounded API reads and one
     # merge call. 10 is already generous; if this job is running long it is
     # stuck, not busy.
@@ -2007,7 +2015,8 @@ jobs:
                       "devteam/review-cap",
                       "ai-review", "code-review", "merge-eligible",
                       "provenance-gate", "gate", "fork-notice",
-                      "merged-event", "merge-attempt", "CodeRabbit"}
+                      "merged-event", "merge-attempt", "CodeRabbit",
+                      "nudge", "devteam-nudge"}
 
           # As a REUSABLE workflow, this file's jobs are reported to `gh pr
           # checks` as "<caller job id> / <job id>" — e.g. "review /
@@ -2088,6 +2097,10 @@ jobs:
                   print("::error::same-run entry point reached with no PR number "
                         "or head SHA from the gate")
                   sys.exit(1)
+
+          if os.environ.get("GITHUB_OUTPUT"):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write(f"pr_number={pr_number}\n")
 
           # ---- 2. is this PR still a thing we may merge, RIGHT NOW ----
           # Every one of these is re-read live rather than taken from the
@@ -2565,3 +2578,49 @@ jobs:
 #
 # No `--enable-auto-merge` repo setting is needed: this file never calls
 # `gh pr merge --auto` (see the merge step's own comment for why).
+
+  # ---------------------------------------------------------------------------
+  # nudge: the LAST job. After every event this workflow handled, post the
+  # PR's live state to the platform (devteam-nudge-reusable.yml), which decides
+  # wake / ask / wait / nothing. This job holds no decision logic and can never
+  # fail a PR (the callee exits 0 on every path). `always()` so it runs when
+  # the gate refused, the review failed or nothing was merge-eligible; it is
+  # in `merge-attempt`'s ADVISORY set so it never reads as its own pending CI.
+  #
+  # On workflow_run the gate is skipped and has no PR number, so it comes from
+  # `merge-attempt`, which already resolves it from the head SHA.
+  # ---------------------------------------------------------------------------
+  nudge:
+    needs: [gate, code-review, provenance-gate, merge-attempt]
+    if: >-
+      always() &&
+      github.event.action != 'closed' &&
+      github.event.sender.type != 'Bot' &&
+      (
+        github.event_name == 'pull_request' ||
+        github.event_name == 'workflow_run' ||
+        (
+          github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request != null
+        )
+      ) &&
+      (needs.gate.outputs.pr_number != '' || needs.merge-attempt.outputs.pr_number != '')
+    uses: fredericowu/aw-shared-workflows/.github/workflows/devteam-nudge-reusable.yml@master
+    with:
+      pr_number: ${{ needs.gate.outputs.pr_number || needs.merge-attempt.outputs.pr_number }}
+      trigger_kind: >-
+        ${{ github.event_name == 'workflow_run' && 'ci_done'
+        || needs.code-review.result != 'skipped' && 'review_done'
+        || github.event_name == 'issue_comment' && 'comment'
+        || 'push_unreviewed' }}
+      event_url: ${{ inputs.event_url }}
+      runs_on: ${{ inputs.runs_on }}
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      checks: read
+      statuses: read
+      actions: read
+    secrets:
+      AW_DEVTEAM_EVENT_SECRET: ${{ secrets.AW_DEVTEAM_EVENT_SECRET }}

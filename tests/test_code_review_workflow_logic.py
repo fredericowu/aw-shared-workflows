@@ -3461,3 +3461,306 @@ def test_the_drop_happens_even_when_the_push_is_then_refused(
     proc, out, calls = _gate(script, gh_dir, tmp_path, round_="2", labels="devteam:awaiting-fixes", **kw)
     assert "allowed=false" in out, proc.stdout + proc.stderr + out
     assert any("-X DELETE" in c and "labels/devteam%3Aawaiting-fixes" in c for c in calls), calls
+
+
+# --------------------------------------------------------------------------
+# devteam-nudge (event-driven PR lifecycle, part B)
+# --------------------------------------------------------------------------
+
+NUDGE_WORKFLOW = WORKFLOW.parent / "devteam-nudge-reusable.yml"
+_NUDGE_STEP = "- name: Post the PR state to the platform"
+_NUDGE_SECRET = "s3cr3t-value"
+_OPEN_VIEW = {
+    "state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+    "isDraft": False, "statusCheckRollup": [{"name": "tests", "conclusion": "SUCCESS"}],
+    "headRefOid": "a" * 40, "url": "https://github.com/o/r/pull/7",
+}
+
+
+@pytest.fixture(scope="module")
+def nudge_script(tmp_path_factory) -> Path:
+    src = _extract_heredoc(_NUDGE_STEP, NUDGE_WORKFLOW.read_text())
+    assert "devteam-pr-nudge" in src, "extracted the wrong block"
+    path = tmp_path_factory.mktemp("nudge") / "nudge.py"
+    path.write_text(src)
+    return path
+
+
+@pytest.fixture(scope="module")
+def nudge_bin(tmp_path_factory) -> Path:
+    """Fake `gh` and `curl`. State and logs live under $NUDGE_STATE."""
+    d = tmp_path_factory.mktemp("nudgebin")
+    (d / "gh").write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$*" >> "$NUDGE_STATE/gh.log"\n'
+        'if [[ "$*" == *"/labels"* ]]; then printf "%s\\n" $FAKE_LABELS; exit 0; fi\n'
+        'if [[ "$*" == *"/events"* ]]; then cat "$NUDGE_STATE/events" 2>/dev/null; exit 0; fi\n'
+        'if [[ "$1 $2" == "pr view" ]]; then\n'
+        '  n=$(cat "$NUDGE_STATE/view_n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$NUDGE_STATE/view_n"\n'
+        '  f="$NUDGE_STATE/view_$n"; [ -f "$f" ] || f="$NUDGE_STATE/view_last"\n'
+        '  cat "$f"; exit 0\n'
+        "fi\n"
+        "exit 0\n"
+    )
+    (d / "curl").write_text(
+        "#!/bin/bash\n"
+        'out=""; data=""; hdr=""; prev=""\n'
+        'for a in "$@"; do\n'
+        '  [ "$prev" = "-o" ] && out="$a"\n'
+        '  [ "$prev" = "--data-binary" ] && data="${a#@}"\n'
+        '  [ "$prev" = "-H" ] && [[ "$a" == X-Hub-Signature-256* ]] && hdr="$a"\n'
+        '  prev="$a"\n'
+        "done\n"
+        'n=$(cat "$NUDGE_STATE/curl_n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$NUDGE_STATE/curl_n"\n'
+        'cp "$data" "$NUDGE_STATE/posted_$n.json"; echo "$hdr" > "$NUDGE_STATE/sig_$n"\n'
+        'printf "%s\\n" "$*" >> "$NUDGE_STATE/curl.log"\n'
+        'code=$(sed -n "${n}p" "$NUDGE_STATE/codes" 2>/dev/null); code=${code:-200}\n'
+        '[ "$code" = "fail" ] && { echo "curl: (7) refused" >&2; exit 7; }\n'
+        'cat "$NUDGE_STATE/response" > "$out" 2>/dev/null\n'
+        'printf "%s" "$code"\n'
+    )
+    for f in ("gh", "curl"):
+        (d / f).chmod(0o755)
+    return d
+
+
+def _run_nudge(script, nudge_bin, tmp_path, *, kind="review_done", label="",
+               labels=("aw-run:" + "r" * 32,), view=None, views=None, secret=_NUDGE_SECRET,
+               codes=(), response='{"verdict": "woken", "reason": "chain idle"}',
+               events="", actor="octo", actor_type="User", pr="7", dry_run="false"):
+    state = tmp_path / "state"
+    state.mkdir()
+    for i, v in enumerate(views or [], 1):
+        (state / f"view_{i}").write_text(json.dumps(v))
+    (state / "view_last").write_text(json.dumps(view if view is not None else _OPEN_VIEW))
+    (state / "codes").write_text("\n".join(codes))
+    (state / "response").write_text(response)
+    (state / "events").write_text(events)
+    env = {
+        **os.environ,
+        "PATH": f"{nudge_bin}:{os.environ['PATH']}",
+        "NUDGE_STATE": str(state), "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
+        "NUDGE_SLEEP_SCALE": "0", "FAKE_LABELS": " ".join(labels),
+        "REPO": "o/r", "PR_NUMBER": pr, "TRIGGER_KIND": kind, "TRIGGER_LABEL": label,
+        "EVENT_URL": "https://ap.example/", "DRY_RUN": dry_run,
+        "ACTOR": actor, "ACTOR_TYPE": actor_type, "AW_DEVTEAM_EVENT_SECRET": secret,
+    }
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env)
+    posts = sorted(state.glob("posted_*.json"), key=lambda p: int(p.stem.split("_")[1]))
+    return proc, state, [json.loads(p.read_text()) for p in posts]
+
+
+def _comments(state) -> list[str]:
+    log = state / "gh.log"
+    return [l for l in (log.read_text().splitlines() if log.exists() else [])
+            if "/comments" in l and "-X POST" in l]
+
+
+@pytest.mark.parametrize("kind", ["review_done", "push_unreviewed", "ci_done", "comment"])
+def test_nudge_payload_shape_per_trigger_kind(nudge_script, nudge_bin, tmp_path, kind):
+    proc, state, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, kind=kind,
+                                    actor="alice", actor_type="User")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(posts) == 1
+    p = posts[0]
+    assert p["v"] == 1
+    assert p["trigger"] == {"kind": kind, "actor": "alice", "actor_type": "User", "label": ""}
+    assert p["repo"] == "o/r" and p["pr_number"] == 7
+    assert p["pr_url"] == "https://github.com/o/r/pull/7"
+    assert p["head_sha"] == "a" * 40
+    assert p["labels"] == ["aw-run:" + "r" * 32]
+    assert p["run_id"] == "r" * 32
+    assert p["view"] == _OPEN_VIEW and p["needs_human_actor"] is None
+    assert p["dry_run"] is False
+    assert "/api/github/devteam-pr-nudge" in (state / "curl.log").read_text()
+
+
+def test_nudge_label_trigger_carries_the_label_and_dry_run(nudge_script, nudge_bin, tmp_path):
+    labels = ("aw-run:" + "r" * 32, "devteam:awaiting-fixes")
+    proc, _, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, kind="label",
+                                label="devteam:awaiting-fixes", labels=labels, dry_run="true")
+    assert proc.returncode == 0 and len(posts) == 1, proc.stdout + proc.stderr
+    assert posts[0]["trigger"]["label"] == "devteam:awaiting-fixes"
+    assert posts[0]["dry_run"] is True
+
+
+def test_nudge_run_id_is_empty_with_only_a_card_label(nudge_script, nudge_bin, tmp_path):
+    _, _, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, labels=("aw-card:abc",))
+    assert posts[0]["run_id"] == ""
+
+
+def test_nudge_reports_the_last_needs_human_labeler(nudge_script, nudge_bin, tmp_path):
+    events = '{"login": "bot1", "type": "Bot"}\n{"login": "frederico", "type": "User"}\n'
+    _, _, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, events=events,
+                             labels=("aw-run:" + "r" * 32, "devteam:needs-human"))
+    assert posts[0]["needs_human_actor"] == {"login": "frederico", "type": "User"}
+
+
+@pytest.mark.parametrize("case", ["closed", "merged", "no_agent_label", "label_wrong",
+                                  "label_gone", "no_pr", "no_secret"])
+def test_nudge_skips_quietly_and_never_posts(nudge_script, nudge_bin, tmp_path, case):
+    kw = {}
+    if case == "closed":
+        kw["view"] = {**_OPEN_VIEW, "state": "CLOSED"}
+    elif case == "merged":
+        kw["view"] = {**_OPEN_VIEW, "state": "MERGED"}
+    elif case == "no_agent_label":
+        kw["labels"] = ("bug",)
+    elif case == "label_wrong":
+        kw.update(kind="label", label="devteam:needs-human",
+                  labels=("aw-run:" + "r" * 32, "devteam:needs-human"))
+    elif case == "label_gone":
+        kw.update(kind="label", label="devteam:awaiting-fixes")  # not in the live set
+    elif case == "no_pr":
+        kw["pr"] = ""
+    elif case == "no_secret":
+        kw["secret"] = ""
+    proc, state, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, **kw)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert posts == [] and _comments(state) == []
+    if case == "no_secret":
+        assert "::warning::" in proc.stdout
+
+
+def test_nudge_rereads_the_view_while_mergeable_is_unknown(nudge_script, nudge_bin, tmp_path):
+    unknown = {**_OPEN_VIEW, "mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"}
+    proc, state, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, views=[unknown, unknown])
+    assert proc.returncode == 0 and len(posts) == 1
+    assert posts[0]["view"]["mergeable"] == "MERGEABLE"
+    assert (state / "view_n").read_text().strip() == "3"
+
+
+def test_nudge_gives_up_on_unknown_after_three_reads_and_still_posts(nudge_script, nudge_bin, tmp_path):
+    unknown = {**_OPEN_VIEW, "mergeable": "UNKNOWN"}
+    proc, state, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, view=unknown)
+    assert proc.returncode == 0 and len(posts) == 1
+    assert (state / "view_n").read_text().strip() == "3"
+    assert posts[0]["view"]["mergeable"] == "UNKNOWN"
+
+
+def test_nudge_signature_is_over_the_exact_posted_bytes(nudge_script, nudge_bin, tmp_path):
+    import hashlib, hmac
+    proc, state, _ = _run_nudge(nudge_script, nudge_bin, tmp_path)
+    raw = (state / "posted_1.json").read_bytes()
+    want = hmac.new(_NUDGE_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    assert (state / "sig_1").read_text().strip() == f"X-Hub-Signature-256: sha256={want}"
+    assert _NUDGE_SECRET not in (state / "curl.log").read_text()  # never in argv
+    assert _NUDGE_SECRET not in proc.stdout + proc.stderr
+
+
+def test_nudge_404_is_a_warning_and_exit_zero(nudge_script, nudge_bin, tmp_path):
+    proc, state, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, codes=["404"],
+                                    response='{"detail": "Not Found"}')
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(posts) == 1, "404 is final, no retry"
+    assert "::warning::" in proc.stdout and "not deployed" in proc.stdout
+
+
+def test_nudge_retries_5xx_and_transport_errors_then_succeeds(nudge_script, nudge_bin, tmp_path):
+    proc, state, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, codes=["fail", "502", "200"])
+    assert proc.returncode == 0 and len(posts) == 3
+    assert posts[0] == posts[2]
+    assert "woken" in (tmp_path / "summary.md").read_text()
+
+
+def test_nudge_persistent_5xx_gives_up_after_three_and_exits_zero(nudge_script, nudge_bin, tmp_path):
+    proc, _, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, codes=["503", "503", "503", "200"])
+    assert proc.returncode == 0 and len(posts) == 3
+    assert "::warning::" in proc.stdout
+
+
+@pytest.mark.parametrize("code", ["400", "401", "422"])
+def test_nudge_other_non_2xx_is_a_warning_without_retry(nudge_script, nudge_bin, tmp_path, code):
+    proc, _, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, codes=[code])
+    assert proc.returncode == 0 and len(posts) == 1
+    assert f"HTTP {code}" in proc.stdout and "::warning::" in proc.stdout
+
+
+@pytest.mark.parametrize("kind,verdict,comments", [
+    ("label", "active", 1), ("comment", "recent", 1), ("label", "woken", 0),
+    ("review_done", "active", 0), ("ci_done", "waiting_ci", 0), ("push_unreviewed", "recent", 0),
+])
+def test_nudge_comments_only_for_human_triggers_that_did_not_wake(
+        nudge_script, nudge_bin, tmp_path, kind, verdict, comments):
+    kw = {}
+    if kind == "label":
+        kw.update(label="devteam:awaiting-fixes",
+                  labels=("aw-run:" + "r" * 32, "devteam:awaiting-fixes"))
+    proc, state, _ = _run_nudge(
+        nudge_script, nudge_bin, tmp_path, kind=kind,
+        response=json.dumps({"verdict": verdict, "reason": "why not"}), **kw)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(_comments(state)) == comments
+    if comments:
+        assert verdict in _comments(state)[0] and "why not" in _comments(state)[0]
+    assert verdict in (tmp_path / "summary.md").read_text()
+
+
+def test_nudge_script_never_raises_even_on_garbage(nudge_script, nudge_bin, tmp_path):
+    proc, _, _ = _run_nudge(nudge_script, nudge_bin, tmp_path, response="<html>oops</html>")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# ---- structure of the two workflows ---------------------------------------
+
+
+def _job(text: str, name: str) -> str:
+    start = text.index(f"\n  {name}:\n")
+    rest = text[start + 1:]
+    m = re.search(r"\n  [a-z][a-z-]*:\n", rest[1:])
+    return rest if not m else rest[:m.start() + 1]
+
+
+def test_nudge_workflow_is_continue_on_error_and_bounded_with_no_checkout():
+    text = NUDGE_WORKFLOW.read_text()
+    code = _code_only(text)
+    assert "timeout-minutes: 5" in code
+    assert code.count("continue-on-error: true") >= 2  # job and step
+    assert "actions/checkout" not in code, "pull_request_target + secret: never check out PR code"
+    assert "secrets.AW_DEVTEAM_EVENT_SECRET" in code
+    assert "event_url" in code and "https://agents-platform.aw.tekflox.com" in code
+
+
+def test_the_review_workflow_ends_with_a_nudge_job_that_waits_for_everything():
+    text = WORKFLOW.read_text()
+    job = _code_only(_job(text, "nudge"))
+    assert "devteam-nudge-reusable.yml@master" in job
+    assert "needs: [gate, code-review, provenance-gate, merge-attempt]" in job
+    assert "always()" in job and "github.event.action != 'closed'" in job
+    assert "github.event.sender.type != 'Bot'" in job
+    for kind in ("ci_done", "review_done", "comment", "push_unreviewed"):
+        assert f"'{kind}'" in job
+    assert "needs.merge-attempt.outputs.pr_number" in job
+    assert "AW_DEVTEAM_EVENT_SECRET: ${{ secrets.AW_DEVTEAM_EVENT_SECRET }}" in job
+
+
+def test_merge_attempt_exposes_the_pr_it_resolves_and_the_nudge_is_advisory():
+    text = WORKFLOW.read_text()
+    assert "pr_number: ${{ steps.merge.outputs.pr_number }}" in _job(text, "merge-attempt")
+    src = _extract_heredoc(_MERGE_STEP)
+    assert 'pr_number={pr_number}' in src and "GITHUB_OUTPUT" in src
+    advisory = src[src.index("ADVISORY = {"):src.index("}", src.index("ADVISORY = {"))]
+    assert '"nudge"' in advisory and '"devteam-nudge"' in advisory
+
+
+def test_the_review_event_payloads_announce_that_a_nudge_follows():
+    report = _extract_heredoc("- name: Report round outcome to the platform")
+    cap = _extract_heredoc("python3 - <<'PYEOF'\n          import hashlib, hmac, json, os, subprocess\n          TMP")
+    assert '"nudge_follows": True' in report
+    assert '"nudge_follows": True' in cap
+    # the merged event is untouched
+    merged = _extract_heredoc("- name: Report the merge to the platform")
+    assert "nudge_follows" not in merged
+
+
+def test_the_reference_label_caller_matches_the_design():
+    caller = (WORKFLOW.parent / "devteam-nudge.yml").read_text()
+    code = _code_only(caller)
+    assert "pull_request_target:" in code and "types: [labeled]" in code
+    assert "group: devteam-nudge-${{ github.event.pull_request.number }}" in code
+    assert "cancel-in-progress: false" in code
+    assert "trigger_kind: label" in code
+    assert "devteam-nudge-reusable.yml@master" in code
+    assert "actions/checkout" not in code
+    assert "github.event.label.name == 'devteam:awaiting-fixes'" in code

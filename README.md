@@ -8,6 +8,8 @@ repos. One file, several callers, no copy-paste drift.
 | Workflow | Purpose |
 |---|---|
 | `.github/workflows/code-review-reusable.yml` | The Dev Team's two-round PR review → merge loop (`workflow_call`). |
+| `.github/workflows/devteam-nudge-reusable.yml` | Posts a PR's live state to the Agents Platform so it can wake the coder / ask / wait (`workflow_call`). Called by the review workflow's final `nudge` job and by the label caller. |
+| `.github/workflows/devteam-nudge.yml` | This repo's own caller for the human `devteam:awaiting-fixes` label; the reference copy consumers get. |
 | `.github/workflows/security-scan-reusable.yml` | Weekly Semgrep + Trivy + Gitleaks scan, SARIF to code scanning (`workflow_call`). |
 | `.github/workflows/test.yml` | This repo's own CI — runs `tests/`. |
 | `scripts/check_master_pin.py` | Lint: fails on any consumer `uses:` of this repo at a ref other than `@master`. See below. |
@@ -378,6 +380,35 @@ rather than a confusing downstream 401 or 500.
 
 The full caller checklist, with the `gh` commands, is at the bottom of the
 workflow file itself.
+
+## `devteam-nudge-reusable.yml` (event-driven PR lifecycle)
+
+After every event `code-review-reusable.yml` handles, its final `nudge` job
+calls this workflow, which reads the PR's live labels and `gh pr view` JSON
+and posts one HMAC-signed call (`AW_DEVTEAM_EVENT_SECRET`, same secret as the
+review events) to `<event_url>/api/github/devteam-pr-nudge`. The platform
+decides wake / ask / wait / nothing; **this workflow holds no decision
+logic.** The review-event payloads carry `nudge_follows: true`, so the
+platform only stores the digest and lets the nudge decide.
+
+- **Never fails a PR.** Every path exits 0: an unset secret, a 404 (platform
+  not deployed yet) or a persistent 5xx is a warning. Retries 3 times on
+  transport errors and 5xx.
+- **Skips quietly** when the PR is not open, has no `aw-run:`/`aw-card:`
+  label, or (label trigger) the label is not a still-live
+  `devteam:awaiting-fixes`.
+- `trigger_kind` is `review_done`, `push_unreviewed`, `ci_done`, `comment`
+  or `label`. For `label` and `comment`, when the platform did not wake
+  anyone, the job posts one short PR comment with the verdict and reason.
+- Never checks out PR code (the label caller is `pull_request_target`).
+
+Review-event nudges reach every consumer through `@master` with no consumer
+edit. Only the **human label trigger** needs a per-repo file: copy
+[`.github/workflows/devteam-nudge.yml`](.github/workflows/devteam-nudge.yml)
+as is. Labels written by the pipeline itself use `GITHUB_TOKEN` and start no
+workflow, so only a person (or a PAT) adding `devteam:awaiting-fixes` fires it.
+Roll out the platform route (AP-MT `/api/github/devteam-pr-nudge`) first; until
+then the job logs a 404 warning and does nothing.
 
 ## `security-scan-reusable.yml`
 
