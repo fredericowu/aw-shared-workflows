@@ -16,7 +16,11 @@ on:
     types: [labeled]
 
 concurrency:
-  group: devteam-nudge-${{ github.event.pull_request.number }}
+  # The label name is part of the key: every label event on a PR enters the
+  # group before the job's `if` filters it, and GitHub keeps ONE pending run
+  # per group, so an unrelated label would otherwise replace a pending
+  # devteam:awaiting-fixes nudge with a run that then skips.
+  group: devteam-nudge-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
   cancel-in-progress: false
 
 permissions:
