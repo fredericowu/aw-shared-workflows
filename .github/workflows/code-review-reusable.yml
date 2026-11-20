@@ -387,6 +387,7 @@ jobs:
       pr_number: ${{ steps.decide.outputs.pr_number }}
       mode: ${{ steps.decide.outputs.mode }}
       round: ${{ steps.decide.outputs.round }}
+      fix_push: ${{ steps.decide.outputs.fix_push }}
       is_draft: ${{ steps.decide.outputs.is_draft }}
     steps:
       - name: Decide
@@ -519,12 +520,18 @@ jobs:
             # Terminal until a human removes the label. The review still runs
             # and still posts its findings — it just cannot change state.
             round=needs-human
-          elif printf '%s\n' "$labels" | grep -Eq '^devteam:review-[0-9]+$'; then
+          elif [ "${{ github.event.action }}" = "synchronize" ] \
+               && printf '%s\n' "$labels" | grep -Eq '^devteam:review-[0-9]+$'; then
             # awaiting-fixes is dropped on every push (below), so it can no
-            # longer be the round memory. A live devteam:review-N label (stamped
-            # by the ceiling on every paid dispatch) says this PR is already
-            # past round 1. With max_reviews=0 no review-N is stamped and a
-            # later push reads as round 1 (needs /aw-review).
+            # longer be the round memory for a PUSH. A live devteam:review-N
+            # label (stamped by the ceiling on every paid dispatch) says a
+            # review already ran on this PR. Push events only: review-N is also
+            # stamped by /aw-improve and by a round-1 dispatch that timed out,
+            # so /aw-review must not read it as "round 1 already returned"
+            # (it stays round 1, the full lens). Residual: a push after such
+            # an improve-only/failed first dispatch is reviewed as round 2.
+            # With max_reviews=0 no review-N is stamped and a push after the
+            # first fix reads as round 1 (needs /aw-review).
             round=2
           else
             round=1
@@ -542,6 +549,11 @@ jobs:
           # push (ceiling, untrusted author, reused verdict) never keeps a
           # label that says the coder owes a push. A failed delete is a
           # warning, never a failure (a fork PR token is read-only).
+          if [ "${{ github.event.action }}" = "synchronize" ]; then
+            # A push is the fix: the label step must not read a failed delete
+            # below as "the coder still owes a push".
+            echo "fix_push=true" >> "$GITHUB_OUTPUT"
+          fi
           if [ "${{ github.event.action }}" = "synchronize" ] \
              && has_label "devteam:awaiting-fixes"; then
             gh api -X DELETE "repos/${{ github.repository }}/issues/$pr_number/labels/devteam%3Aawaiting-fixes" --silent \
@@ -1397,6 +1409,7 @@ jobs:
           ROUND: ${{ needs.gate.outputs.round }}
           FINDINGS_COUNT: ${{ steps.findings.outputs.findings_count }}
           BLOCKING_COUNT: ${{ steps.findings.outputs.blocking_count }}
+          FIX_PUSH: ${{ needs.gate.outputs.fix_push }}
         run: |
           set -euo pipefail
           add_label() {
@@ -1429,7 +1442,10 @@ jobs:
             # Read live: a round 2 run on an unchanged head (/aw-review) still
             # has awaiting-fixes, and the coder still owes a push, so it must
             # not escalate. A failed read behaves as before: escalate.
-            if live="$(gh api "repos/${{ github.repository }}/issues/${{ needs.gate.outputs.pr_number }}/labels" --jq '.[].name')" \
+            # A synchronize run is the fix push itself: awaiting-fixes cannot
+            # still be owed even if the gate's drop failed, so escalate.
+            if [ "${FIX_PUSH:-}" != "true" ] \
+               && live="$(gh api "repos/${{ github.repository }}/issues/${{ needs.gate.outputs.pr_number }}/labels" --jq '.[].name')" \
                && printf '%s\n' "$live" | grep -Fxq "devteam:awaiting-fixes"; then
               echo "devteam:awaiting-fixes still live — keeping it, not escalating"
             else

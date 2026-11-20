@@ -565,6 +565,7 @@ def round_script(tmp_path_factory) -> Path:
     body = (
         text[start:end]
         .replace("${{ github.repository }}", "tekflox/aw-app-template")
+        .replace("${{ github.event.action }}", "${EVENT_ACTION:-synchronize}")
         .replace('"$GITHUB_OUTPUT"', "/dev/null")
     )
     assert "has_label" in body, "extracted the wrong fragment"
@@ -579,9 +580,10 @@ def round_script(tmp_path_factory) -> Path:
 
 def _detect_round(
     script: Path, fake_gh, *, labels: str, mode: str = "review", fetch_fails: bool = False,
-    gh_log: Path | None = None,
+    gh_log: Path | None = None, action: str = "synchronize",
 ):
     env = {
+        "EVENT_ACTION": action,
         **({"GH_LOG": str(gh_log)} if gh_log else {}),
         **os.environ,
         "PATH": f"{fake_gh}{os.pathsep}{os.environ['PATH']}",
@@ -619,6 +621,14 @@ def test_round_is_detected_from_live_labels(round_script, fake_gh, labels, expec
     rc, round_, _ = _detect_round(round_script, fake_gh, labels=labels)
     assert rc == 0
     assert round_ == expected
+
+
+@pytest.mark.parametrize("action", ["created", "opened"])
+def test_review_n_is_not_round_memory_outside_a_push(round_script, fake_gh, action):
+    """/aw-improve and a timed-out round-1 dispatch also stamp review-N, so a
+    manual /aw-review on review-N alone stays round 1 (full lens)."""
+    rc, round_, _ = _detect_round(round_script, fake_gh, labels="devteam:review-1", action=action)
+    assert rc == 0 and round_ == "1"
 
 
 def test_a_stray_needs_human_beside_awaiting_fixes_is_deleted(round_script, fake_gh, tmp_path):
@@ -704,7 +714,7 @@ def labels_script(tmp_path_factory) -> Path:
 
 def _run_labels(
     script: Path, fake_gh, tmp_path, *, round_: str, findings_count: int = 0, blocking_count: int = 0,
-    live_labels: str = "", outputs: Path | None = None,
+    live_labels: str = "", outputs: Path | None = None, fix_push: str = "",
 ):
     log = tmp_path / "gh_calls.log"
     env = {
@@ -716,6 +726,7 @@ def _run_labels(
         "GH_TOKEN": "fake",
         "GH_LOG": str(log),
         "FAKE_LABELS": live_labels,
+        "FIX_PUSH": fix_push,
         "GITHUB_OUTPUT": str(outputs) if outputs else "/dev/null",
     }
     proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
@@ -748,6 +759,18 @@ def test_round2_blocking_with_awaiting_fixes_live_keeps_it_and_does_not_escalate
     assert "labelled: devteam:needs-human" not in out
     assert not [c for c in calls if "-X POST" in c or "-X DELETE" in c], calls
     assert "escalated=false" in outputs.read_text()
+
+
+def test_a_fix_push_run_escalates_even_if_the_gate_drop_failed(labels_script, fake_gh, tmp_path):
+    """The label is still live because the drop DELETE failed; the run IS the
+    push, so the coder owes nothing and the blocker must escalate."""
+    outputs = tmp_path / "o"
+    out, _ = _run_labels(
+        labels_script, fake_gh, tmp_path, round_="2", blocking_count=1,
+        live_labels="devteam:awaiting-fixes", outputs=outputs, fix_push="true",
+    )
+    assert "labelled: devteam:needs-human" in out
+    assert "escalated=true" in outputs.read_text()
 
 
 def test_round2_blocking_without_awaiting_fixes_escalates_and_reports_it(
@@ -890,6 +913,7 @@ def test_synchronize_drops_awaiting_fixes_and_still_reviews(synchronize_script, 
     )
     assert _drops_awaiting_fixes(got), got["_calls"]
     assert got["round"] == "2" and got["allowed"] == "true"
+    assert got["fix_push"] == "true"
 
 
 @pytest.mark.parametrize("action", ["opened", "reopened", "ready_for_review", "created"])
