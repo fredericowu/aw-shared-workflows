@@ -578,9 +578,11 @@ def round_script(tmp_path_factory) -> Path:
 
 
 def _detect_round(
-    script: Path, fake_gh, *, labels: str, mode: str = "review", fetch_fails: bool = False
+    script: Path, fake_gh, *, labels: str, mode: str = "review", fetch_fails: bool = False,
+    gh_log: Path | None = None,
 ):
     env = {
+        **({"GH_LOG": str(gh_log)} if gh_log else {}),
         **os.environ,
         "PATH": f"{fake_gh}{os.pathsep}{os.environ['PATH']}",
         "MODE_IN": mode,
@@ -604,7 +606,12 @@ def _detect_round(
         ("bug enhancement", "1"),  # unrelated labels
         ("devteam:awaiting-fixes", "2"),
         ("devteam:needs-human", "needs-human"),
-        ("devteam:awaiting-fixes devteam:needs-human", "needs-human"),  # terminal wins
+        ("devteam:awaiting-fixes devteam:needs-human", "2"),  # awaiting-fixes wins
+        ("devteam:review-1", "2"),  # a live review-N means past round 1
+        ("devteam:review-3 bug", "2"),
+        ("devteam:review-1 devteam:needs-human", "needs-human"),
+        ("devteam:review-capped", "1"),  # not a review-N counter label
+        ("devteam:review-exhausted", "1"),
         ("devteam:awaiting-fixes-but-not-really", "1"),  # exact match only
     ],
 )
@@ -612,6 +619,39 @@ def test_round_is_detected_from_live_labels(round_script, fake_gh, labels, expec
     rc, round_, _ = _detect_round(round_script, fake_gh, labels=labels)
     assert rc == 0
     assert round_ == expected
+
+
+def test_a_stray_needs_human_beside_awaiting_fixes_is_deleted(round_script, fake_gh, tmp_path):
+    log = tmp_path / "gh.log"
+    rc, round_, out = _detect_round(
+        round_script, fake_gh, labels="devteam:awaiting-fixes devteam:needs-human", gh_log=log
+    )
+    assert rc == 0 and round_ == "2"
+    deletes = [c for c in log.read_text().splitlines() if "-X DELETE" in c]
+    assert len(deletes) == 1 and "labels/devteam%3Aneeds-human" in deletes[0], deletes
+    assert "awaiting-fixes wins" in out
+
+
+@pytest.mark.parametrize("labels", ["devteam:awaiting-fixes", "devteam:needs-human", "devteam:review-1", ""])
+def test_no_needs_human_delete_without_the_pair(round_script, fake_gh, tmp_path, labels):
+    log = tmp_path / "gh.log"
+    _detect_round(round_script, fake_gh, labels=labels, gh_log=log)
+    assert not [c for c in log.read_text().splitlines() if "-X DELETE" in c]
+
+
+def test_a_failed_stray_delete_does_not_fail_the_round(round_script, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/bin/bash\n"
+        'if [[ "$*" == *"-X DELETE"* ]]; then exit 1; fi\n'
+        "printf '%s\\n' devteam:awaiting-fixes devteam:needs-human\n"
+    )
+    gh.chmod(0o755)
+    rc, round_, out = _detect_round(round_script, bin_dir, labels="")
+    assert rc == 0 and round_ == "2"
+    assert "::warning::could not remove stray" in out
 
 
 @pytest.mark.parametrize("labels", ["", "devteam:awaiting-fixes"])
@@ -663,7 +703,8 @@ def labels_script(tmp_path_factory) -> Path:
 
 
 def _run_labels(
-    script: Path, fake_gh, tmp_path, *, round_: str, findings_count: int = 0, blocking_count: int = 0
+    script: Path, fake_gh, tmp_path, *, round_: str, findings_count: int = 0, blocking_count: int = 0,
+    live_labels: str = "", outputs: Path | None = None,
 ):
     log = tmp_path / "gh_calls.log"
     env = {
@@ -674,7 +715,8 @@ def _run_labels(
         "BLOCKING_COUNT": str(blocking_count),
         "GH_TOKEN": "fake",
         "GH_LOG": str(log),
-        "FAKE_LABELS": "",
+        "FAKE_LABELS": live_labels,
+        "GITHUB_OUTPUT": str(outputs) if outputs else "/dev/null",
     }
     proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
     assert proc.returncode == 0, f"label step failed:\n{proc.stderr[-2000:]}"
@@ -692,6 +734,51 @@ def test_round2_blocking_adds_needs_human(labels_script, fake_gh, tmp_path):
     out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="2", blocking_count=1)
     assert "labelled: devteam:needs-human" in out
     assert any("-X POST" in c and "/labels" in c for c in calls)
+    assert "un-labelled: devteam:awaiting-fixes" in out  # never write both
+
+
+def test_round2_blocking_with_awaiting_fixes_live_keeps_it_and_does_not_escalate(
+    labels_script, fake_gh, tmp_path
+):
+    outputs = tmp_path / "o"
+    out, calls = _run_labels(
+        labels_script, fake_gh, tmp_path, round_="2", blocking_count=1,
+        live_labels="devteam:awaiting-fixes", outputs=outputs,
+    )
+    assert "labelled: devteam:needs-human" not in out
+    assert not [c for c in calls if "-X POST" in c or "-X DELETE" in c], calls
+    assert "escalated=false" in outputs.read_text()
+
+
+def test_round2_blocking_without_awaiting_fixes_escalates_and_reports_it(
+    labels_script, fake_gh, tmp_path
+):
+    outputs = tmp_path / "o"
+    out, _ = _run_labels(
+        labels_script, fake_gh, tmp_path, round_="2", blocking_count=1,
+        live_labels="devteam:review-1", outputs=outputs,
+    )
+    assert "labelled: devteam:needs-human" in out
+    assert "escalated=true" in outputs.read_text()
+
+
+def test_round2_blocking_escalates_when_the_live_read_fails(labels_script, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text('#!/bin/bash\nif [[ "$*" == *"-X "* ]]; then exit 0; fi\nexit 1\n')
+    gh.chmod(0o755)
+    outputs = tmp_path / "o"
+    out, _ = _run_labels(
+        labels_script, bin_dir, tmp_path, round_="2", blocking_count=1, outputs=outputs
+    )
+    assert "labelled: devteam:needs-human" in out
+    assert "escalated=true" in outputs.read_text()
+
+
+def test_round1_findings_also_clear_a_stray_needs_human(labels_script, fake_gh, tmp_path):
+    out, _ = _run_labels(labels_script, fake_gh, tmp_path, round_="1", findings_count=1)
+    assert "un-labelled: devteam:needs-human" in out
 
 
 def test_a_clean_needs_human_round_removes_its_own_label(labels_script, fake_gh, tmp_path):
@@ -772,6 +859,7 @@ def _decide_allowed(script: Path, fake_gh, tmp_path, *, labels: str, action: str
     out = tmp_path / "gh_output"
     out.write_text("")
     env = {
+        "GH_LOG": str(tmp_path / "gh_calls.log"),
         **os.environ,
         "PATH": f"{fake_gh}{os.pathsep}{os.environ['PATH']}",
         "MODE_IN": mode,
@@ -787,7 +875,56 @@ def _decide_allowed(script: Path, fake_gh, tmp_path, *, labels: str, action: str
         line.split("=", 1) for line in out.read_text().splitlines() if "=" in line
     )
     parsed["_log"] = proc.stdout + proc.stderr
+    log = tmp_path / "gh_calls.log"
+    parsed["_calls"] = log.read_text().splitlines() if log.exists() else []
     return parsed
+
+
+def _drops_awaiting_fixes(got) -> bool:
+    return any("-X DELETE" in c and "labels/devteam%3Aawaiting-fixes" in c for c in got["_calls"])
+
+
+def test_synchronize_drops_awaiting_fixes_and_still_reviews(synchronize_script, fake_gh, tmp_path):
+    got = _decide_allowed(
+        synchronize_script, fake_gh, tmp_path, labels="devteam:awaiting-fixes", action="synchronize"
+    )
+    assert _drops_awaiting_fixes(got), got["_calls"]
+    assert got["round"] == "2" and got["allowed"] == "true"
+
+
+@pytest.mark.parametrize("action", ["opened", "reopened", "ready_for_review", "created"])
+def test_a_non_synchronize_trigger_does_not_drop_awaiting_fixes(
+    synchronize_script, fake_gh, tmp_path, action
+):
+    got = _decide_allowed(
+        synchronize_script, fake_gh, tmp_path, labels="devteam:awaiting-fixes", action=action
+    )
+    assert not _drops_awaiting_fixes(got)
+
+
+@pytest.mark.parametrize("labels", ["", "devteam:review-1", "devteam:needs-human"])
+def test_synchronize_without_awaiting_fixes_deletes_nothing(
+    synchronize_script, fake_gh, tmp_path, labels
+):
+    got = _decide_allowed(synchronize_script, fake_gh, tmp_path, labels=labels, action="synchronize")
+    assert not _drops_awaiting_fixes(got)
+
+
+def test_a_failed_drop_is_a_warning_not_a_failure(synchronize_script, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/bin/bash\n"
+        'if [[ "$*" == *"-X DELETE"* ]]; then exit 1; fi\n'
+        "printf '%s\\n' devteam:awaiting-fixes\n"
+    )
+    gh.chmod(0o755)
+    got = _decide_allowed(
+        synchronize_script, bin_dir, tmp_path, labels="", action="synchronize"
+    )
+    assert got["allowed"] == "true"
+    assert "::warning::could not drop devteam:awaiting-fixes" in got["_log"]
 
 
 @pytest.mark.parametrize(
@@ -798,6 +935,8 @@ def _decide_allowed(script: Path, fake_gh, tmp_path, *, labels: str, action: str
         ("bug", "false"),
         ("devteam:needs-human", "true"),             # escalated: a fix push IS reviewed
         ("devteam:awaiting-fixes devteam:needs-human", "true"),
+        ("devteam:review-1", "true"),                # past round 1 once awaiting-fixes was dropped
+        ("devteam:review-capped", "false"),          # not a counter label
     ],
 )
 def test_synchronize_is_admitted_on_the_fix_cycle_rounds_only(
@@ -2954,7 +3093,7 @@ def test_a_second_empty_reviewer_message_fails_the_dispatch(dispatch_env):
 @pytest.fixture(scope="module")
 def gate_tail_script(tmp_path_factory) -> Path:
     text = WORKFLOW.read_text()
-    start = text.index("          if [ \"${{ github.event.action }}\" = \"synchronize\" ] \\\n             && [ \"$round\" != \"2\"")
+    start = text.index("          # ---- a push means the coder paid its debt")
     end = text.index("      - name: Report review ceiling")
     body = (
         text[start:end]
@@ -3261,3 +3400,40 @@ def test_report_step_runs_only_on_a_cap_and_marks_the_head():
     assert "context=devteam/review-cap" in step and "state=failure" in step
     assert "review_budget_exhausted" in step
     assert '"first_cap=' not in step  # announced via the decide output, not recomputed here
+
+
+@pytest.fixture()
+def ceiling_gh(tmp_path):
+    """cap_gh plus a PR timeline that reports three spent review-N labels."""
+    d = tmp_path / "ceilbin"
+    d.mkdir()
+    gh = d / "gh"
+    gh.write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$*" >> "$GH_LOG"\n'
+        'if [[ "$*" == *"/timeline"* ]]; then printf "1\\n2\\n3\\n"; exit 0; fi\n'
+        "exit 0\n"
+    )
+    gh.chmod(0o755)
+    return d
+
+
+@pytest.mark.parametrize("case", ["ceiling", "untrusted", "reused"])
+def test_the_drop_happens_even_when_the_push_is_then_refused(
+    gate_tail_script, cap_gh, ceiling_gh, tmp_path, case
+):
+    """A refused push must not keep a label saying the coder owes a push."""
+    kw = {}
+    script, gh_dir = gate_tail_script, cap_gh
+    if case == "untrusted":
+        script = tmp_path / "untrusted.sh"
+        script.write_text(
+            "allowlist=x\n" + gate_tail_script.read_text().replace("is_trusted() { return 0; }", "is_trusted() { return 1; }")
+        )
+    elif case == "reused":
+        kw["statuses"] = [_st("success", "x [rk r=2 m=review]")]
+    else:
+        gh_dir = ceiling_gh
+    proc, out, calls = _gate(script, gh_dir, tmp_path, round_="2", labels="devteam:awaiting-fixes", **kw)
+    assert "allowed=false" in out, proc.stdout + proc.stderr + out
+    assert any("-X DELETE" in c and "labels/devteam%3Aawaiting-fixes" in c for c in calls), calls
