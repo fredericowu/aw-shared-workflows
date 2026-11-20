@@ -547,10 +547,16 @@ jobs:
             fi
             gh api -X POST "$label_api" -f "labels[]=$cap_label" --silent \
               || echo "::warning::could not stamp $cap_label; reviewing anyway"
-          elif has_label "$cap_label" && { [ "$round" != "needs-human" ] \
-               || [ "${{ github.event.action }}" != "synchronize" ]; }; then
-            # Re-arm: `/aw-review`, or the PR left needs-human.
-            gh api -X DELETE "$label_api/devteam%3Areview-capped" --silent || true
+          elif [ "$mode" != "improve" ] && has_label "$cap_label" \
+               && { [ "$round" != "needs-human" ] \
+                    || [ "${{ github.event.action }}" != "synchronize" ]; }; then
+            # Re-arm: `/aw-review`, or the PR left needs-human. NEVER on
+            # `/aw-improve`: it is a suggestion re-run, not a review round,
+            # and must not grant the next push a free automatic review.
+            # A failed delete is loud, not silent: the cap then stays on,
+            # which only costs the next push its automatic review.
+            gh api -X DELETE "$label_api/devteam%3Areview-capped" --silent \
+              || echo "::warning::could not clear $cap_label; the next push stays capped until /aw-review"
           fi
 
           if ! is_trusted "$author"; then
