@@ -109,17 +109,25 @@ name: Code Review (reusable)
 # gate never writes both, deletes a stray needs-human it finds beside
 # awaiting-fixes, and DROPS awaiting-fixes on every `synchronize` (the push
 # is the payment). Because awaiting-fixes is therefore no longer the round
-# memory, a live `devteam:review-N` label (stamped on every paid dispatch)
-# also means round 2. With `max_reviews: 0` no review-N is stamped, so a push
-# after the first fix reads as round 1 and needs `/aw-review`.
+# memory, a third label does that job: `devteam:fix-cycle`, written ONLY by
+# the label step when a completed round 1 returned findings, and NEVER removed
+# by this workflow (a human removing it forces the full lens again). It means
+# "a real round-1 verdict with findings exists on this PR" and puts every later
+# trigger (push or `/aw-review`) in round 2. `devteam:review-N` is the
+# per-PR ceiling counter and nothing else: /aw-improve and a timed-out
+# dispatch stamp it too, so it says "a dispatch was paid for", not "round 1
+# returned", and the round derivation does not read it.
 #
 #   (no label)                -> round 1: normal review, all lenses.
 #                                >=1 finding  -> label `devteam:awaiting-fixes`,
 #                                                POST `findings` (wakes the coder
 #                                                that opened the PR).
 #                                0 findings   -> merge.
+#                                (`devteam:fix-cycle` is written first, then
+#                                awaiting-fixes: a failed fix-cycle write
+#                                fails the step before awaiting-fixes exists.)
 #   devteam:awaiting-fixes,
-#   or any devteam:review-N    -> round 2: the lenient "major only" lens. Merge
+#   or devteam:fix-cycle       -> round 2: the lenient "major only" lens. Merge
 #                                eligibility is per-finding `blocks_merge`, NOT
 #                                severity.
 #                                none blocking -> merge.
@@ -158,7 +166,7 @@ name: Code Review (reusable)
 #
 # The fix-cycle rounds — 2 and `needs-human` — are entered AUTOMATICALLY, on
 # `pull_request: synchronize` — i.e. the coder's fix push. A `synchronize` on
-# a PR carrying neither label is round 1 and is refused by the gate after one
+# a PR carrying none of those labels is round 1 and is refused by the gate after one
 # label read, before any paid judge run: a full deep review costs real
 # subscription budget and PR-Agent already reviews every push, so "review
 # every push" was never the ask. `/aw-review` survives untouched as the
@@ -520,18 +528,12 @@ jobs:
             # Terminal until a human removes the label. The review still runs
             # and still posts its findings — it just cannot change state.
             round=needs-human
-          elif [ "${{ github.event.action }}" = "synchronize" ] \
-               && printf '%s\n' "$labels" | grep -Eq '^devteam:review-[0-9]+$'; then
-            # awaiting-fixes is dropped on every push (below), so it can no
-            # longer be the round memory for a PUSH. A live devteam:review-N
-            # label (stamped by the ceiling on every paid dispatch) says a
-            # review already ran on this PR. Push events only: review-N is also
-            # stamped by /aw-improve and by a round-1 dispatch that timed out,
-            # so /aw-review must not read it as "round 1 already returned"
-            # (it stays round 1, the full lens). Residual: a push after such
-            # an improve-only/failed first dispatch is reviewed as round 2.
-            # With max_reviews=0 no review-N is stamped and a push after the
-            # first fix reads as round 1 (needs /aw-review).
+          elif has_label "devteam:fix-cycle"; then
+            # Durable round memory: a completed round 1 returned findings
+            # (written by the label step, never removed by this workflow).
+            # Any trigger, push or /aw-review, is round 2. devteam:review-N
+            # is deliberately NOT read here: /aw-improve and a timed-out
+            # dispatch stamp it without any round-1 verdict existing.
             round=2
           else
             round=1
@@ -591,7 +593,7 @@ jobs:
              && [ "$round" != "2" ] && [ "$round" != "needs-human" ]; then
             echo "synchronize on a round-$round PR — not re-reviewing. \
             Automatic re-review is for the fix-cycle rounds only (labels \
-            devteam:awaiting-fixes, devteam:needs-human); \
+            devteam:awaiting-fixes, devteam:fix-cycle, devteam:needs-human); \
             comment /aw-review to force one."
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -1392,9 +1394,10 @@ jobs:
       # so the machine stops being stuck on the human action specifically.
       # A human can still remove it directly at any time to force round 1's
       # full lens on the next push. `devteam:awaiting-fixes` is dropped by the
-      # gate on every push; the round memory is the `devteam:review-N` label.
-      # Both state labels must already exist on the caller repo — see the
-      # caller checklist at the bottom of this file.
+      # gate on every push; the round memory is `devteam:fix-cycle`, written
+      # here (before awaiting-fixes) when round 1 has findings and never
+      # removed by this workflow. The label POST auto-creates a missing label;
+      # the caller checklist at the bottom of this file lists the colours.
       - name: Set round labels
         id: labels
         # always(): the round state must not be lost because an EARLIER step
@@ -1421,15 +1424,17 @@ jobs:
           }
           remove_label() {
             # 404s if already absent (e.g. a human beat the review to it) --
-            # that is the goal state, not a failure. ':' must be
+            # that is the goal state, not a failure, but the log must say
+            # which of the two happened. ':' must be
             # percent-encoded in the URL path, or GitHub's API 404s on the
             # literal character — done here, not at the call site, so the
             # log line stays the plain label name.
             encoded="${1/:/%3A}"
             gh api -X DELETE \
               "repos/${{ github.repository }}/issues/${{ needs.gate.outputs.pr_number }}/labels/$encoded" \
-              --silent || true
-            echo "un-labelled: $1"
+              --silent \
+              && echo "un-labelled: $1" \
+              || echo "::warning::could not remove $1 (API call failed or label already absent)"
           }
           # devteam:awaiting-fixes and devteam:needs-human are mutually
           # exclusive; writing one removes the other. `escalated` is the
@@ -1437,6 +1442,10 @@ jobs:
           # needs-human was actually written here.
           escalated=false
           if [ "$ROUND" = "1" ] && [ "${FINDINGS_COUNT:-0}" -gt 0 ]; then
+            # fix-cycle first: if this write fails, set -e stops the step before
+            # awaiting-fixes exists, so the PR never says "coder owes a push"
+            # without the round memory behind it.
+            add_label "devteam:fix-cycle"
             add_label "devteam:awaiting-fixes"
             remove_label "devteam:needs-human"
           elif [ "$ROUND" = "2" ] && [ "${BLOCKING_COUNT:-0}" -gt 0 ]; then
@@ -1511,11 +1520,12 @@ jobs:
           if [ "$round" = "1" ] && [ "${FINDINGS_COUNT:-0}" -gt 0 ]; then
             event=findings
           elif [ "$round" = "2" ] && [ "${BLOCKING_COUNT:-0}" -gt 0 ]; then
-            if [ "${ESCALATED:-}" = "false" ]; then
-              echo "label step kept devteam:awaiting-fixes (coder still owes a push) — no escalate event"
+            if [ "${ESCALATED:-}" != "true" ]; then
+              # false: label step kept awaiting-fixes. Empty: label step
+              # failed or was skipped, so needs-human was never confirmed.
+              echo "::warning::needs-human not confirmed written (escalated='${ESCALATED:-}') — no escalate event"
               exit 0
             fi
-            # Label step skipped/failed (empty): behave as before and escalate.
             event=escalate
           elif [ "$round" = "needs-human" ] && [ "${BLOCKING_COUNT:-0}" -gt 0 ]; then
             # Still blocking on an already-escalated PR: this is not new
@@ -2403,9 +2413,9 @@ jobs:
             echo "::warning::could not read PR #$PR_NUMBER's labels — reporting round=unknown \
             rather than guessing. The merge itself is unaffected."
             round=unknown
-          elif printf '%s\n' "$labels" | grep -Eq '^devteam:(awaiting-fixes|review-[0-9]+)$'; then
+          elif printf '%s\n' "$labels" | grep -Eq '^devteam:(awaiting-fixes|fix-cycle)$'; then
             # Same derivation as the gate: awaiting-fixes is dropped on push,
-            # so a live devteam:review-N also means past round 1.
+            # so the durable devteam:fix-cycle also means past round 1.
             round=2
           else
             round=1
@@ -2563,10 +2573,13 @@ jobs:
 #     see the PROVENANCE note above), AW_DEVTEAM_MERGE_TOKEN,
 #     AW_DEVTEAM_EVENT_SECRET
 #   - labels: devteam:awaiting-fixes (#FBCA04), devteam:needs-human (#B60205),
+#     devteam:fix-cycle (#C5DEF5, durable round memory, auto-created on first use)
 #     (mutually exclusive: awaiting-fixes wins and is dropped on every push)
 #     provenance-exempt (#0E8A16) — human-applied only, see `provenance-gate`
 #       gh label create devteam:awaiting-fixes --color FBCA04 --repo <owner/repo> \
 #         --description "Findings on this head; the coder owes a push (dropped on push)"
+#       gh label create devteam:fix-cycle --color C5DEF5 --repo <owner/repo> \
+#         --description "A round-1 review returned findings; later reviews are round 2. Never removed by CI."
 #       gh label create devteam:needs-human --color B60205 --repo <owner/repo> \
 #         --description "Round 2 still blocking; a human must decide"
 #       gh label create provenance-exempt --color 0E8A16 --repo <owner/repo> \
