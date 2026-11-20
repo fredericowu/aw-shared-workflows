@@ -10,27 +10,48 @@ Exit 0 = clean, 1 = at least one non-@master reference, 2 = usage/IO error.
 
 Matches `uses:` lines for `fredericowu/aw-shared-workflows` and
 `tekflox/aw-shared-workflows`. Comment-only lines and trailing `# ...` text
-are ignored. Stdlib only on purpose: it runs on a bare runner or agent box.
+are ignored. : it runs on a bare runner or agent box.
 """
 import re
 import sys
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    print("error: PyYAML is required (pip install pyyaml)", file=sys.stderr)
+    sys.exit(2)
+
 USES = re.compile(
-    r"^\s*(?:-\s*)?uses:\s*['\"]?(?P<owner>fredericowu|tekflox)/aw-shared-workflows/"
-    r"(?P<path>[^@\s'\"]+)@(?P<ref>[^\s'\"#]+)"
+    r"^(?P<owner>fredericowu|tekflox)/aw-shared-workflows/(?P<path>[^@\s]+)@(?P<ref>\S+)$"
 )
 ALLOWED_REF = "master"
 
 
-def scan_text(text: str):
-    """Yield (lineno, owner, path, ref) for every non-@master reference."""
-    for n, line in enumerate(text.splitlines(), 1):
-        if line.lstrip().startswith("#"):
+def _uses_values(doc):
+    """Every `uses:` value under jobs.<id>.uses and jobs.<id>.steps[].uses."""
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    for job in (jobs.values() if isinstance(jobs, dict) else []):
+        if not isinstance(job, dict):
             continue
-        m = USES.match(line)
-        if m and m["ref"] != ALLOWED_REF:
-            yield n, m["owner"], m["path"], m["ref"]
+        yield job.get("uses")
+        for step in job.get("steps") or []:
+            if isinstance(step, dict):
+                yield step.get("uses")
+
+
+def scan_text(text: str):
+    """Yield (owner, path, ref) for every non-@master reference.
+
+    Parses the YAML rather than matching lines, so quoted keys, folded
+    scalars and trailing comments are handled by the parser and `uses:` text
+    inside a `run:` script is not mistaken for a reference.
+    """
+    for value in _uses_values(yaml.safe_load(text)):
+        if isinstance(value, str):
+            m = USES.match(value.strip())
+            if m and m["ref"] != ALLOWED_REF:
+                yield m["owner"], m["path"], m["ref"]
 
 
 def workflow_files(arg: str):
@@ -38,7 +59,7 @@ def workflow_files(arg: str):
     if p.is_file():
         return [p]
     wf = p / ".github" / "workflows" if (p / ".github" / "workflows").is_dir() else p
-    return sorted(f for f in wf.glob("*") if f.suffix in (".yml", ".yaml"))
+    return sorted(f for f in wf.glob("*") if f.suffix in (".yml", ".yaml") and f.is_file())
 
 
 def main(argv) -> int:
@@ -51,9 +72,14 @@ def main(argv) -> int:
             print(f"error: {arg} does not exist", file=sys.stderr)
             return 2
         for f in workflow_files(arg):
-            for n, owner, path, ref in scan_text(f.read_text()):
+            try:
+                hits = list(scan_text(f.read_text()))
+            except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+                print(f"error: {f}: {e}", file=sys.stderr)
+                return 2
+            for owner, path, ref in hits:
                 bad += 1
-                print(f"{f}:{n}: {owner}/aw-shared-workflows/{path}@{ref} "
+                print(f"{f}: {owner}/aw-shared-workflows/{path}@{ref} "
                       f"-- must be @{ALLOWED_REF}")
     if bad:
         print(f"{bad} non-@{ALLOWED_REF} reference(s)", file=sys.stderr)

@@ -32,7 +32,7 @@ repo at `@master`. **This supersedes the "Pin an exact tag" section below**,
 which describes the older tag-pin convention and the immutable-tag ruleset;
 that text is kept for history and for consumers not yet moved.
 
-`scripts/check_master_pin.py` is the check. Stdlib only, no install:
+`scripts/check_master_pin.py` is the check (needs PyYAML):
 
 ```bash
 python3 scripts/check_master_pin.py PATH [PATH ...]   # repo root, workflows dir, or a file
@@ -45,11 +45,19 @@ usage error. Comment lines and trailing `# ...` are ignored. Tests:
 `tests/test_check_master_pin.py`, run by this repo's `test.yml`.
 
 Where it runs: it is deliberately a script, not a required check, because it
-reads *consumer* repos and a CI job here cannot reach them. Use it (a) as a
-step in a consumer's own CI (`python3 <(curl -fsSL
-https://raw.githubusercontent.com/fredericowu/aw-shared-workflows/master/scripts/check_master_pin.py) .`
-or a checkout of this repo), and (b) from the shared-workflow drift-checker
-over its local checkouts. Consumers still on tags will fail until they move;
+reads *consumer* repos and a CI job here cannot reach them. Use it as a step in
+a consumer's own CI (download first, so a failed download fails the step):
+
+```bash
+curl -fsSL -o "$RUNNER_TEMP/check_master_pin.py" \
+  https://raw.githubusercontent.com/fredericowu/aw-shared-workflows/master/scripts/check_master_pin.py
+python3 "$RUNNER_TEMP/check_master_pin.py" .
+```
+
+or by hand over local checkouts. **Not yet wired into the drift-checker**: its
+discovery (in `aw-app-maintenance-agents`) still matches only `v*` tags, so a
+consumer moved to `@main` would not show up there; invoking this script from it
+is a follow-up. Consumers still on tags will fail the lint until they move;
 nothing here edits them.
 
 ## Pin an exact tag. Never a moving ref. (superseded, see `@master` pin lint)
