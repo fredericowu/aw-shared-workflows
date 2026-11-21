@@ -3318,6 +3318,41 @@ def test_reuse_never_applies_when_any_key_part_differs_or_lookup_is_unsafe(
     assert "allowed=true" in out, case
 
 
+@pytest.mark.parametrize("case", [
+    "r2_then_needs_human", "needs_human_then_r2", "blocking_then_improve",
+    "blocking_then_error", "blocking_then_pending", "eligible", "other_sha", "round1_exact",
+])
+def test_lenient_lens_is_one_reuse_class(gate_tail_script, cap_gh, tmp_path, case):
+    """Round 2 and needs-human share a lens: a completed non-eligible verdict
+    from either blocks any further lenient-lens review of the same sha."""
+    blocked = "x [rk r=2 m=review]"
+    cur = "needs-human"
+    sts, expect = [_st("success", blocked)], "false"
+    if case == "needs_human_then_r2":
+        sts, cur = [_st("success", "x [rk r=needs-human m=review]")], "2"
+    elif case == "blocking_then_improve":
+        sts = [_st("success", "y [rk r=1 m=improve]"), _st("success", blocked)]
+    elif case == "blocking_then_error":
+        sts = [_st("error", "code review cancelled"), _st("failure", "failed"), _st("success", blocked)]
+    elif case == "blocking_then_pending":
+        sts = [_st("pending", "in progress"), _st("success", blocked)]
+    elif case == "eligible":
+        sts, expect = [_st("success", "cleared", "devteam/merge-eligible"), _st("success", blocked)], "true"
+    elif case == "other_sha":
+        sts, expect = [], "true"  # statuses are per-sha: a new head has none
+    elif case == "round1_exact":
+        sts, cur, expect = [_st("success", "x [rk r=1 m=review]")], "2", "true"
+    _, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_=cur, action="created",
+                      labels="devteam:needs-human", statuses=sts)
+    assert f"allowed={expect}" in out, (case, out)
+
+
+def test_reuse_log_names_the_reused_round(gate_tail_script, cap_gh, tmp_path):
+    proc, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="needs-human", action="created",
+                         labels="devteam:needs-human", statuses=[_st("success", "x [rk r=2 m=review]")])
+    assert "allowed=false" in out and "round=2" in proc.stdout, proc.stdout
+
+
 def test_aw_improve_never_rearms_the_cap(gate_tail_script, cap_gh, tmp_path):
     """/aw-improve is not a review round: it must not clear the cap stamp."""
     _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="informational",
