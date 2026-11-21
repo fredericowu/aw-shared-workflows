@@ -284,7 +284,8 @@ on:
         description: >-
           Per-PR ceiling on paid review dispatches (v1.13.0). Identity-free:
           counted from the PR timeline's `labeled` events by
-          `github-actions[bot]` for `devteam:review-N` labels, so removing a
+          `github-actions[bot]` for `review-count:N` labels (and the legacy
+          `devteam:review-N`, still counted), so removing a
           label, force-pushing or re-commenting never resets it. Past the
           ceiling the gate refuses EVERY trigger, `/aw-review` included, and
           says so on the PR (`devteam/review-cap` status, one comment, one
@@ -673,7 +674,9 @@ jobs:
           # reset: PR #15 on tekflox/aw-app-git got 7 paid reviews in 18
           # minutes that way. This is the identity-free hard stop. Every
           # dispatch that reaches this point spends one unit of a per-PR
-          # budget (`max_reviews`, default 3), recorded as a `devteam:review-N`
+          # budget (`max_reviews`, default 3), recorded as a visible `review-count:N`
+          # label (legacy `devteam:review-N` stamps still count, so a PR that
+          # was part-way through its budget before the rename keeps its count)
           # label this job adds. The COUNT is read from the PR timeline's
           # `labeled` events authored by github-actions[bot] — an event log
           # nobody can edit — so removing the labels or force-pushing resets
@@ -694,7 +697,7 @@ jobs:
             used=""
             for attempt in 1 2 3; do
               if used="$(gh api --paginate "repos/${{ github.repository }}/issues/$pr_number/timeline?per_page=100" \
-                           --jq '.[] | select(.event=="labeled" and .actor.login=="github-actions[bot]" and ((.label.name // "") | test("^devteam:review-[0-9]+$"))) | .id' \
+                           --jq '.[] | select(.event=="labeled" and .actor.login=="github-actions[bot]" and ((.label.name // "") | test("^(devteam:review-|review-count:)[0-9]+$"))) | .id' \
                            | wc -l | tr -d ' ')"; then
                 break
               fi
@@ -724,11 +727,11 @@ jobs:
               # request is sent: nothing is spent, so nothing is charged.
               echo "::warning::AW_CODEREVIEW_V1_KEY is not set; not charging the review ceiling for a dispatch that cannot start"
             else
-              next_label="devteam:review-$(( used + 1 ))"
+              next_label="review-count:$(( used + 1 ))"
               # DELETE first: re-adding a label that is already present emits
               # NO `labeled` event, which would leave the count short (a
               # pre-seeded label must not be able to dodge the ceiling).
-              gh api -X DELETE "$label_api/devteam%3Areview-$(( used + 1 ))" --silent 2>/dev/null || true
+              gh api -X DELETE "$label_api/review-count%3A$(( used + 1 ))" --silent 2>/dev/null || true
               gh api -X POST "$label_api" -f "labels[]=$next_label" --silent \
                 || echo "::warning::could not stamp $next_label; reviewing anyway"
               echo "review $(( used + 1 )) of $max_reviews on PR #$pr_number"

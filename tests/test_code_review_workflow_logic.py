@@ -3351,7 +3351,7 @@ def ceil_gh(tmp_path_factory) -> Path:
         'if [[ "$*" == *"/statuses"* ]]; then echo "[]"; exit 0; fi\n'
         'if [[ "$*" == *"-X POST"* ]]; then\n'
         '  if [ "${LABEL_POST_FAIL:-0}" = "1" ]; then exit 1; fi\n'
-        '  if [[ "$*" == *"labels[]=devteam:review-"* && "$*" != *"review-capped"* && "$*" != *"review-exhausted"* ]]; then echo ev >> "$TIMELINE_FILE"; fi\n'
+        '  if [[ ( "$*" == *"labels[]=devteam:review-"* || "$*" == *"labels[]=review-count:"* ) && "$*" != *"review-capped"* && "$*" != *"review-exhausted"* ]]; then echo ev >> "$TIMELINE_FILE"; fi\n'
         "fi\n"
         "exit 0\n"
     )
@@ -3384,10 +3384,10 @@ def _ceil(script, ceil_gh, tmp_path, *, used=0, max_reviews="3", labels="", acti
 def test_under_the_ceiling_dispatches_and_stamps_the_next_label(gate_tail_script, ceil_gh, tmp_path):
     proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=2)
     assert out.get("allowed") == "true" and "capped" not in out, proc.stdout + proc.stderr
-    stamp = [i for i, c in enumerate(calls) if "labels[]=devteam:review-3" in c]
+    stamp = [i for i, c in enumerate(calls) if "labels[]=review-count:3" in c]
     assert len(stamp) == 1, calls
     # DELETE-then-POST so a pre-seeded label cannot swallow the `labeled` event
-    assert any("-X DELETE" in c and "devteam%3Areview-3" in c for c in calls[: stamp[0]]), calls
+    assert any("-X DELETE" in c and "review-count%3A3" in c for c in calls[: stamp[0]]), calls
 
 
 def test_at_the_ceiling_every_trigger_is_refused_visibly(gate_tail_script, ceil_gh, tmp_path):
@@ -3396,7 +3396,7 @@ def test_at_the_ceiling_every_trigger_is_refused_visibly(gate_tail_script, ceil_
     assert out["first_cap"] == "true" and out["review_count"] == "3" and out["max_reviews"] == "3"
     # the marker is stamped by the report step AFTER delivery, never by the gate
     assert not any("labels[]=devteam:review-exhausted" in c for c in calls)
-    assert not any("labels[]=devteam:review-4" in c for c in calls)
+    assert not any("labels[]=review-count:4" in c for c in calls)
 
 
 def test_second_refusal_does_not_re_announce(gate_tail_script, ceil_gh, tmp_path):
@@ -3410,7 +3410,7 @@ def test_a_missing_dispatch_key_does_not_charge_the_budget(gate_tail_script, cei
     monkeypatch.setenv("HAS_KEY", "false")
     proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=2)
     assert out["allowed"] == "true" and "capped" not in out
-    assert not any("labels[]=devteam:review-3" in c for c in calls)
+    assert not any("labels[]=review-count:3" in c for c in calls)
     assert "not charging" in proc.stdout + proc.stderr
 
 
@@ -3456,7 +3456,7 @@ def test_a_hand_added_label_cannot_dodge_the_count(gate_tail_script, ceil_gh, tm
     seeded = "\n".join(f"devteam:review-{n}" for n in range(1, 4))
     _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0, labels=seeded)
     assert out["allowed"] == "true"
-    assert any("-X DELETE" in c and "devteam%3Areview-1" in c for c in calls)
+    assert any("-X DELETE" in c and "review-count%3A1" in c for c in calls)
     assert (tmp_path / "timeline").read_text().count("ev") == 1
 
 
@@ -3846,3 +3846,20 @@ def test_the_reference_label_caller_matches_the_design():
     assert "devteam-nudge-reusable.yml@master" in code
     assert "actions/checkout" not in code
     assert "github.event.label.name == 'devteam:awaiting-fixes'" in code
+
+
+def test_legacy_review_n_events_carry_forward_without_double_charge(gate_tail_script, ceil_gh, tmp_path):
+    """Two reviews were stamped as `devteam:review-N` before the rename: the
+    timeline has 2 events. The next dispatch is the 3rd (`review-count:3`),
+    and the one after that is refused: neither lost nor charged twice."""
+    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=2)
+    assert out.get("allowed") == "true", proc.stdout + proc.stderr
+    assert any("labels[]=review-count:3" in c for c in calls)
+    assert not any("labels[]=devteam:review-" in c and "capped" not in c and "exhausted" not in c for c in calls)
+    proc, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=2)  # timeline now has 3
+    assert out.get("allowed") == "false" and out.get("capped") == "true", proc.stdout + proc.stderr
+
+
+def test_ceiling_jq_counts_both_label_families():
+    src = (Path(__file__).resolve().parent.parent / ".github/workflows/code-review-reusable.yml").read_text()
+    assert 'test("^(devteam:review-|review-count:)[0-9]+$")' in src
