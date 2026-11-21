@@ -4016,18 +4016,27 @@ _EXH = ("aw-run:" + "r" * 32, "devteam:review-exhausted")
 
 def test_nudge_stamps_escalated_when_the_question_was_asked(nudge_script, nudge_bin, tmp_path):
     _, state, _ = _run_nudge(nudge_script, nudge_bin, tmp_path, labels=_EXH,
-                             response='{"verdict": "asked", "reason": "review ceiling exhausted"}')
+                             response='{"verdict": "asked", "acted": true, "reason": "review ceiling exhausted"}')
     assert _stamped(state)
 
 
-@pytest.mark.parametrize("verdict", ["ask_failed", "ask_deferred", "ask_unroutable", "woken"])
-def test_nudge_does_not_stamp_escalated_when_nothing_was_asked(nudge_script, nudge_bin, tmp_path, verdict):
+@pytest.mark.parametrize("resp", [
+    {"verdict": "ask_failed", "acted": False},
+    {"verdict": "ask_deferred", "acted": False},
+    {"verdict": "ask_unroutable", "acted": False},
+    {"verdict": "woken", "acted": True},
+    # AP-MT: simulated ASK (dry run) and an already-asked replay are verdict=asked, acted=false
+    {"verdict": "asked", "acted": False, "result": {"dry_run": True}},
+    {"verdict": "asked", "acted": False, "result": {"already_asked": True}},
+    {"verdict": "asked"},
+])
+def test_nudge_does_not_stamp_escalated_when_nothing_was_asked(nudge_script, nudge_bin, tmp_path, resp):
     _, state, _ = _run_nudge(nudge_script, nudge_bin, tmp_path, labels=_EXH,
-                             response=json.dumps({"verdict": verdict}))
+                             response=json.dumps(resp))
     assert not _stamped(state)
 
 
 def test_nudge_does_not_stamp_escalated_without_the_exhausted_label(nudge_script, nudge_bin, tmp_path):
     _, state, _ = _run_nudge(nudge_script, nudge_bin, tmp_path,
-                             response='{"verdict": "asked"}')
+                             response='{"verdict": "asked", "acted": true}')
     assert not _stamped(state)
