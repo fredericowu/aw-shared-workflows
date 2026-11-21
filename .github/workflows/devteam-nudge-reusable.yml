@@ -263,6 +263,16 @@ jobs:
                   line += f" - {reason}"
               summary(line)
 
+              # The review-ceiling escalation is delivered by this ASK, not by
+              # the report step's store-only webhook. Mark it delivered only
+              # when the platform confirms the question was asked; any other
+              # verdict leaves the marker off so the next refused run retries.
+              if verdict == "asked" and "devteam:review-exhausted" in labels:
+                  r = gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/labels",
+                         "-f", "labels[]=devteam:review-escalated", "--silent")
+                  if r.returncode != 0:
+                      warn(f"could not stamp devteam:review-escalated: {r.stderr[:200]}")
+
               if kind in ("label", "comment") and verdict != "woken":
                   r = gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/comments",
                          "-f", f"body={line}", "--silent")
