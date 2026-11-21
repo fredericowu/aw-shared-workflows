@@ -151,7 +151,12 @@ name: Code Review (reusable)
 #                                comments `/aw-review` (v1.11.0). An
 #                                unchanged (sha, round, mode) with a
 #                                finished, non-eligible verdict is not
-#                                re-dispatched either.
+#                                re-dispatched either. Round 2 and
+#                                needs-human are ONE lens class for that
+#                                check: a sha with a completed non-eligible
+#                                lenient-lens verdict from either gets no
+#                                further lenient-lens review (a new verdict
+#                                needs a new head or the labels removed).
 #                                A human can still remove the label directly
 #                                to force round 1's full lens on the next
 #                                push/`/aw-review`, instead of waiting for a
@@ -662,11 +667,38 @@ jobs:
           # `devteam/merge-eligible` success (a retry there must reach the
           # merge job), and any lookup failure — all fall through to a fresh
           # review, so this can only ever save a run, never clear a PR.
+          #
+          # Invariant: once a sha holds a COMPLETED, non-merge-eligible
+          # review-mode verdict from the lenient lens (round 2 or round
+          # needs-human), no further lenient-lens review is dispatched on
+          # that same sha. Round 2 and round needs-human are ONE lens class
+          # for this key: a round-2 block writes `devteam:needs-human`, so a
+          # later `/aw-review` on the unchanged head derives round
+          # needs-human, and without this it would buy a second verdict with
+          # the identical `blocks_merge` lens that could clear the hold. The
+          # match is on the most recent COMPLETED review-mode stamp, not only
+          # the newest status, so an intervening `/aw-improve`, a cancelled
+          # or errored run cannot reopen it. A new verdict needs a new head,
+          # or a human removing the labels (round 1, full lens). Round 1
+          # keys stay exact: r=1 then `/aw-review` as round 2 is intended.
           if statuses="$(gh api "repos/${{ github.repository }}/commits/$sha/statuses?per_page=100" 2>/dev/null)"; then
             latest="$(printf '%s' "$statuses" | jq -r \
               '[.[] | select(.context=="devteam/code-review")][0] | "\(.state)|\(.description)"' 2>/dev/null || true)"
             eligible_seen="$(printf '%s' "$statuses" | jq -r \
               '[.[] | select(.context=="devteam/merge-eligible" and .state=="success")] | length' 2>/dev/null || echo 1)"
+            last_review_round=""
+            if [ "$mode" = "review" ] && { [ "$round" = "2" ] || [ "$round" = "needs-human" ]; }; then
+              last_review_round="$(printf '%s' "$statuses" | jq -r \
+                '[.[] | select(.context=="devteam/code-review" and .state=="success")
+                  | (.description // "") | capture("\\[rk r=(?<r>[^ \\]]+) m=(?<m>[^ \\]]+)\\]")?
+                  | select(.m=="review")][0].r // empty' 2>/dev/null || true)"
+            fi
+            if [ "$eligible_seen" = "0" ] \
+               && { [ "$last_review_round" = "2" ] || [ "$last_review_round" = "needs-human" ]; }; then
+              echo "verdict reused: sha $sha already has a completed lenient-lens review (stamped round=$last_review_round); current round=$round mode=$mode — not dispatching again."
+              echo "allowed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             if [ "$eligible_seen" = "0" ] && [ "${latest%%|*}" = "success" ] \
                && printf '%s' "$latest" | grep -Fq "[rk r=$round m=$mode]"; then
               echo "verdict reused: sha $sha already has a completed review for round=$round mode=$mode — not dispatching again."
