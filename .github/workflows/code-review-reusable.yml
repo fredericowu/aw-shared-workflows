@@ -754,7 +754,7 @@ jobs:
               first=true
               if has_label "devteam:review-exhausted"; then first=false; fi
               # Escalation delivery is tracked apart from the announcement:
-              # `review-escalated` is stamped only after the webhook answered 2xx.
+              # `review-escalated` is stamped by the nudge job once the human question was asked.
               escalated=false
               if has_label "devteam:review-escalated"; then escalated=true; fi
               {
@@ -872,16 +872,13 @@ jobs:
           code = run.stdout.strip()
           body = open(response_path).read()[:500] if os.path.exists(response_path) else run.stderr.strip()
           print(f"escalate(review_budget_exhausted) -> HTTP {code or 'none'}: {body}")
-          # A 2xx with a non-zero curl exit is an incomplete transfer (e.g. 18):
-          # the response was not fully received, so it is not a delivery.
+          # This delivery only STORES the event (AP-MT answers 200 stored:true,
+          # acted:false); the human escalation is the platform nudge's ASK. So
+          # `devteam:review-escalated` is NOT stamped here: the `nudge` job
+          # stamps it once the platform confirms the question was asked. A
+          # 2xx with a non-zero curl exit is an incomplete transfer (e.g. 18).
           if run.returncode != 0 or not code.startswith("2"):
-              print(f"::warning::devteam-review-event escalate not delivered (HTTP {code or 'none'}, curl exit {run.returncode}); will retry on the next refused run")
-          else:
-              stamp = subprocess.run(["gh", "api", "-X", "POST",
-                  f"repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/labels",
-                  "-f", "labels[]=devteam:review-escalated", "--silent"])
-              if stamp.returncode != 0:
-                  print("::warning::could not stamp devteam:review-escalated; the escalation may repeat")
+              print(f"::warning::devteam-review-event escalate not stored (HTTP {code or 'none'}, curl exit {run.returncode}); will retry on the next refused run")
           PYEOF
 
   code-review:

@@ -3975,16 +3975,20 @@ def _report(script, tmp_path, *, first="true", escalated="false", http="200", se
     return proc, calls
 
 
-def test_a_failed_webhook_is_not_marked_delivered_and_is_retried_next_run(report_script, tmp_path):
-    proc, calls = _report(report_script, tmp_path, http="503")
-    assert "HTTP 503" in proc.stdout
-    assert any("labels[]=devteam:review-exhausted" in c for c in calls)  # comment/status done
+def test_the_report_step_never_stamps_escalated_the_webhook_only_stores(report_script, tmp_path):
+    # AP-MT answers 200 stored:true acted:false: not a human delivery.
+    proc, calls = _report(report_script, tmp_path, http="200")
+    assert "curl" in calls
     assert not any("review-escalated" in c for c in calls), calls
-    # next head: announcement marker present, escalation not -> webhook retried
+
+
+def test_a_failed_webhook_is_retried_next_run(report_script, tmp_path):
+    proc, calls = _report(report_script, tmp_path, http="503")
+    assert "HTTP 503" in proc.stdout and "will retry" in proc.stdout
+    assert any("labels[]=devteam:review-exhausted" in c for c in calls)  # comment/status done
     (tmp_path / "n").mkdir()
     proc, calls = _report(report_script, tmp_path / "n", first="false", escalated="false", http="200")
     assert "curl" in calls and not any("/comments" in c for c in calls), calls
-    assert any("labels[]=devteam:review-escalated" in c for c in calls), calls
 
 
 def test_a_delivered_escalation_is_never_resent(report_script, tmp_path):
@@ -3998,3 +4002,32 @@ def test_a_2xx_with_an_incomplete_transfer_is_not_marked_delivered(report_script
     assert "curl" in calls
     assert not any("review-escalated" in c for c in calls), calls
     assert "will retry" in proc.stdout
+
+
+# ── the nudge stamps `review-escalated` only after the human was asked ──────
+
+def _stamped(state) -> bool:
+    log = state / "gh.log"
+    return log.exists() and "labels[]=devteam:review-escalated" in log.read_text()
+
+
+_EXH = ("aw-run:" + "r" * 32, "devteam:review-exhausted")
+
+
+def test_nudge_stamps_escalated_when_the_question_was_asked(nudge_script, nudge_bin, tmp_path):
+    _, state, _ = _run_nudge(nudge_script, nudge_bin, tmp_path, labels=_EXH,
+                             response='{"verdict": "asked", "reason": "review ceiling exhausted"}')
+    assert _stamped(state)
+
+
+@pytest.mark.parametrize("verdict", ["ask_failed", "ask_deferred", "ask_unroutable", "woken"])
+def test_nudge_does_not_stamp_escalated_when_nothing_was_asked(nudge_script, nudge_bin, tmp_path, verdict):
+    _, state, _ = _run_nudge(nudge_script, nudge_bin, tmp_path, labels=_EXH,
+                             response=json.dumps({"verdict": verdict}))
+    assert not _stamped(state)
+
+
+def test_nudge_does_not_stamp_escalated_without_the_exhausted_label(nudge_script, nudge_bin, tmp_path):
+    _, state, _ = _run_nudge(nudge_script, nudge_bin, tmp_path,
+                             response='{"verdict": "asked"}')
+    assert not _stamped(state)
