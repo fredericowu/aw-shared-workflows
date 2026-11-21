@@ -265,9 +265,12 @@ jobs:
 
               # The review-ceiling escalation is delivered by this ASK, not by
               # the report step's store-only webhook. Mark it delivered only
-              # when the platform confirms the question was asked; any other
-              # verdict leaves the marker off so the next refused run retries.
-              if verdict == "asked" and "devteam:review-exhausted" in labels:
+              # when the platform confirms a question was really asked now:
+              # `acted` is true for a delivered ASK and false for a dry run,
+              # an already-asked replay or any failed/deferred ask. Anything
+              # else leaves the marker off so the next refused run retries.
+              if (verdict == "asked" and out.get("acted") is True
+                      and "devteam:review-exhausted" in labels):
                   r = gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/labels",
                          "-f", "labels[]=devteam:review-escalated", "--silent")
                   if r.returncode != 0:
