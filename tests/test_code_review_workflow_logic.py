@@ -3840,7 +3840,9 @@ def test_the_reference_label_caller_matches_the_design():
     caller = (WORKFLOW.parent / "devteam-nudge.yml").read_text()
     code = _code_only(caller)
     assert "pull_request_target:" in code and "types: [labeled]" in code
-    assert "group: devteam-nudge-${{ github.event.pull_request.number }}" in code
+    # label name in the key: an unrelated label must not evict a pending nudge
+    assert ("group: devteam-nudge-${{ github.event.pull_request.number }}"
+            "-${{ github.event.label.name }}") in code
     assert "cancel-in-progress: false" in code
     assert "trigger_kind: label" in code
     assert "devteam-nudge-reusable.yml@master" in code
