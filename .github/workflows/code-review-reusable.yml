@@ -872,8 +872,10 @@ jobs:
           code = run.stdout.strip()
           body = open(response_path).read()[:500] if os.path.exists(response_path) else run.stderr.strip()
           print(f"escalate(review_budget_exhausted) -> HTTP {code or 'none'}: {body}")
-          if not code.startswith("2"):
-              print(f"::warning::devteam-review-event escalate returned HTTP {code or 'none'}; will retry on the next refused run")
+          # A 2xx with a non-zero curl exit is an incomplete transfer (e.g. 18):
+          # the response was not fully received, so it is not a delivery.
+          if run.returncode != 0 or not code.startswith("2"):
+              print(f"::warning::devteam-review-event escalate not delivered (HTTP {code or 'none'}, curl exit {run.returncode}); will retry on the next refused run")
           else:
               stamp = subprocess.run(["gh", "api", "-X", "POST",
                   f"repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/labels",
