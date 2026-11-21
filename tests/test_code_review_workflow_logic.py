@@ -3952,14 +3952,14 @@ def report_script(tmp_path_factory) -> Path:
     return path
 
 
-def _report(script, tmp_path, *, first="true", escalated="false", http="200", secret="s"):
+def _report(script, tmp_path, *, first="true", escalated="false", http="200", secret="s", rc=0):
     d = tmp_path / "bin"
     d.mkdir()
     (d / "gh").write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$GH_LOG"\nexit 0\n')
     (d / "curl").write_text(
         '#!/bin/bash\nprintf "curl\\n" >> "$GH_LOG"\n'
         'while [ $# -gt 0 ]; do [ "$1" = "-o" ] && { shift; echo "{}" > "$1"; }; shift; done\n'
-        f'printf "{http}"\n'
+        f'printf "{http}"\nexit {rc}\n'
     )
     for f in ("gh", "curl"):
         (d / f).chmod(0o755)
@@ -3991,3 +3991,10 @@ def test_a_delivered_escalation_is_never_resent(report_script, tmp_path):
     proc, calls = _report(report_script, tmp_path, first="false", escalated="true")
     assert "curl" not in calls and not any("/comments" in c for c in calls), calls
     assert "already delivered" in proc.stdout
+
+
+def test_a_2xx_with_an_incomplete_transfer_is_not_marked_delivered(report_script, tmp_path):
+    proc, calls = _report(report_script, tmp_path, http="200", rc=18)
+    assert "curl" in calls
+    assert not any("review-escalated" in c for c in calls), calls
+    assert "will retry" in proc.stdout
