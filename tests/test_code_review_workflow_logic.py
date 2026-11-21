@@ -3865,3 +3865,94 @@ def test_legacy_review_n_events_carry_forward_without_double_charge(gate_tail_sc
 def test_ceiling_jq_counts_both_label_families():
     src = (Path(__file__).resolve().parent.parent / ".github/workflows/code-review-reusable.yml").read_text()
     assert 'test("^(devteam:review-|review-count:)[0-9]+$")' in src
+
+# --------------------------------------------------------------------------
+# QA rework (card 41e5bf3b): the legacy cap's refusal must not bypass the
+# ceiling report, and escalation delivery is tracked apart from the comment.
+# --------------------------------------------------------------------------
+
+_LEGACY = "devteam:needs-human\ndevteam:review-capped"
+
+
+def test_legacy_cap_refusal_on_an_exhausted_budget_is_surfaced(gate_tail_script, ceil_gh, tmp_path):
+    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=3, labels=_LEGACY,
+                             action="synchronize")
+    assert out["allowed"] == "false" and out["capped"] == "true", proc.stdout + proc.stderr
+    assert out["first_cap"] == "true" and out["review_count"] == "3"
+    assert not any("labels[]=review-count:4" in c for c in calls)
+
+
+def test_legacy_cap_refusal_with_budget_left_stays_free_and_uncharged(gate_tail_script, ceil_gh, tmp_path):
+    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=1, labels=_LEGACY,
+                             action="synchronize")
+    assert out["allowed"] == "false" and "capped" not in out, proc.stdout + proc.stderr
+    assert not any("labels[]=review-count:" in c for c in calls), calls
+
+
+@pytest.mark.parametrize("kw", [{"timeline_fail": True}, {"max_reviews": "0"}])
+def test_legacy_cap_refusal_holds_when_the_ceiling_cannot_decide(gate_tail_script, ceil_gh, tmp_path, kw):
+    _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0, labels=_LEGACY,
+                          action="synchronize", **kw)
+    assert out["allowed"] == "false", kw
+    assert not any("labels[]=review-count:" in c for c in calls), calls
+
+
+def test_gate_reports_whether_the_escalation_was_already_delivered(gate_tail_script, ceil_gh, tmp_path):
+    _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=3)
+    assert out["escalated"] == "false"
+    (tmp_path / "second").mkdir()
+    _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path / "second", used=3,
+                      labels="devteam:review-exhausted\ndevteam:review-escalated")
+    assert out["escalated"] == "true"
+
+
+@pytest.fixture(scope="module")
+def report_script(tmp_path_factory) -> Path:
+    text = WORKFLOW.read_text()
+    i = text.index("      - name: Report review ceiling")
+    seg = text[i:text.index("  code-review:\n    needs: gate")]
+    body = seg[seg.index("        run: |\n") + len("        run: |\n"):]
+    path = tmp_path_factory.mktemp("rep") / "report.sh"
+    path.write_text(textwrap.dedent(body))
+    return path
+
+
+def _report(script, tmp_path, *, first="true", escalated="false", http="200", secret="s"):
+    d = tmp_path / "bin"
+    d.mkdir()
+    (d / "gh").write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$GH_LOG"\nexit 0\n')
+    (d / "curl").write_text(
+        '#!/bin/bash\nprintf "curl\\n" >> "$GH_LOG"\n'
+        'while [ $# -gt 0 ]; do [ "$1" = "-o" ] && { shift; echo "{}" > "$1"; }; shift; done\n'
+        f'printf "{http}"\n'
+    )
+    for f in ("gh", "curl"):
+        (d / f).chmod(0o755)
+    env = {
+        **os.environ, "PATH": f"{d}{os.pathsep}{os.environ['PATH']}",
+        "GH_LOG": str(tmp_path / "calls.log"), "RUNNER_TEMP": str(tmp_path),
+        "AW_DEVTEAM_EVENT_SECRET": secret, "EVENT_URL": "http://ev.invalid", "REPO": "o/r",
+        "PR_NUMBER": "7", "HEAD_SHA": "abcdef1234", "ROUND": "needs-human", "USED": "3",
+        "MAX": "3", "FIRST": first, "ESCALATED": escalated, "PR_URL": "u", "RUN_URL": "r",
+    }
+    proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    calls = (tmp_path / "calls.log").read_text().splitlines()
+    return proc, calls
+
+
+def test_a_failed_webhook_is_not_marked_delivered_and_is_retried_next_run(report_script, tmp_path):
+    proc, calls = _report(report_script, tmp_path, http="503")
+    assert "HTTP 503" in proc.stdout
+    assert any("labels[]=devteam:review-exhausted" in c for c in calls)  # comment/status done
+    assert not any("review-escalated" in c for c in calls), calls
+    # next head: announcement marker present, escalation not -> webhook retried
+    (tmp_path / "n").mkdir()
+    proc, calls = _report(report_script, tmp_path / "n", first="false", escalated="false", http="200")
+    assert "curl" in calls and not any("/comments" in c for c in calls), calls
+    assert any("labels[]=devteam:review-escalated" in c for c in calls), calls
+
+
+def test_a_delivered_escalation_is_never_resent(report_script, tmp_path):
+    proc, calls = _report(report_script, tmp_path, first="false", escalated="true")
+    assert "curl" not in calls and not any("/comments" in c for c in calls), calls
+    assert "already delivered" in proc.stdout
