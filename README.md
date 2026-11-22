@@ -592,3 +592,21 @@ jobs came across, and every design comment came with them. One thing was
 *added* rather than ported: the fail-loud empty-secret guard, which the
 original did not need because it read a repo secret directly instead of a
 `workflow_call` one.
+
+## `lifecycle: v2` (PR lifecycle v2)
+
+Opt-in per caller via `with: lifecycle: v2` on `code-review-reusable.yml`
+(default `v1` = the two-round loop, unchanged; `block_severity` default
+`medium`). Review 1 is the only review that can block: a finding at or above
+`block_severity` (or with a missing/unknown severity) turns the `code-review`
+job red as its last step and withholds `devteam/merge-eligible`. Any
+`pull_request` event after a completed review 1 (memory = a
+`github-actions[bot]`-written `devteam:reviewed` or legacy `devteam:fix-cycle`
+label, read from the PR timeline; an unreadable timeline fails closed) writes
+`devteam/code-review` + `devteam/merge-eligible` success with one shared
+attempt URL and merges once CI is green, with no new deep review. Drafts get no
+clearance; forks and untrusted authors never reach it. A manual `/aw-review`
+after review 1 is advisory only. The nudge job is skipped under v2, and the
+review event is sent with `nudge_follows: false` so AP-MT wakes the coder
+directly. The merge is reported by the org webhook; the merged-event job stays
+until slice C and the platform dedupes both on one ledger key.

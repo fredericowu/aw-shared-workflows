@@ -4040,3 +4040,227 @@ def test_nudge_does_not_stamp_escalated_without_the_exhausted_label(nudge_script
     _, state, _ = _run_nudge(nudge_script, nudge_bin, tmp_path,
                              response='{"verdict": "asked", "acted": true}')
     assert not _stamped(state)
+
+
+# --------------------------------------------------------------------------
+# lifecycle v2 (Kanban 41f5bf3b): one blocking review, later pushes merge
+# --------------------------------------------------------------------------
+
+V2_ENV = {"LIFECYCLE": "v2", "BLOCK_SEVERITY": "medium"}
+
+
+def _run_eligibility_v2(script, tmp_path, fake_gh, findings, monkeypatch, round_="1", is_draft="false"):
+    counts: dict = {}
+    for f in findings:
+        sev = str(f.get("severity", "info")).lower()
+        counts[sev] = counts.get(sev, 0) + 1
+    for k, v in V2_ENV.items():
+        monkeypatch.setenv(k, v)
+    return _run_eligibility(script, tmp_path, fake_gh, findings=findings, counts=counts,
+                            round_=round_, is_draft=is_draft)
+
+
+def test_v2_review1_blocks_on_medium_and_above(eligibility_script, tmp_path, fake_gh, monkeypatch):
+    got = _run_eligibility_v2(eligibility_script, tmp_path, fake_gh, [MEDIUM_BLOCKING], monkeypatch)
+    assert got["eligible"] == "false" and got["blocking_count"] == "1"
+    assert not any("devteam/merge-eligible" in c for c in _gh_calls(tmp_path))
+
+
+@pytest.mark.parametrize("sev", ["high", "critical"])
+def test_v2_review1_blocks_on_high_and_critical(eligibility_script, tmp_path, fake_gh, monkeypatch, sev):
+    got = _run_eligibility_v2(eligibility_script, tmp_path, fake_gh,
+                              [{**MINOR, "severity": sev}], monkeypatch)
+    assert got["eligible"] == "false"
+
+
+def test_v2_review1_low_and_info_findings_do_not_block(eligibility_script, tmp_path, fake_gh, monkeypatch):
+    got = _run_eligibility_v2(eligibility_script, tmp_path, fake_gh, [MINOR, CROSS_CUTTING], monkeypatch)
+    assert got["eligible"] == "true" and got["blocking_count"] == "0"
+    assert got["findings_count"] == "2"
+    assert any("devteam/merge-eligible" in c for c in _gh_calls(tmp_path))
+
+
+def test_v2_review1_missing_or_unknown_severity_fails_closed(eligibility_script, tmp_path, fake_gh, monkeypatch):
+    for sev in (None, "", "urgent"):
+        f = {"title": "x", "body": "x", **({} if sev is None else {"severity": sev})}
+        # the verdict validator lowercases a missing severity to "info"
+        # for the tally, so give it a consistent counts object
+        for k, v in V2_ENV.items():
+            monkeypatch.setenv(k, v)
+        got = _run_eligibility(eligibility_script, tmp_path, fake_gh, findings=[f],
+                               counts={str(f.get("severity", "info")).lower(): 1}, round_="1")
+        if sev is None:
+            # absent severity is tallied as "info" but the finding itself has none: blocking
+            assert got["eligible"] == "false"
+        else:
+            assert got["eligible"] == "false", sev
+
+
+def test_v2_a_draft_is_still_never_eligible(eligibility_script, tmp_path, fake_gh, monkeypatch):
+    got = _run_eligibility_v2(eligibility_script, tmp_path, fake_gh, [], monkeypatch, is_draft="true")
+    assert got["eligible"] == "false"
+
+
+def test_v1_default_still_blocks_on_any_finding(eligibility_script, tmp_path, fake_gh):
+    got = _run_eligibility(eligibility_script, tmp_path, fake_gh, findings=[MINOR],
+                           counts={"low": 1}, round_="1")
+    assert got["eligible"] == "false"
+
+
+def _v2_labels(labels_script, fake_gh, tmp_path, **kw):
+    # `_run_labels` has no LIFECYCLE knob; add it through the environment.
+    os.environ["LIFECYCLE"] = "v2"
+    try:
+        return _run_labels(labels_script, fake_gh, tmp_path, **kw)
+    finally:
+        del os.environ["LIFECYCLE"]
+
+
+@pytest.mark.parametrize("findings,blocking", [(0, 0), (1, 0), (2, 1)])
+def test_v2_every_completed_review1_writes_reviewed_and_nothing_else(
+        labels_script, fake_gh, tmp_path, findings, blocking):
+    out, calls = _v2_labels(labels_script, fake_gh, tmp_path, round_="1",
+                            findings_count=findings, blocking_count=blocking)
+    posts = [c for c in calls if "-X POST" in c]
+    assert len(posts) == 1 and "labels[]=devteam:reviewed" in posts[0], posts
+    assert not any("awaiting-fixes" in c or "needs-human" in c for c in calls)
+
+
+def test_v2_labels_nothing_on_an_informational_run(labels_script, fake_gh, tmp_path):
+    _, calls = _v2_labels(labels_script, fake_gh, tmp_path, round_="informational", findings_count=1)
+    assert not [c for c in calls if "-X POST" in c]
+
+
+@pytest.fixture(scope="module")
+def bypass_script(tmp_path_factory) -> Path:
+    """The gate's v2 round derivation + bypass, extracted from `Decide`
+    (round fragment through the reuse-verdict marker, minus the trusted check
+    and the caps, which have their own tests)."""
+    text = WORKFLOW.read_text()
+    a = text.index("# ---- round, from the PR's LIVE labels ----")
+    b = text.index("          # ---- lifecycle v2: is review 1 already COMPLETED")
+    c = text.index("          # ---- lifecycle v2 bypass:")
+    d = text.index("          # ---- (2) reuse the verdict")
+    labels_fetch = text[a:b]
+    reviewed = text[b:text.index("          if [ \"$mode\" = \"improve\" ]; then", b)]
+    chain_start = text.index("          if [ \"$mode\" = \"improve\" ]; then", b)
+    chain_end = text.index('          echo "round=$round', chain_start)
+    chain = text[chain_start:chain_end]
+    # only the v2 arm of the chain matters here; cut the legacy arms
+    chain = chain[:chain.index("          elif has_label \"devteam:awaiting-fixes\"")] + "          fi\n"
+    body = (labels_fetch + reviewed + chain + text[c:d])
+    for k, v in {
+        "${{ github.repository }}": "o/r", "${{ github.event_name }}": "${EVENT_NAME}",
+        "${{ github.server_url }}": "https://github.com", "${{ github.run_id }}": "9",
+        "${{ github.run_attempt }}": "1",
+    }.items():
+        body = body.replace(k, v)
+    body = body.replace('"$GITHUB_OUTPUT"', '"$OUT"')
+    path = tmp_path_factory.mktemp("wf") / "bypass.sh"
+    path.write_text('set -euo pipefail\npr_number=42\nsha=deadbeef\nmode="${MODE_IN}"\n'
+                    'is_draft="${DRAFT:-false}"\n' + body)
+    return path
+
+
+@pytest.fixture
+def v2_gh(tmp_path):
+    """fake gh: timeline -> N lines (FAKE_TIMELINE), `fail` -> exit 1;
+    everything else is logged to GH_LOG."""
+    bin_dir = tmp_path / "bin2"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$*" >> "$GH_LOG"\n'
+        'if [[ "$*" == *"/timeline"* ]]; then\n'
+        '  [ "${FAKE_TIMELINE:-0}" = "fail" ] && { echo boom >&2; exit 1; }\n'
+        '  n=${FAKE_TIMELINE:-0}; for i in $(seq 1 $n); do echo devteam:reviewed; done; exit 0\n'
+        "fi\n"
+        'if [[ "$*" == *"/labels"* ]]; then exit 0; fi\n'
+        "exit 0\n")
+    gh.chmod(0o755)
+    return bin_dir
+
+
+def _run_bypass(script, v2_gh, tmp_path, *, timeline="0", event="pull_request", mode="review",
+                draft="false"):
+    out = tmp_path / "out"
+    out.write_text("")
+    log = tmp_path / "ghlog"
+    env = {**os.environ, "PATH": f"{v2_gh}{os.pathsep}{os.environ['PATH']}", "LIFECYCLE": "v2",
+           "GH_LOG": str(log), "FAKE_TIMELINE": timeline, "EVENT_NAME": event, "MODE_IN": mode,
+           "DRAFT": draft, "OUT": str(out), "GH_TOKEN": "x"}
+    proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    got = dict(l.split("=", 1) for l in out.read_text().splitlines() if "=" in l)
+    return proc, got, (log.read_text().splitlines() if log.exists() else [])
+
+
+def test_v2_a_push_after_a_completed_review1_is_bypassed_with_matching_statuses(
+        bypass_script, v2_gh, tmp_path):
+    proc, got, calls = _run_bypass(bypass_script, v2_gh, tmp_path, timeline="1")
+    assert proc.returncode == 0, proc.stderr
+    assert got.get("bypass") == "true" and got.get("allowed") == "false"
+    posts = [c for c in calls if "/statuses/" in c]
+    assert any("context=devteam/code-review" in c and "state=success" in c for c in posts), posts
+    assert any("context=devteam/merge-eligible" in c and "state=success" in c for c in posts), posts
+    urls = {re.search(r"target_url=(\S+)", c).group(1) for c in posts}
+    assert len(urls) == 1, "merge-attempt needs ONE shared attempt URL on both statuses"
+
+
+def test_v2_without_a_completed_review1_the_push_is_reviewed_not_bypassed(bypass_script, v2_gh, tmp_path):
+    proc, got, calls = _run_bypass(bypass_script, v2_gh, tmp_path, timeline="0")
+    assert proc.returncode == 0, proc.stderr
+    assert got.get("bypass") != "true"
+    assert not [c for c in calls if "/statuses/" in c]
+
+
+def test_v2_a_draft_gets_no_clearance(bypass_script, v2_gh, tmp_path):
+    proc, got, calls = _run_bypass(bypass_script, v2_gh, tmp_path, timeline="1", draft="true")
+    assert proc.returncode == 0 and got.get("bypass") != "true"
+    assert not [c for c in calls if "/statuses/" in c]
+
+
+def test_v2_manual_aw_review_after_review1_never_grants_eligibility(bypass_script, v2_gh, tmp_path):
+    proc, got, calls = _run_bypass(bypass_script, v2_gh, tmp_path, timeline="1", event="issue_comment")
+    assert proc.returncode == 0 and got.get("bypass") != "true"
+    assert not [c for c in calls if "/statuses/" in c]
+
+
+def test_v2_an_unreadable_timeline_fails_closed(bypass_script, v2_gh, tmp_path):
+    proc, got, calls = _run_bypass(bypass_script, v2_gh, tmp_path, timeline="fail")
+    assert proc.returncode != 0, "must not guess: no review, no bypass"
+    assert not [c for c in calls if "/statuses/" in c]
+
+
+def test_v2_only_a_bot_written_label_counts_as_review1_memory():
+    text = WORKFLOW.read_text()
+    i = text.index("# ---- lifecycle v2: is review 1 already COMPLETED")
+    frag = text[i:i + 1800]
+    assert 'actor.login=="github-actions[bot]"' in frag
+    assert '"devteam:reviewed","devteam:fix-cycle"' in frag
+
+
+def test_v2_wiring_blocking_step_is_last_and_bypass_reaches_merge_attempt():
+    text = WORKFLOW.read_text()
+    code = _code_only(text)
+    assert "inputs.lifecycle" in code and "default: 'v1'" in code
+    fail = code.index("- name: Fail the job on a blocking review 1 (lifecycle v2)")
+    for earlier in ("- name: Publish code-review status", "- name: Set round labels",
+                    "- name: Report round outcome to the platform"):
+        assert code.index(earlier) < fail
+    assert code.index("  provenance-gate:") > fail, "the red step must close the code-review job"
+    ma = code[code.index("  merge-attempt:"):]
+    assert "needs.gate.outputs.bypass == 'true'" in ma[:ma.index("steps:")]
+    pg = code[code.index("  provenance-gate:"):]
+    assert "needs.gate.outputs.bypass == 'true'" in pg[:pg.index("steps:")]
+    nudge = code[code.index("  nudge:"):]
+    assert "inputs.lifecycle != 'v2'" in nudge[:nudge.index("uses:")]
+
+
+def test_v2_the_check_status_stays_success_when_the_job_goes_red():
+    """The job fails via a final step, never by writing a failure status:
+    the gate's reuse check reads state==success to avoid a paid re-dispatch."""
+    text = WORKFLOW.read_text()
+    i = text.index("- name: Fail the job on a blocking review 1 (lifecycle v2)")
+    step = text[i:i + 900]
+    assert "statuses" not in step and "exit 1" in step
