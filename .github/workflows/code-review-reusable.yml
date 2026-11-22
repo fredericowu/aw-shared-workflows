@@ -1,6 +1,6 @@
 name: Code Review (reusable)
 
-# The canonical two-round PR review -> merge loop, as a `workflow_call`
+# The canonical single-review PR review -> merge loop, as a `workflow_call`
 # reusable workflow. Deep PR review by the Dev Team's pipeline reviewer agent
 # (`code-reviewer-pipeline` by default), published as the commit status
 # `devteam/code-review` on the PR's head SHA.
@@ -49,7 +49,7 @@ name: Code Review (reusable)
 #                    default.
 #
 # Everything else is deliberately NOT parameterized. The label names, the
-# status context, the round state machine, the fail-closed `blocks_merge`
+# status context, the round state machine, the fail-closed severity
 # rule, the HMAC scheme — varying any of those between repos is how the
 # three copies drifted in the first place.
 #
@@ -102,84 +102,44 @@ name: Code Review (reusable)
 # declares its own `concurrency: code-review-<pr#>` with
 # `cancel-in-progress: false`.
 #
-# ── THE TWO-ROUND REVIEW→MERGE LOOP ───────────────────────────────────────
-# Round state lives ON THE PR, as labels, an explicit state machine.
-# `devteam:awaiting-fixes` ("the coder owes a push on this head") and
-# `devteam:needs-human` are MUTUALLY EXCLUSIVE and awaiting-fixes wins: the
-# gate never writes both, deletes a stray needs-human it finds beside
-# awaiting-fixes, and DROPS awaiting-fixes on every `synchronize` (the push
-# is the payment). Because awaiting-fixes is therefore no longer the round
-# memory, a third label does that job: `devteam:fix-cycle`, written ONLY by
-# the label step when a completed round 1 returned findings, and NEVER removed
-# by this workflow (a human removing it forces the full lens again). It means
-# "a real round-1 verdict with findings exists on this PR" and puts every later
-# trigger (push or `/aw-review`) in round 2. `devteam:review-N` is the
-# per-PR ceiling counter and nothing else: /aw-improve and a timed-out
-# dispatch stamp it too, so it says "a dispatch was paid for", not "round 1
-# returned", and the round derivation does not read it.
+# ── THE PR LIFECYCLE: ONE REVIEW, THEN CLEARED ────────────────────────────
+# There is exactly one lifecycle (no opt-in, no second version; the
+# deprecated `lifecycle` input is accepted and ignored). Review 1 is the ONLY
+# review that can block. Round memory lives ON THE PR as labels, read LIVE via
+# `gh api` (never from the event payload, whose `issue_comment` form carries a
+# stale label snapshot):
 #
-#   (no label)                -> round 1: normal review, all lenses.
-#                                >=1 finding  -> label `devteam:awaiting-fixes`,
-#                                                POST `findings` (wakes the coder
-#                                                that opened the PR).
-#                                0 findings   -> merge.
-#                                (`devteam:fix-cycle` is written first, then
-#                                awaiting-fixes: a failed fix-cycle write
-#                                fails the step before awaiting-fixes exists.)
-#   devteam:awaiting-fixes,
-#   or devteam:fix-cycle       -> round 2: the lenient "major only" lens. Merge
-#                                eligibility is per-finding `blocks_merge`, NOT
-#                                severity.
-#                                none blocking -> merge.
-#                                any blocking  -> label `devteam:needs-human`
-#                                                 (awaiting-fixes removed),
-#                                                 POST `escalate`. If
-#                                                 awaiting-fixes is still
-#                                                 live (a run on an
-#                                                 unchanged head) it is kept
-#                                                 and nothing escalates.
-#   devteam:needs-human        -> round "needs-human": the SAME lenient
-#                                `blocks_merge` lens as round 2, run again on
-#                                every push or `/aw-review`.
-#                                none blocking -> label REMOVED, merge, same
-#                                                 as any other eligible round.
-#                                any blocking  -> label stays, no new event
-#                                                 (already escalated once).
-#                                A PUSH gets ONE automatic re-review here (legacy round cap),
-#                                stamped by label `devteam:review-capped`;
-#                                later pushes are refused until a human
-#                                comments `/aw-review` (v1.11.0). An
-#                                unchanged (sha, round, mode) with a
-#                                finished, non-eligible verdict is not
-#                                re-dispatched either. Round 2 and
-#                                needs-human are ONE lens class for that
-#                                check: a sha with a completed non-eligible
-#                                lenient-lens verdict from either gets no
-#                                further lenient-lens review (a new verdict
-#                                needs a new head or the labels removed).
-#                                A human can still remove the label directly
-#                                to force round 1's full lens on the next
-#                                push/`/aw-review`, instead of waiting for a
-#                                clean `blocks_merge` verdict.
+#   `devteam:reviewed`   written by the label step once review 1 COMPLETED
+#                        (any verdict) and its status was published. Counted
+#                        from a bot-authored `labeled` timeline event, so a
+#                        hand-added label is not memory.
+#   `devteam:fix-cycle`  legacy spelling of the same memory (PRs in flight at
+#                        rollout); read, never written.
+#   `review-count:N`     the per-PR paid-dispatch ceiling counter
+#                        (`max_reviews`), nothing else.
+#   `devteam:awaiting-fixes`  never written; a stray one is dropped on push.
+#   `devteam:needs-human`     never written or read; a stray one on an old PR
+#                        is deleted by the gate. Human-needed state lives on
+#                        the Kanban card / `ask_human`, not on the PR.
+#
+#   (not reviewed)    -> round 1: all lenses. A finding at or above
+#                        `block_severity` (a missing/unknown severity always
+#                        blocks) turns the `code-review` job red, withholds
+#                        merge eligibility and POSTs `findings` (wakes the
+#                        coder). Otherwise merge eligibility is written.
+#   (reviewed) + push -> `bypass`: NOT re-reviewed; cleared to merge once CI
+#                        is green (`devteam/merge-eligible` written by the
+#                        gate itself).
+#   (reviewed) + `/aw-review` or `/aw-improve` -> `informational`: advisory,
+#                        never grants or removes eligibility.
 #
 # Why labels and not commit counts or status history: `/aw-review` can be
-# invoked any number of times, workflow runs get cancelled and re-run, and a
-# round-2 merge step can fail mechanically and be retried. Labels encode
-# STATE; counts and history encode the past and break on exactly those
-# re-runs. The gate reads them LIVE via `gh api` — never from the event
-# payload, whose `issue_comment` form carries a stale label snapshot.
+# invoked any number of times, workflow runs get cancelled and re-run.
+# Labels encode STATE; counts and history encode the past and break on
+# exactly those re-runs.
 #
-# The fix-cycle rounds — 2 and `needs-human` — are entered AUTOMATICALLY, on
-# `pull_request: synchronize` — i.e. the coder's fix push. A `synchronize` on
-# a PR carrying none of those labels is round 1 and is refused by the gate after one
-# label read, before any paid judge run: a full deep review costs real
-# subscription budget and PR-Agent already reviews every push, so "review
-# every push" was never the ask. `/aw-review` survives untouched as the
-# manual override — for a round 1 re-run, for a retry after a mechanical
-# failure, and as the recovery path when an event is lost.
-#
-# Each caller repo must have both labels and both reviewer/merge secrets; see
-# the "Caller checklist" comment at the bottom of this file.
+# Each caller repo must have both reviewer/merge secrets; see the "Caller
+# checklist" comment at the bottom of this file.
 #
 # ── THE MERGE IS EVENT-DRIVEN, NOT POLLED (v1.3.0) ────────────────────────
 # Through v1.2.1 the merge waited for the caller's CI by polling `gh pr
@@ -225,7 +185,7 @@ name: Code Review (reusable)
 #     still reads the checks itself.
 #
 # ── ONE TRAP, IF YOU ARE EDITING A CALLER'S OWN code-review.yml IN A PR ───
-# `pull_request` runs the caller's PR copy (round 1 and round 2 both see your
+# `pull_request` runs the caller's PR copy (review 1 sees your
 # edits live). `issue_comment` (`/aw-review`) and `workflow_run` BOTH always
 # run the caller's DEFAULT BRANCH copy. A PR that modifies the caller's
 # `code-review.yml` therefore cannot exercise its own comment path or its own
@@ -300,23 +260,17 @@ on:
         default: 3
       lifecycle:
         description: >-
-          PR lifecycle (PR lifecycle v2, Kanban 41f5bf3b). `v1` (default) is
-          the two-round loop above, unchanged. `v2`: review 1 is the ONLY
-          review that can block (a finding at or above `block_severity` turns
-          the `code-review` job red and withholds merge eligibility); any push
-          after a COMPLETED review 1 is not re-reviewed and is cleared to
-          merge once CI is green; the merge itself is reported to the platform
-          by the org webhook (and, redundantly until the merged-event job is
-          retired, by that job -- the platform dedupes on one ledger key). The
-          nudge job is skipped. Round memory is the bot-written
-          `devteam:reviewed` label (or a bot-written legacy `devteam:fix-cycle`
-          so PRs in flight at rollout do not get a second review 1).
+          DEPRECATED AND IGNORED. There is exactly one PR lifecycle and it is
+          always on; this input is declared only so callers that still pass
+          `lifecycle: v2` (or any value) are not rejected with an
+          invalid-input error. It never changes behaviour; delete it from
+          your caller whenever convenient.
         required: false
         type: string
-        default: 'v1'
+        default: ''
       block_severity:
         description: >-
-          lifecycle v2 only: lowest severity that blocks on review 1
+          Lowest severity that blocks on review 1
           (`low`, `medium`, `high`, `critical`). A finding with a missing or
           unknown severity ALWAYS blocks (fail closed).
         required: false
@@ -425,11 +379,10 @@ jobs:
       pr_number: ${{ steps.decide.outputs.pr_number }}
       mode: ${{ steps.decide.outputs.mode }}
       round: ${{ steps.decide.outputs.round }}
-      fix_push: ${{ steps.decide.outputs.fix_push }}
       is_draft: ${{ steps.decide.outputs.is_draft }}
       bypass: ${{ steps.decide.outputs.bypass }}
     steps:
-      # DECIDE, lifecycle v2 (inputs.lifecycle == 'v2'). Comments live HERE, not
+      # DECIDE. Comments live HERE, not
       # in the script: GitHub rejects a `run:` over 21,000 characters as a
       # workflow-file error, and this script is close to that cap.
       #  * Round memory: "review 1 completed" = a `labeled` timeline event by
@@ -459,7 +412,6 @@ jobs:
           # documented in the KB).
           TRUSTED_AUTHORS: ${{ vars.AW_REVIEW_TRUSTED_AUTHORS }}
           MAX_REVIEWS: ${{ inputs.max_reviews }}
-          LIFECYCLE: ${{ inputs.lifecycle }}
           # Only used to avoid CHARGING the ceiling for a run whose reviewer
           # job will fail on a missing dispatch key before any request is sent.
           HAS_KEY: ${{ secrets.AW_CODEREVIEW_V1_KEY != '' }}
@@ -550,15 +502,15 @@ jobs:
           if [ "$labels" = "__FETCH_FAILED__" ]; then
             echo "::error::could not read PR #$pr_number's labels after 3 attempts. \
             Refusing to guess the review round: defaulting to round 1 would reset a PR \
-            that is mid-fix-cycle or already escalated. Re-run this workflow once the \
+            that was already reviewed. Re-run this workflow once the \
             GitHub API is answering again."
             exit 1
           fi
           has_label() { printf '%s\n' "$labels" | grep -Fxq "$1"; }
 
-          # lifecycle v2 round memory (see the DECIDE note above this step).
+          # Round memory (see the DECIDE note above this step).
           reviewed=false
-          if [ "${LIFECYCLE:-v1}" = "v2" ] && [ "$mode" != "improve" ]; then
+          if [ "$mode" != "improve" ]; then
             seen=""
             for attempt in 1 2 3; do
               if seen="$(gh api --paginate "repos/${{ github.repository }}/issues/$pr_number/timeline?per_page=100" \
@@ -570,7 +522,7 @@ jobs:
               sleep $(( attempt * 3 ))
             done
             if [ "$seen" = "__FAILED__" ] || [ -z "$seen" ]; then
-              echo "::error::lifecycle v2: could not read PR #$pr_number's timeline; re-run"
+              echo "::error::could not read PR #$pr_number's timeline; re-run"
               exit 1
             fi
             [ "$seen" -gt 0 ] && reviewed=true
@@ -580,37 +532,12 @@ jobs:
             # /aw-improve is a suggestion re-run, not a review round. It must
             # not consume round 1, must not set a label, and must not merge.
             round=informational
-          elif [ "${LIFECYCLE:-v1}" = "v2" ]; then
-            if [ "$reviewed" != "true" ]; then
-              round=1
-            elif [ "${{ github.event_name }}" = "pull_request" ]; then
-              round=bypass
-            else
-              round=informational
-            fi
-          elif has_label "devteam:awaiting-fixes"; then
-            # awaiting-fixes wins: the two labels are mutually exclusive and
-            # awaiting-fixes means "the coder owes a push". A needs-human that
-            # sits beside it is stale or hand-added; repair the pair.
-            round=2
-            if has_label "devteam:needs-human"; then
-              echo "devteam:needs-human present beside devteam:awaiting-fixes — removing needs-human (awaiting-fixes wins)"
-              gh api -X DELETE "repos/${{ github.repository }}/issues/$pr_number/labels/devteam%3Aneeds-human" --silent \
-                || echo "::warning::could not remove stray devteam:needs-human (API call failed or label already absent)"
-            fi
-          elif has_label "devteam:needs-human"; then
-            # Terminal until a human removes the label. The review still runs
-            # and still posts its findings — it just cannot change state.
-            round=needs-human
-          elif has_label "devteam:fix-cycle"; then
-            # Durable round memory: a completed round 1 returned findings
-            # (written by the label step, never removed by this workflow).
-            # Any trigger, push or /aw-review, is round 2. devteam:review-N
-            # is deliberately NOT read here: /aw-improve and a timed-out
-            # dispatch stamp it without any round-1 verdict existing.
-            round=2
-          else
+          elif [ "$reviewed" != "true" ]; then
             round=1
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            round=bypass
+          else
+            round=informational
           fi
           echo "round=$round" >> "$GITHUB_OUTPUT"
           # Draft state gates the MERGE, not the review: reviewing a WIP draft
@@ -619,17 +546,20 @@ jobs:
           echo "is_draft=${is_draft:-false}" >> "$GITHUB_OUTPUT"
           echo "round=$round is_draft=${is_draft:-false} (labels: $(printf '%s' "$labels" | tr '\n' ' '))"
 
+          # ---- a stray `devteam:needs-human` is ignored and deleted ----
+          # The gate neither writes nor reads that label any more (human-needed
+          # state lives on the Kanban card). One left on an old PR is removed.
+          if has_label "devteam:needs-human"; then
+            gh api -X DELETE "repos/${{ github.repository }}/issues/$pr_number/labels/devteam%3Aneeds-human" --silent \
+              && echo "removed stray devteam:needs-human" \
+              || echo "::warning::could not remove stray devteam:needs-human (API call failed or label already absent)"
+          fi
+
           # ---- a push means the coder paid its debt: drop awaiting-fixes ----
-          # After the round is computed (a push on an awaiting-fixes PR is
-          # still round 2) and BEFORE every refusal exit below, so a refused
+          # After the round is computed and BEFORE every refusal exit below, so a refused
           # push (ceiling, untrusted author, reused verdict) never keeps a
           # label that says the coder owes a push. A failed delete is a
           # warning, never a failure (a fork PR token is read-only).
-          if [ "${{ github.event.action }}" = "synchronize" ]; then
-            # A push is the fix: the label step must not read a failed delete
-            # below as "the coder still owes a push".
-            echo "fix_push=true" >> "$GITHUB_OUTPUT"
-          fi
           if [ "${{ github.event.action }}" = "synchronize" ] \
              && has_label "devteam:awaiting-fixes"; then
             gh api -X DELETE "repos/${{ github.repository }}/issues/$pr_number/labels/devteam%3Aawaiting-fixes" --silent \
@@ -637,79 +567,7 @@ jobs:
               || echo "::warning::could not drop devteam:awaiting-fixes (API call failed or label already absent)"
           fi
 
-          # ---- `synchronize` is the fix-cycle rounds' automatic trigger ----
-          # The coder pushing fixes is exactly the event rounds 2 and
-          # `needs-human` are waiting for, and making it automatic removes
-          # the one manual step left in the loop. Making it a review of
-          # EVERY push is a different and much more expensive thing: one
-          # judge run plus up to 3 research runs of real subscription
-          # budget, on a diff PR-Agent has already reviewed. So a
-          # synchronize is refused here unless the PR is genuinely
-          # mid-fix-cycle (`devteam:awaiting-fixes` -> round 2, or
-          # `devteam:needs-human` -> round needs-human).
-          #
-          # `needs-human` admits a push for the same reason round 2 does
-          # (v1.10.0): the status is per-commit, so a silently-skipped
-          # synchronize leaves the PREVIOUS commit's pass on display, which
-          # reads as "resolved" when nothing looked at the fix. The window is
-          # self-closing — the first clean `blocks_merge` verdict removes
-          # the label — and a still-blocking re-run posts no new escalate
-          # event, so repeated pushes cost budget but never re-ping a human.
-          #
-          # Round 1 is still refused AFTER the label read and BEFORE
-          # anything paid: that one `gh api` call is the whole cost of a
-          # push to a PR no review has ever run on, which is the
-          # high-volume case this strictness was written for. `/aw-review`
-          # still forces a review from any state.
-          if [ "${LIFECYCLE:-v1}" != "v2" ] \
-             && [ "${{ github.event.action }}" = "synchronize" ] \
-             && [ "$round" != "2" ] && [ "$round" != "needs-human" ]; then
-            echo "synchronize on a round-$round PR — not re-reviewing. \
-            Automatic re-review is for the fix-cycle rounds only (labels \
-            devteam:awaiting-fixes, devteam:fix-cycle, devteam:needs-human); \
-            comment /aw-review to force one."
-            echo "allowed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # ---- review caps (v1.11.0): bound the repeat reviews ----
-          # (1) After escalation, ONE automatic `needs-human` re-review per
-          # `/aw-review`: the first push to an escalated PR is reviewed and
-          # stamps `devteam:review-capped`; further pushes are refused here,
-          # before anything paid, until a human comments `/aw-review` (which
-          # clears the stamp and grants one more) -- the LEGACY round cap only; the
-          # per-PR ceiling in (3) still refuses everyone, and a legacy refusal
-          # defers to (3) so an exhausted budget is still surfaced. State is a label, like
-          # the rest of this machine, never a count.
-          # A failed label write FAILS OPEN to "review it": the cap exists
-          # to save budget, never to leave a push unreviewed.
-          cap_label="devteam:review-capped"
           label_api="repos/${{ github.repository }}/issues/$pr_number/labels"
-          legacy_refused=false
-          if [ "$round" = "needs-human" ] && [ "${{ github.event.action }}" = "synchronize" ]; then
-            if has_label "$cap_label"; then
-              # Still a free refusal, but NOT an immediate exit: the ceiling
-              # section below must see this head so an exhausted budget is
-              # surfaced (status + one announcement) instead of the refusal
-              # bypassing the report step.
-              echo "synchronize on an escalated PR that already had its one automatic \
-              re-review — not re-reviewing. Comment /aw-review to force one."
-              legacy_refused=true
-            else
-              gh api -X POST "$label_api" -f "labels[]=$cap_label" --silent \
-                || echo "::warning::could not stamp $cap_label; reviewing anyway"
-            fi
-          elif [ "$mode" != "improve" ] && has_label "$cap_label" \
-               && { [ "$round" != "needs-human" ] \
-                    || [ "${{ github.event.action }}" != "synchronize" ]; }; then
-            # Re-arm: `/aw-review`, or the PR left needs-human. NEVER on
-            # `/aw-improve`: it is a suggestion re-run, not a review round,
-            # and must not grant the next push a free automatic review.
-            # A failed delete is loud, not silent (it can also be a 404 for
-            # an absent label, so the message states only what happened).
-            gh api -X DELETE "$label_api/devteam%3Areview-capped" --silent \
-              || echo "::warning::could not clear $cap_label (API call failed or label already absent)"
-          fi
 
           if ! is_trusted "$author"; then
             {
@@ -723,10 +581,10 @@ jobs:
             exit 0
           fi
 
-          # lifecycle v2 bypass (see the DECIDE note above this step).
+          # Bypass (see the DECIDE note above this step).
           if [ "$round" = "bypass" ]; then
             if [ "$is_draft" = "true" ]; then
-              echo "lifecycle v2: PR #$pr_number is a draft - no clearance written; ready_for_review will write it."
+              echo "PR #$pr_number is a draft - no clearance written; ready_for_review will write it."
               echo "allowed=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -743,7 +601,7 @@ jobs:
               -f state=success -f context=devteam/merge-eligible \
               -f "description=review 1 done: cleared to merge once CI is green" \
               -f "target_url=$attempt_url" --silent
-            echo "lifecycle v2: review 1 already completed - cleared $sha to merge on green CI without a new review"
+            echo "review 1 already completed - cleared $sha to merge on green CI without a new review"
             {
               echo "allowed=false"
               echo "bypass=true"
@@ -763,40 +621,18 @@ jobs:
           # merge job), and any lookup failure — all fall through to a fresh
           # review, so this can only ever save a run, never clear a PR.
           #
-          # Invariant: once a sha holds a COMPLETED, non-merge-eligible
-          # review-mode verdict from the lenient lens (round 2 or round
-          # needs-human), no further lenient-lens review is dispatched on
-          # that same sha. Round 2 and round needs-human are ONE lens class
-          # for this key: a round-2 block writes `devteam:needs-human`, so a
-          # later `/aw-review` on the unchanged head derives round
-          # needs-human, and without this it would buy a second verdict with
-          # the identical `blocks_merge` lens that could clear the hold. The
-          # match is on the latest COMPLETED review-mode stamp, so an
-          # `/aw-improve`, cancelled or errored run cannot reopen it. A new
-          # verdict needs a new head or a human removing the labels. Round 1
-          # keys stay exact: r=1 then `/aw-review` as round 2 is intended.
+          # The match is on the latest COMPLETED stamp, so an `/aw-improve`,
+          # cancelled or errored run cannot reopen it. A new verdict needs a
+          # new head.
           if statuses="$(gh api "repos/${{ github.repository }}/commits/$sha/statuses?per_page=100" 2>/dev/null)"; then
             latest="$(printf '%s' "$statuses" | jq -r \
               '[.[] | select(.context=="devteam/code-review")][0] | "\(.state)|\(.description)"' 2>/dev/null || true)"
             eligible_seen="$(printf '%s' "$statuses" | jq -r \
               '[.[] | select(.context=="devteam/merge-eligible" and .state=="success")] | length' 2>/dev/null || echo 1)"
-            last_review_round=""
-            if [ "$mode" = "review" ] && { [ "$round" = "2" ] || [ "$round" = "needs-human" ]; }; then
-              last_review_round="$(printf '%s' "$statuses" | jq -r \
-                '[.[] | select(.context=="devteam/code-review" and .state=="success")
-                  | (.description // "") | capture("\\[rk r=(?<r>[^ \\]]+) m=(?<m>[^ \\]]+)\\]")?
-                  | select(.m=="review")][0].r // empty' 2>/dev/null || true)"
-            fi
-            if [ "$eligible_seen" = "0" ] \
-               && { [ "$last_review_round" = "2" ] || [ "$last_review_round" = "needs-human" ]; }; then
-              echo "verdict reused: sha $sha already has a completed lenient-lens review (stamped round=$last_review_round); current round=$round mode=$mode — not dispatching again."
-              echo "allowed=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
             if [ "$eligible_seen" = "0" ] && [ "${latest%%|*}" = "success" ] \
                && printf '%s' "$latest" | grep -Fq "[rk r=$round m=$mode]"; then
               echo "verdict reused: sha $sha already has a completed review for round=$round mode=$mode — not dispatching again."
-              [ "${LIFECYCLE:-v1}$round$mode" = v21review ] && { gh api -X POST "$label_api" -f "labels[]=devteam:reviewed" --silent || true; }  # lost-response label restore
+              [ "$round$mode" = 1review ] && { gh api -X POST "$label_api" -f "labels[]=devteam:reviewed" --silent || true; }  # lost-response label restore
               echo "allowed=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -861,9 +697,6 @@ jobs:
                 echo "max_reviews=$max_reviews"
               } >> "$GITHUB_OUTPUT"
               exit 0
-            elif [ "$legacy_refused" = "true" ]; then
-              # Budget left: the legacy cap's free refusal stands, uncharged.
-              :
             elif [ "${HAS_KEY:-true}" != "true" ]; then
               # The reviewer job fails loudly on the missing key before any
               # request is sent: nothing is spent, so nothing is charged.
@@ -878,12 +711,6 @@ jobs:
                 || echo "::warning::could not stamp $next_label; reviewing anyway"
               echo "review $(( used + 1 )) of $max_reviews on PR #$pr_number"
             fi
-          fi
-          if [ "$legacy_refused" = "true" ]; then
-            # Ceiling off or its timeline read failed: keep the legacy
-            # refusal (free) rather than buy a review.
-            echo "allowed=false" >> "$GITHUB_OUTPUT"
-            exit 0
           fi
           echo "allowed=true" >> "$GITHUB_OUTPUT"
 
@@ -961,8 +788,8 @@ jobs:
               "v": 1, "event": "escalate", "repo": os.environ["REPO"],
               "pr_number": int(os.environ["PR_NUMBER"]),
               "pr_url": os.environ["PR_URL"], "head_sha": os.environ["HEAD_SHA"],
-              "round": os.environ["ROUND"] or "needs-human",
-              "nudge_follows": True,
+              "round": os.environ["ROUND"] or "1",
+              "nudge_follows": False,  # no nudge job follows: the platform must escalate itself
               "reason": "review_budget_exhausted",
               "counts": {}, "findings": [], "blocking": [],
               "missing_blocks_merge": 0,
@@ -1023,7 +850,7 @@ jobs:
         run: |
           gh api -X POST "repos/${{ github.repository }}/statuses/${{ needs.gate.outputs.sha }}" \
             -f state=pending \
-            -f context=devteam/code-review \
+            -f context=${{ needs.gate.outputs.round == 'informational' && 'devteam/code-review-advisory' || 'devteam/code-review' }} \
             -f description="Dev Team deep review in progress" \
             -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}" \
             --silent
@@ -1077,22 +904,6 @@ jobs:
                 "PR deep review. Repo: " + $repo + ". PR #" + $pr +
                 ". Head SHA: " + $sha + ". Base ref: " + $base +
                 ". Round: " + $round + ". " +
-                (if $round == "2" or $round == "needs-human" then
-                  "This is a ROUND 2 review: the coder has already addressed " +
-                  "round 1 and pushed fixes. Follow the \"Round 2: the " +
-                  "major-only lens\" section of the aw-agent-code-reviewer " +
-                  "skill, in addition to the entry-path section below. Your " +
-                  "JSON must include the required per-finding boolean " +
-                  "`blocks_merge` that section defines. Read the coder'\''s " +
-                  "\"Won'\''t do:\" replies on the PR as input before judging " +
-                  "a finding they declined. " +
-                  (if $round == "needs-human" then
-                    "NOTE: this PR already carries the `devteam:needs-human` " +
-                    "label from an earlier escalation. Judge it exactly like " +
-                    "round 2: if nothing you find is genuinely `blocks_merge`, " +
-                    "the label will be REMOVED and the PR will merge. "
-                  else "" end)
-                else "" end) +
                 (if $mode == "improve" then
                   "Triggered via /aw-improve: focus this run specifically " +
                   "on producing improvement suggestions for the current " +
@@ -1224,7 +1035,6 @@ jobs:
           HEAD_SHA: ${{ needs.gate.outputs.sha }}
           ROUND: ${{ needs.gate.outputs.round }}
           IS_DRAFT: ${{ needs.gate.outputs.is_draft }}
-          LIFECYCLE: ${{ inputs.lifecycle }}
           BLOCK_SEVERITY: ${{ inputs.block_severity }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
           AGENT_SLUG: ${{ inputs.agent_slug }}
@@ -1356,16 +1166,6 @@ jobs:
           if declared != tally:
               _reject(f"counts {declared} contradict findings {tally}")
 
-          # In round 2 / needs-human `blocks_merge` is the merge gate, so a
-          # PRESENT value must be a JSON boolean: `null`, "false", 0 are all
-          # falsy-or-truthy by accident under bool(). (A MISSING field is
-          # still counted as blocking below -- fail closed.)
-          if os.environ.get("ROUND", "1") in ("2", "needs-human"):
-              for f in findings:
-                  if "blocks_merge" in f and not isinstance(f["blocks_merge"], bool):
-                      _reject("`blocks_merge` must be a JSON boolean "
-                              f"(got {f['blocks_merge']!r})")
-
           repo = os.environ["REPO"]
           pr = os.environ["PR_NUMBER"]
           sha = os.environ["HEAD_SHA"]
@@ -1441,19 +1241,8 @@ jobs:
 
           # ---- merge eligibility, and the digest the platform event carries ----
           #
-          # Round 1: eligible iff there are NO findings at all. Any finding
-          # wakes the coder instead.
-          #
-          # Round 2 and `needs-human`: eligible iff no finding has
-          # `blocks_merge == true`. That boolean — not severity — is the
-          # gate, and it is the SAME gate for both: `needs-human` is not a
-          # harsher lens, it is round 2 run again on an already-escalated
-          # PR. A clean verdict here re-arms the machine (the "Set round
-          # labels" step below removes the label), the same as a human
-          # manually clearing it.
-          #
-          # FAIL CLOSED on a missing `blocks_merge`: a finding without the
-          # field counts as blocking, on round 2 or `needs-human` alike.
+          # Review 1 is the only review that can block: eligible iff no
+          # finding is at or above `block_severity`.
           round_ = os.environ.get("ROUND", "1")
 
           def _digest(items):
@@ -1467,17 +1256,9 @@ jobs:
               return out
 
           blocking = []
-          missing_field = 0
-          if round_ in ("2", "needs-human"):
-              for f in findings:
-                  if "blocks_merge" not in f:
-                      missing_field += 1
-                      blocking.append(f)
-                  elif f["blocks_merge"] is True:
-                      blocking.append(f)
 
-          if round_ == "1" and os.environ.get("LIFECYCLE", "v1") == "v2":
-              # lifecycle v2: review 1 blocks on `block_severity` and above.
+          if round_ == "1":
+              # Review 1 blocks on `block_severity` and above.
               # FAIL CLOSED: a missing or unknown severity counts as blocking.
               order = ["info", "low", "medium", "high", "critical"]
               floor = os.environ.get("BLOCK_SEVERITY", "medium").strip().lower()
@@ -1486,10 +1267,6 @@ jobs:
                   sev = str(f.get("severity") or "").strip().lower()
                   return sev not in order or order.index(sev) >= floor_ix
               blocking = [f for f in findings if _blocks(f)]
-              eligible = not blocking
-          elif round_ == "1":
-              eligible = not findings
-          elif round_ in ("2", "needs-human"):
               eligible = not blocking
           else:
               # informational (/aw-improve suggestion runs): never eligible,
@@ -1502,11 +1279,6 @@ jobs:
               print("::notice::PR is a DRAFT — review complete, merge withheld. "
                     "Mark it ready for review to re-run round 1 and merge.")
 
-          if missing_field:
-              print(f"::warning::{missing_field} round-2 finding(s) have no "
-                    f"`blocks_merge` field — counted as BLOCKING (fail closed). "
-                    f"Check the round-2 lens section of the aw-agent-code-reviewer skill.")
-
           with open(os.path.join(TMP, "devteam_findings.json"), "w") as fh:
               json.dump(_digest(findings), fh)
           with open(os.path.join(TMP, "devteam_blocking.json"), "w") as fh:
@@ -1518,7 +1290,6 @@ jobs:
               gh_out.write(f"desc={desc}\n")
               gh_out.write(f"findings_count={len(findings)}\n")
               gh_out.write(f"blocking_count={len(blocking)}\n")
-              gh_out.write(f"missing_blocks_merge={missing_field}\n")
               gh_out.write(f"eligible={'true' if eligible else 'false'}\n")
           print(f"round={round_} findings={len(findings)} blocking={len(blocking)} "
                 f"eligible={eligible}")
@@ -1585,30 +1356,26 @@ jobs:
             state=failure
             description="code review failed or timed out - see run log"
           fi
+          # An informational run (/aw-review or /aw-improve on a reviewed head) is
+          # advisory: it must NOT replace the attempt URL on `devteam/code-review`,
+          # which `merge-attempt` matches against `devteam/merge-eligible`.
+          context=devteam/code-review
+          [ "${ROUND:-}" = informational ] && context=devteam/code-review-advisory
           gh api -X POST "repos/${{ github.repository }}/statuses/${{ needs.gate.outputs.sha }}" \
             -f state="$state" \
-            -f context=devteam/code-review \
+            -f context="$context" \
             -f description="$description" \
             -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}" \
             --silent
-          echo "devteam/code-review -> $state ($description)"
+          echo "$context -> $state ($description)"
 
-      # ---- the round state machine's write to the PR ----
-      # Adds a label on round 1/2 escalation, same as always. Writing one of
-      # awaiting-fixes / needs-human removes the other (mutually exclusive);
-      # round 2 with a blocking finding adds needs-human only when
-      # awaiting-fixes is not live, and reports the outcome in the `escalated`
-      # step output so the event step cannot disagree. The one
-      # subtraction: a clean `needs-human`-round verdict (no blocking
-      # finding) now REMOVES `devteam:needs-human` itself — a human clearing
-      # it by hand and a review clearing it by verdict are the same re-arm,
-      # so the machine stops being stuck on the human action specifically.
-      # A human can still remove it directly at any time to force round 1's
-      # full lens on the next push. `devteam:awaiting-fixes` is dropped by the
-      # gate on every push; the round memory is `devteam:fix-cycle`, written
-      # here (before awaiting-fixes) when round 1 has findings and never
-      # removed by this workflow. The label POST auto-creates a missing label;
-      # the caller checklist at the bottom of this file lists the colours.
+      # ---- the round memory's write to the PR ----
+      # Writes `devteam:reviewed` once review 1 COMPLETED (any verdict) and its
+      # status was actually published: the bypass gate clears a later head by
+      # reading that status, so a label without it would let a replay of the
+      # same SHA skip a blocked review. Nothing else is written: no
+      # awaiting-fixes / needs-human. The label POST auto-creates a missing
+      # label.
       - name: Set round labels
         id: labels
         # always(): the round state must not be lost because an EARLIER step
@@ -1617,15 +1384,10 @@ jobs:
         # to label.
         if: >-
           always() && steps.findings.outcome == 'success' &&
-          (needs.gate.outputs.round == '1' || needs.gate.outputs.round == '2' ||
-           needs.gate.outputs.round == 'needs-human')
+          needs.gate.outputs.round == '1'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ROUND: ${{ needs.gate.outputs.round }}
-          FINDINGS_COUNT: ${{ steps.findings.outputs.findings_count }}
-          BLOCKING_COUNT: ${{ steps.findings.outputs.blocking_count }}
-          FIX_PUSH: ${{ needs.gate.outputs.fix_push }}
-          LIFECYCLE: ${{ inputs.lifecycle }}
           PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
         run: |
           set -euo pipefail
@@ -1635,66 +1397,11 @@ jobs:
               -f "labels[]=$1" --silent
             echo "labelled: $1"
           }
-          remove_label() {
-            # 404s if already absent (e.g. a human beat the review to it) --
-            # that is the goal state, not a failure, but the log must say
-            # which of the two happened. ':' must be
-            # percent-encoded in the URL path, or GitHub's API 404s on the
-            # literal character — done here, not at the call site, so the
-            # log line stays the plain label name.
-            encoded="${1/:/%3A}"
-            gh api -X DELETE \
-              "repos/${{ github.repository }}/issues/${{ needs.gate.outputs.pr_number }}/labels/$encoded" \
-              --silent \
-              && echo "un-labelled: $1" \
-              || echo "::warning::could not remove $1 (API call failed or label already absent)"
-          }
-          # devteam:awaiting-fixes and devteam:needs-human are mutually
-          # exclusive; writing one removes the other. `escalated` is the
-          # step's real outcome: the event step sends `escalate` only when
-          # needs-human was actually written here.
-          escalated=false
-          if [ "${LIFECYCLE:-v1}" = "v2" ]; then
-            # Round memory only: review 1 COMPLETED (any verdict). No
-            # awaiting-fixes / needs-human in v2.
-            # Only when the round-1 status was actually published: the bypass
-            # gate clears a head by reading that status, so a label without it
-            # would let a replay of the same SHA skip a blocked review.
-            if [ "$ROUND" = "1" ]; then
-              if [ "${PUBLISH_OUTCOME:-success}" = "success" ]; then
-                add_label "devteam:reviewed"
-              else
-                echo "::warning::round-1 status publish ${PUBLISH_OUTCOME}; not writing devteam:reviewed so the next run reviews again"
-              fi
-            fi
-          elif [ "$ROUND" = "1" ] && [ "${FINDINGS_COUNT:-0}" -gt 0 ]; then
-            # fix-cycle first: if this write fails, set -e stops the step before
-            # awaiting-fixes exists, so the PR never says "coder owes a push"
-            # without the round memory behind it.
-            add_label "devteam:fix-cycle"
-            add_label "devteam:awaiting-fixes"
-            remove_label "devteam:needs-human"
-          elif [ "$ROUND" = "2" ] && [ "${BLOCKING_COUNT:-0}" -gt 0 ]; then
-            # Read live: a round 2 run on an unchanged head (/aw-review) still
-            # has awaiting-fixes, and the coder still owes a push, so it must
-            # not escalate. A failed read behaves as before: escalate.
-            # A synchronize run is the fix push itself: awaiting-fixes cannot
-            # still be owed even if the gate's drop failed, so escalate.
-            if [ "${FIX_PUSH:-}" != "true" ] \
-               && live="$(gh api "repos/${{ github.repository }}/issues/${{ needs.gate.outputs.pr_number }}/labels" --paginate --jq '.[].name')" \
-               && printf '%s\n' "$live" | grep -Fxq "devteam:awaiting-fixes"; then
-              echo "devteam:awaiting-fixes still live — keeping it, not escalating"
-            else
-              add_label "devteam:needs-human"
-              remove_label "devteam:awaiting-fixes"
-              escalated=true
-            fi
-          elif [ "$ROUND" = "needs-human" ] && [ "${BLOCKING_COUNT:-0}" -eq 0 ]; then
-            remove_label "devteam:needs-human"
+          if [ "${PUBLISH_OUTCOME:-success}" = "success" ]; then
+            add_label "devteam:reviewed"
           else
-            echo "no label change (round=$ROUND findings=${FINDINGS_COUNT:-0} blocking=${BLOCKING_COUNT:-0})"
+            echo "::warning::round-1 status publish ${PUBLISH_OUTCOME}; not writing devteam:reviewed so the next run reviews again"
           fi
-          echo "escalated=$escalated" >> "$GITHUB_OUTPUT"
 
       # ---- tell the platform what this round decided ----
       # LAST, and after the findings are already on the PR: the woken coder
@@ -1716,8 +1423,7 @@ jobs:
         id: event
         if: >-
           always() && steps.findings.outcome == 'success' &&
-          (needs.gate.outputs.round == '1' || needs.gate.outputs.round == '2' ||
-           needs.gate.outputs.round == 'needs-human')
+          needs.gate.outputs.round == '1'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1727,16 +1433,8 @@ jobs:
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           HEAD_SHA: ${{ needs.gate.outputs.sha }}
           ROUND: ${{ needs.gate.outputs.round }}
-          FINDINGS_COUNT: ${{ steps.findings.outputs.findings_count }}
           BLOCKING_COUNT: ${{ steps.findings.outputs.blocking_count }}
-          # What the label step really did; `escalate` only if it wrote needs-human.
-          ESCALATED: ${{ steps.labels.outputs.escalated }}
-          # Carried into the payload so an `escalate` that happened only
-          # because the judge omitted `blocks_merge` says so to the human it
-          # pings, instead of reading as a real blocking finding.
-          MISSING_BLOCKS_MERGE: ${{ steps.findings.outputs.missing_blocks_merge }}
           ELIGIBLE: ${{ steps.findings.outputs.eligible }}
-          LIFECYCLE: ${{ inputs.lifecycle }}
           PR_URL: ${{ github.server_url }}/${{ github.repository }}/pull/${{ needs.gate.outputs.pr_number }}
         run: |
           set -euo pipefail
@@ -1744,35 +1442,12 @@ jobs:
             echo "::warning::AW_DEVTEAM_EVENT_SECRET is not set — the coder cannot be woken."
             exit 0
           fi
-          # lifecycle v2: review 1 is the only round and only a BLOCKING
-          # finding wakes the coder (`findings`); anything else is `cleared`
-          # (carrying the LOW/INFO digest: stored, no wake).
-          if [ "${LIFECYCLE:-v1}" = "v2" ]; then FINDINGS_COUNT="${BLOCKING_COUNT:-0}"; fi
-          round="$ROUND"
-          if [ "$round" = "1" ] && [ "${FINDINGS_COUNT:-0}" -gt 0 ]; then
+          # Review 1 is the only round and only a BLOCKING finding wakes the
+          # coder (`findings`); anything else is `cleared` (carrying the
+          # LOW/INFO digest: stored, no wake).
+          if [ "${BLOCKING_COUNT:-0}" -gt 0 ]; then
             event=findings
-          elif [ "$round" = "2" ] && [ "${BLOCKING_COUNT:-0}" -gt 0 ]; then
-            if [ "${ESCALATED:-}" != "true" ]; then
-              # false: label step kept awaiting-fixes. Empty: label step
-              # failed or was skipped, so needs-human was never confirmed.
-              echo "::warning::needs-human not confirmed written (escalated='${ESCALATED:-}') — no escalate event"
-              exit 0
-            fi
-            event=escalate
-          elif [ "$round" = "needs-human" ] && [ "${BLOCKING_COUNT:-0}" -gt 0 ]; then
-            # Still blocking on an already-escalated PR: this is not new
-            # news, `escalate` already fired on the round that set the
-            # label. Re-posting it on every push/`/aw-review` would just
-            # re-ping a human who already knows.
-            echo "still blocking on an escalated PR — no new event"
-            exit 0
           else
-            # Eligible: still report, as `cleared`. A round-1-clean PR sends
-            # an EMPTY findings digest (devteam_findings.json is already []
-            # at this point); a round-2/needs-human-clean PR sends whatever
-            # non-blocking findings survived, `blocks_merge` flags included.
-            # The `merged` event (from the merged-event job, when the PR
-            # actually closes) looks this row up by head_sha.
             event=cleared
           fi
           python3 - "$event" <<'PYEOF'
@@ -1812,14 +1487,10 @@ jobs:
               "counts": json.load(open(os.path.join(TMP, "devteam_counts.json"))),
               "findings": json.load(open(os.path.join(TMP, "devteam_findings.json"))),
               "blocking": json.load(open(os.path.join(TMP, "devteam_blocking.json"))),
-              "missing_blocks_merge": int(os.environ.get("MISSING_BLOCKS_MERGE") or 0),
-              # The `nudge` job runs after this one and decides wake / ask /
-              # wait; the platform only stores this digest.
-              "nudge_follows": True,
+              "missing_blocks_merge": 0,
+              # There is no nudge job: the platform must wake directly.
+              "nudge_follows": False,
           }
-          if os.environ.get("LIFECYCLE", "v1") == "v2":
-              # v2 has no nudge job: the platform must wake directly.
-              payload["nudge_follows"] = False
           # Sign the EXACT bytes that get posted — build once, write once,
           # sign the file's contents, send the file. Signed in python rather
           # than `openssl dgst -hmac "$SECRET"` so the secret never appears
@@ -1847,13 +1518,13 @@ jobs:
               sys.exit(1)
           PYEOF
 
-      # lifecycle v2: LAST step of the job, after the statuses, the round
+      # LAST step of the job, after the statuses, the round
       # label and the event are all written. The job goes red; the
       # `devteam/code-review` STATUS stays a success ("a verdict exists"), so
       # the gate's reuse check never re-dispatches a paid review on this sha.
-      - name: Fail the job on a blocking review 1 (lifecycle v2)
+      - name: Fail the job on a blocking review 1
         if: >-
-          always() && inputs.lifecycle == 'v2' &&
+          always() &&
           needs.gate.outputs.round == '1' &&
           steps.findings.outcome == 'success' &&
           steps.findings.outputs.blocking_count != '0'
@@ -1873,8 +1544,8 @@ jobs:
   # settings, so the merge commit message is NOT relied on.
   #
   # Gated like `code-review` is — `needs.gate.outputs.allowed == 'true'` —
-  # same precondition: a fork PR, an untrusted author, or a non-round-2
-  # synchronize never reaches either job.
+  # same precondition: a fork PR or an untrusted author never reaches
+  # either job.
   #
   # Modelled on `devteam/merge-eligible`, not on raw check-run pass/fail:
   # this job's own name is in `merge-attempt`'s ADVISORY set below (like
@@ -2214,8 +1885,8 @@ jobs:
       )
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     outputs:
-      # The PR this job resolved (empty when none). The `nudge` job reads it
-      # on workflow_run, where the gate is skipped and has no PR number.
+      # The PR this job resolved (empty when none); on workflow_run the gate
+      # is skipped and has no PR number.
       pr_number: ${{ steps.merge.outputs.pr_number }}
     # Nothing here waits on anything: a handful of bounded API reads and one
     # merge call. 10 is already generous; if this job is running long it is
@@ -2299,7 +1970,7 @@ jobs:
           # on success. See `PROVENANCE_CONTEXT` below.
           ADVISORY = {"devteam/ai-review", "devteam/code-review",
                       "devteam/merge-eligible", "devteam/provenance",
-                      "devteam/review-cap",
+                      "devteam/review-cap", "devteam/code-review-advisory",
                       "ai-review", "code-review", "merge-eligible",
                       "provenance-gate", "gate", "fork-notice",
                       "merged-event", "merge-attempt", "CodeRabbit",
@@ -2796,12 +2467,9 @@ jobs:
 # Three things about that block, each of which has a way of going wrong
 # silently:
 #
-#   `synchronize` is what makes the fix-cycle rounds — 2 and `needs-human`
-#   — automatic. Without it the loop still works, it just needs a
-#   `/aw-review` comment after every fix push, which is what v1.2.1 and
-#   earlier required. The gate refuses a round-1 synchronize after a single
-#   label read, so adding it does not spend review budget on the pushes of
-#   a PR no review has run on yet.
+#   `synchronize` is what lets a push to an already-reviewed PR be cleared
+#   (the `bypass` round) without a second deep review; without it a fix push
+#   would need a `/aw-review` comment to get its merge clearance.
 #
 #   `workflow_run.workflows:` takes the CI workflow's `name:` — the human
 #   string at the top of that file, NOT its filename and NOT its job id.
@@ -2870,16 +2538,8 @@ jobs:
 #     code-reviewer-sonnet — or to whatever `agent_slug` the caller passes,
 #     see the PROVENANCE note above), AW_DEVTEAM_MERGE_TOKEN,
 #     AW_DEVTEAM_EVENT_SECRET
-#   - labels: devteam:awaiting-fixes (#FBCA04), devteam:needs-human (#B60205),
-#     devteam:fix-cycle (#C5DEF5, durable round memory, auto-created on first use)
-#     (mutually exclusive: awaiting-fixes wins and is dropped on every push)
-#     provenance-exempt (#0E8A16) — human-applied only, see `provenance-gate`
-#       gh label create devteam:awaiting-fixes --color FBCA04 --repo <owner/repo> \
-#         --description "Findings on this head; the coder owes a push (dropped on push)"
-#       gh label create devteam:fix-cycle --color C5DEF5 --repo <owner/repo> \
-#         --description "A round-1 review returned findings; later reviews are round 2. Never removed by CI."
-#       gh label create devteam:needs-human --color B60205 --repo <owner/repo> \
-#         --description "Round 2 still blocking; a human must decide"
+#   - labels: `devteam:reviewed` and `review-count:N` are auto-created on first
+#     use. provenance-exempt (#0E8A16) — human-applied only, see `provenance-gate`
 #       gh label create provenance-exempt --color 0E8A16 --repo <owner/repo> \
 #         --description "Human-applied: skips provenance-gate. Never apply this yourself."
 #   - optional variable AW_REVIEW_TRUSTED_AUTHORS (comma-separated logins).
@@ -2889,50 +2549,3 @@ jobs:
 #
 # No `--enable-auto-merge` repo setting is needed: this file never calls
 # `gh pr merge --auto` (see the merge step's own comment for why).
-
-  # ---------------------------------------------------------------------------
-  # nudge: the LAST job. After every event this workflow handled, post the
-  # PR's live state to the platform (devteam-nudge-reusable.yml), which decides
-  # wake / ask / wait / nothing. This job holds no decision logic and can never
-  # fail a PR (the callee exits 0 on every path). `always()` so it runs when
-  # the gate refused, the review failed or nothing was merge-eligible; it is
-  # in `merge-attempt`'s ADVISORY set so it never reads as its own pending CI.
-  #
-  # On workflow_run the gate is skipped and has no PR number, so it comes from
-  # `merge-attempt`, which already resolves it from the head SHA.
-  # ---------------------------------------------------------------------------
-  nudge:
-    needs: [gate, code-review, provenance-gate, merge-attempt]
-    if: >-
-      always() &&
-      inputs.lifecycle != 'v2' &&
-      github.event.action != 'closed' &&
-      github.event.sender.type != 'Bot' &&
-      (
-        github.event_name == 'pull_request' ||
-        github.event_name == 'workflow_run' ||
-        (
-          github.event_name == 'issue_comment' &&
-          github.event.issue.pull_request != null
-        )
-      ) &&
-      (needs.gate.outputs.pr_number != '' || needs.merge-attempt.outputs.pr_number != '')
-    uses: fredericowu/aw-shared-workflows/.github/workflows/devteam-nudge-reusable.yml@master
-    with:
-      pr_number: ${{ needs.gate.outputs.pr_number || needs.merge-attempt.outputs.pr_number }}
-      trigger_kind: >-
-        ${{ github.event_name == 'workflow_run' && 'ci_done'
-        || needs.code-review.result != 'skipped' && 'review_done'
-        || github.event_name == 'issue_comment' && 'comment'
-        || 'push_unreviewed' }}
-      event_url: ${{ inputs.event_url }}
-      runs_on: ${{ inputs.runs_on }}
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-      checks: read
-      statuses: read
-      actions: read
-    secrets:
-      AW_DEVTEAM_EVENT_SECRET: ${{ secrets.AW_DEVTEAM_EVENT_SECRET }}

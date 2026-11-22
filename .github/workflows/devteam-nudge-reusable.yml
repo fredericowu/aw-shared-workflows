@@ -5,9 +5,7 @@ name: Devteam Nudge (reusable)
 # nothing. Event-driven counterpart of the 3h github-maintenance tick; the
 # tick stays as the safety-net sweep.
 #
-# Two entry points, one file:
-#   - `nudge` job of code-review-reusable.yml (review_done, push_unreviewed,
-#     ci_done, comment), reached by every consumer through @master.
+# One entry point:
 #   - a per-repo `devteam-nudge.yml` caller on `pull_request: labeled` for the
 #     human `devteam:awaiting-fixes` label (trigger_kind: label). See README.
 #
@@ -174,19 +172,6 @@ jobs:
                   warn("AW_DEVTEAM_EVENT_SECRET is not set; no nudge sent")
                   return
 
-              needs_human_actor = None
-              if "devteam:needs-human" in labels:
-                  r = gh("api", f"repos/{repo}/issues/{pr}/events", "--paginate",
-                         "--jq", '.[] | select(.event=="labeled" and '
-                                 '.label.name=="devteam:needs-human") | '
-                                 '{login: .actor.login, type: .actor.type}')
-                  if r.returncode == 0:
-                      for line in r.stdout.splitlines():
-                          try:
-                              needs_human_actor = json.loads(line)
-                          except ValueError:
-                              pass
-
               payload = {
                   "v": 1,
                   "trigger": {
@@ -202,7 +187,7 @@ jobs:
                   "labels": labels,
                   "run_id": run_label[len("aw-run:"):],
                   "view": view,
-                  "needs_human_actor": needs_human_actor,
+                  "needs_human_actor": None,  # label retired; key kept for payload shape
                   "dry_run": os.environ.get("DRY_RUN", "false").lower() == "true",
               }
 

@@ -280,35 +280,6 @@ def test_invalid_verdict_fails_before_posting(eligibility_script, tmp_path, fake
     assert (tmp_path / "gh_output").read_text() == ""
 
 
-def test_round1_merges_only_on_zero_findings(eligibility_script, tmp_path, fake_gh):
-    clean = _run_eligibility(
-        eligibility_script, tmp_path, fake_gh, findings=[], counts={}, round_="1"
-    )
-    assert clean["eligible"] == "true"
-    assert clean["findings_count"] == "0"
-
-    dirty = _run_eligibility(
-        eligibility_script, tmp_path, fake_gh, findings=[MINOR], counts={"low": 1}, round_="1"
-    )
-    assert dirty["eligible"] == "false", "any round-1 finding must wake the coder"
-    assert dirty["findings_count"] == "1"
-
-
-def test_round1_counts_a_cross_cutting_finding(eligibility_script, tmp_path, fake_gh):
-    """A finding with no file/line is posted as a top-level comment; it still
-    counts, or a purely architectural objection would merge straight through."""
-    got = _run_eligibility(
-        eligibility_script,
-        tmp_path,
-        fake_gh,
-        findings=[CROSS_CUTTING],
-        counts={"info": 1},
-        round_="1",
-    )
-    assert got["eligible"] == "false"
-    assert got["findings_count"] == "1"
-
-
 def test_the_review_banner_names_the_dispatched_agent_slug(eligibility_script, tmp_path, fake_gh):
     """The posted comment's banner must name whichever agent_slug the caller
     passed, not a slug hardcoded at the default — a canary dispatching
@@ -328,54 +299,6 @@ def test_the_review_banner_names_the_dispatched_agent_slug(eligibility_script, t
     assert "code-reviewer-sonnet" not in log
 
 
-def test_round2_gate_is_blocks_merge_and_not_severity(eligibility_script, tmp_path, fake_gh):
-    """The core of the round-2 rule, in both directions."""
-    high_but_fine = _run_eligibility(
-        eligibility_script,
-        tmp_path,
-        fake_gh,
-        findings=[HIGH_NON_BLOCKING],
-        counts={"high": 1},
-        round_="2",
-    )
-    assert high_but_fine["eligible"] == "true", "severity must not block round 2"
-    assert high_but_fine["blocking_count"] == "0"
-
-    medium_but_blocking = _run_eligibility(
-        eligibility_script,
-        tmp_path,
-        fake_gh,
-        findings=[HIGH_NON_BLOCKING, MEDIUM_BLOCKING],
-        counts={"high": 1, "medium": 1},
-        round_="2",
-    )
-    assert medium_but_blocking["eligible"] == "false"
-    assert medium_but_blocking["blocking_count"] == "1"
-
-
-def test_round2_missing_blocks_merge_fails_closed(eligibility_script, tmp_path, fake_gh):
-    """Schema drift must escalate to a human, never silently merge over a
-    finding nobody judged."""
-    got = _run_eligibility(
-        eligibility_script,
-        tmp_path,
-        fake_gh,
-        findings=[NO_BLOCKS_FIELD],
-        counts={"low": 1},
-        round_="2",
-    )
-    assert got["eligible"] == "false"
-    assert got["blocking_count"] == "1"
-    assert got["missing_blocks_merge"] == "1"
-
-
-def test_round2_clean_is_eligible(eligibility_script, tmp_path, fake_gh):
-    got = _run_eligibility(
-        eligibility_script, tmp_path, fake_gh, findings=[], counts={}, round_="2"
-    )
-    assert got["eligible"] == "true"
-
-
 def test_informational_round_never_merges(eligibility_script, tmp_path, fake_gh):
     """`/aw-improve` suggestion runs are not a review round at all — they
     must never merge, whatever they found."""
@@ -383,39 +306,6 @@ def test_informational_round_never_merges(eligibility_script, tmp_path, fake_gh)
         eligibility_script, tmp_path, fake_gh, findings=[], counts={}, round_="informational"
     )
     assert got["eligible"] == "false"
-
-
-def test_needs_human_round_merges_only_when_nothing_blocks(
-    eligibility_script, tmp_path, fake_gh
-):
-    """An already-escalated PR is judged exactly like round 2, not treated
-    as permanently informational: a clean verdict is eligible, a real
-    `blocks_merge` finding still is not, and severity alone still isn't the
-    gate."""
-    clean = _run_eligibility(
-        eligibility_script, tmp_path, fake_gh, findings=[], counts={}, round_="needs-human"
-    )
-    assert clean["eligible"] == "true"
-
-    still_blocking = _run_eligibility(
-        eligibility_script,
-        tmp_path,
-        fake_gh,
-        findings=[MEDIUM_BLOCKING],
-        counts={"medium": 1},
-        round_="needs-human",
-    )
-    assert still_blocking["eligible"] == "false"
-
-    severity_is_not_the_gate = _run_eligibility(
-        eligibility_script,
-        tmp_path,
-        fake_gh,
-        findings=[HIGH_NON_BLOCKING],
-        counts={"high": 1},
-        round_="needs-human",
-    )
-    assert severity_is_not_the_gate["eligible"] == "true"
 
 
 @pytest.mark.parametrize("draft", ["true", "True", "TRUE"])
@@ -463,8 +353,8 @@ def test_a_non_draft_pr_is_unaffected_by_the_draft_guard(
 #
 # And the inverse matters as much: a status written on an INELIGIBLE head
 # would hand the merge job a licence the review never granted. Round 1 with
-# findings, round 2 with a blocking finding, a draft PR, `needs-human` — all
-# of them must leave the SHA with no status at all.
+# a blocking finding, a draft PR, an informational run — all of them must
+# leave the SHA with no status at all.
 
 
 _ELIGIBLE_STATUS = "context=devteam/merge-eligible"
@@ -491,47 +381,6 @@ def test_the_eligible_status_is_published_on_the_head_sha(
         "anything else is unreadable by the merge job"
     )
     assert "state=success" in posts[0]
-
-
-def test_the_eligible_status_is_published_when_an_escalated_pr_clears(
-    eligibility_script, tmp_path, fake_gh
-):
-    """The merge half of the needs-human re-arm: a clean `needs-human`-round
-    verdict must leave the SAME hand-off a clean round 1/2 would, or
-    `merge-attempt` has nothing to read even though the label comes off."""
-    got = _run_eligibility(
-        eligibility_script, tmp_path, fake_gh, findings=[], counts={}, round_="needs-human"
-    )
-    assert got["eligible"] == "true"
-    posts = _status_posts(tmp_path)
-    assert len(posts) == 1, f"expected exactly one status post, got {posts}"
-    assert f"statuses/{'a' * 40}" in posts[0]
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"findings": [MINOR], "counts": {"low": 1}, "round_": "1"},
-        {"findings": [MEDIUM_BLOCKING], "counts": {"medium": 1}, "round_": "2"},
-        {"findings": [NO_BLOCKS_FIELD], "counts": {"low": 1}, "round_": "2"},
-        {"findings": [MEDIUM_BLOCKING], "counts": {"medium": 1}, "round_": "needs-human"},
-        {"findings": [], "counts": {}, "round_": "informational"},
-        {"findings": [], "counts": {}, "round_": "1", "is_draft": "true"},
-    ],
-    ids=["round1-finding", "round2-blocking", "round2-missing-field",
-         "needs-human-still-blocking", "informational", "draft"],
-)
-def test_the_eligible_status_is_never_published_when_not_eligible(
-    eligibility_script, tmp_path, fake_gh, kwargs
-):
-    """Absence of the status IS the negative verdict — there is no failure
-    counterpart for the merge job to read. So writing it on a head the review
-    did not clear is not a cosmetic slip, it is a merge the review refused."""
-    got = _run_eligibility(eligibility_script, tmp_path, fake_gh, **kwargs)
-    assert got["eligible"] == "false"
-    assert _status_posts(tmp_path) == [], (
-        "devteam/merge-eligible was published for an INELIGIBLE review"
-    )
 
 
 def test_the_status_write_is_structurally_inside_the_eligible_branch():
@@ -566,6 +415,7 @@ def round_script(tmp_path_factory) -> Path:
         text[start:end]
         .replace("${{ github.repository }}", "tekflox/aw-app-template")
         .replace("${{ github.event.action }}", "${EVENT_ACTION:-synchronize}")
+        .replace("${{ github.event_name }}", "${EVENT_NAME:-pull_request}")
         .replace('"$GITHUB_OUTPUT"', "/dev/null")
     )
     assert "has_label" in body, "extracted the wrong fragment"
@@ -580,10 +430,11 @@ def round_script(tmp_path_factory) -> Path:
 
 def _detect_round(
     script: Path, fake_gh, *, labels: str, mode: str = "review", fetch_fails: bool = False,
-    gh_log: Path | None = None, action: str = "synchronize",
+    gh_log: Path | None = None, action: str = "synchronize", event: str = "pull_request",
 ):
     env = {
         "EVENT_ACTION": action,
+        "EVENT_NAME": event,
         **({"GH_LOG": str(gh_log)} if gh_log else {}),
         **os.environ,
         "PATH": f"{fake_gh}{os.pathsep}{os.environ['PATH']}",
@@ -601,77 +452,12 @@ def _detect_round(
     return proc.returncode, (emitted[0] if emitted else None), proc.stdout + proc.stderr
 
 
-@pytest.mark.parametrize(
-    "labels,expected",
-    [
-        ("", "1"),  # no labels at all
-        ("bug enhancement", "1"),  # unrelated labels
-        ("devteam:awaiting-fixes", "2"),
-        ("devteam:needs-human", "needs-human"),
-        ("devteam:awaiting-fixes devteam:needs-human", "2"),  # awaiting-fixes wins
-        ("devteam:review-1", "1"),  # review-N is the ceiling counter, not round memory
-        ("devteam:review-3 bug", "1"),
-        ("devteam:fix-cycle", "2"),  # the durable round memory
-        ("devteam:fix-cycle devteam:review-1", "2"),
-        ("devteam:fix-cycle devteam:needs-human", "needs-human"),
-        ("devteam:fix-cycle devteam:awaiting-fixes devteam:needs-human", "2"),
-        ("devteam:review-1 devteam:needs-human", "needs-human"),
-        ("devteam:review-capped", "1"),  # not a review-N counter label
-        ("devteam:review-exhausted", "1"),
-        ("devteam:awaiting-fixes-but-not-really", "1"),  # exact match only
-    ],
-)
-def test_round_is_detected_from_live_labels(round_script, fake_gh, labels, expected):
-    rc, round_, _ = _detect_round(round_script, fake_gh, labels=labels)
-    assert rc == 0
-    assert round_ == expected
-
-
 @pytest.mark.parametrize("action", ["created", "opened", "synchronize"])
 def test_review_n_alone_is_round_1_on_every_trigger(round_script, fake_gh, action):
     """/aw-improve and a timed-out dispatch stamp review-N without any round-1
     verdict, so it must never read as round memory, push or /aw-review."""
     rc, round_, _ = _detect_round(round_script, fake_gh, labels="devteam:review-1", action=action)
     assert rc == 0 and round_ == "1"
-
-
-@pytest.mark.parametrize("action", ["created", "opened", "synchronize"])
-def test_fix_cycle_alone_is_round_2_on_every_trigger(round_script, fake_gh, action):
-    rc, round_, _ = _detect_round(round_script, fake_gh, labels="devteam:fix-cycle", action=action)
-    assert rc == 0 and round_ == "2"
-
-
-def test_a_stray_needs_human_beside_awaiting_fixes_is_deleted(round_script, fake_gh, tmp_path):
-    log = tmp_path / "gh.log"
-    rc, round_, out = _detect_round(
-        round_script, fake_gh, labels="devteam:awaiting-fixes devteam:needs-human", gh_log=log
-    )
-    assert rc == 0 and round_ == "2"
-    deletes = [c for c in log.read_text().splitlines() if "-X DELETE" in c]
-    assert len(deletes) == 1 and "labels/devteam%3Aneeds-human" in deletes[0], deletes
-    assert "awaiting-fixes wins" in out
-
-
-@pytest.mark.parametrize("labels", ["devteam:awaiting-fixes", "devteam:needs-human", "devteam:review-1", "devteam:fix-cycle", ""])
-def test_no_needs_human_delete_without_the_pair(round_script, fake_gh, tmp_path, labels):
-    log = tmp_path / "gh.log"
-    _detect_round(round_script, fake_gh, labels=labels, gh_log=log)
-    assert not [c for c in log.read_text().splitlines() if "-X DELETE" in c]
-
-
-def test_a_failed_stray_delete_does_not_fail_the_round(round_script, tmp_path):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    gh = bin_dir / "gh"
-    gh.write_text(
-        "#!/bin/bash\n"
-        'if [[ "$*" == *"-X DELETE"* ]]; then exit 1; fi\n'
-        "printf '%s\\n' devteam:awaiting-fixes devteam:needs-human\n"
-    )
-    gh.chmod(0o755)
-    rc, round_, out = _detect_round(round_script, bin_dir, labels="")
-    assert rc == 0 and round_ == "2"
-    assert "::warning::could not remove stray" in out
 
 
 @pytest.mark.parametrize("labels", ["", "devteam:awaiting-fixes"])
@@ -696,8 +482,7 @@ def test_an_unreadable_label_set_fails_loud_instead_of_defaulting_to_round_1(rou
 
 
 # --------------------------------------------------------------------------
-# `Set round labels` — the state machine's one write to the PR, now with a
-# subtraction: a clean `needs-human`-round verdict removes the label itself.
+# `Set round labels` — the round memory's one write to the PR
 # --------------------------------------------------------------------------
 
 
@@ -710,13 +495,13 @@ def labels_script(tmp_path_factory) -> Path:
     called rather than relying on real GitHub state."""
     text = WORKFLOW.read_text()
     start = text.index("          add_label() {")
-    end = text.index("      - name: Report round outcome to the platform")
+    end = text.index("      # ---- tell the platform what this round decided ----")
     body = (
         text[start:end]
         .replace("${{ github.repository }}", "tekflox/aw-app-template")
         .replace("${{ needs.gate.outputs.pr_number }}", "42")
     )
-    assert "remove_label" in body, "extracted the wrong fragment"
+    assert "devteam:reviewed" in body, "extracted the wrong fragment"
     path = tmp_path_factory.mktemp("wf") / "labels.sh"
     path.write_text("set -euo pipefail\n" + body)
     return path
@@ -745,19 +530,6 @@ def _run_labels(
     return proc.stdout, calls
 
 
-def test_round1_findings_add_awaiting_fixes(labels_script, fake_gh, tmp_path):
-    out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="1", findings_count=1)
-    assert "labelled: devteam:awaiting-fixes" in out
-    assert any("-X POST" in c and "/labels" in c for c in calls)
-
-
-def test_round1_findings_write_fix_cycle_before_awaiting_fixes(labels_script, fake_gh, tmp_path):
-    out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="1", findings_count=1)
-    posts = [c for c in calls if "-X POST" in c]
-    assert "labels[]=devteam:fix-cycle" in posts[0], posts
-    assert "labels[]=devteam:awaiting-fixes" in posts[1], posts
-
-
 def _failing_gh(tmp_path, fail_marker: str, live: str = ""):
     """A fake gh that fails exactly the calls whose argv contains fail_marker."""
     bin_dir = tmp_path / "failbin"
@@ -773,165 +545,10 @@ def _failing_gh(tmp_path, fail_marker: str, live: str = ""):
     return bin_dir
 
 
-def test_a_failed_fix_cycle_write_fails_the_step_before_awaiting_fixes(labels_script, tmp_path):
-    bin_dir = _failing_gh(tmp_path, "labels[]=devteam:fix-cycle")
-    log = tmp_path / "gh_calls.log"
-    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "ROUND": "1",
-           "FINDINGS_COUNT": "1", "BLOCKING_COUNT": "0", "GH_TOKEN": "x", "GH_LOG": str(log),
-           "GITHUB_OUTPUT": "/dev/null"}
-    proc = subprocess.run(["bash", str(labels_script)], capture_output=True, text=True, env=env)
-    assert proc.returncode != 0
-    assert "devteam:awaiting-fixes" not in (log.read_text() if log.exists() else "")
-
-
-def test_a_failed_needs_human_write_does_not_report_escalated(labels_script, tmp_path):
-    bin_dir = _failing_gh(tmp_path, "labels[]=devteam:needs-human")
-    outputs = tmp_path / "o"
-    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "ROUND": "2",
-           "FINDINGS_COUNT": "1", "BLOCKING_COUNT": "1", "GH_TOKEN": "x",
-           "GH_LOG": str(tmp_path / "l"), "GITHUB_OUTPUT": str(outputs)}
-    proc = subprocess.run(["bash", str(labels_script)], capture_output=True, text=True, env=env)
-    assert proc.returncode != 0
-    assert "escalated=true" not in (outputs.read_text() if outputs.exists() else "")
-
-
-def test_remove_label_does_not_claim_success_when_the_delete_fails(labels_script, tmp_path):
-    bin_dir = _failing_gh(tmp_path, "-X DELETE")
-    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "ROUND": "needs-human",
-           "FINDINGS_COUNT": "0", "BLOCKING_COUNT": "0", "GH_TOKEN": "x",
-           "GH_LOG": str(tmp_path / "l"), "GITHUB_OUTPUT": "/dev/null"}
-    proc = subprocess.run(["bash", str(labels_script)], capture_output=True, text=True, env=env)
-    assert proc.returncode == 0
-    assert "un-labelled" not in proc.stdout
-    assert "could not remove devteam:needs-human" in proc.stdout + proc.stderr
-
-
-@pytest.mark.parametrize("escalated,expect_event", [("true", "escalate"), ("false", None), ("", None)])
-def test_event_step_escalates_only_when_escalated_is_exactly_true(tmp_path, escalated, expect_event):
-    text = WORKFLOW.read_text()
-    start = text.index('          round="$ROUND"\n          if [ "$round" = "1" ]')
-    end = text.index("          python3 - \"$event\" <<'PYEOF'")
-    body = "\n".join(l[10:] if l.startswith("          ") else l for l in text[start:end].splitlines())
-    path = tmp_path / "ev.sh"
-    path.write_text("set -euo pipefail\n" + body + '\necho "EVENT=$event"\n')
-    env = {**os.environ, "ROUND": "2", "FINDINGS_COUNT": "1", "BLOCKING_COUNT": "1", "ESCALATED": escalated}
-    proc = subprocess.run(["bash", str(path)], capture_output=True, text=True, env=env)
-    assert proc.returncode == 0, proc.stderr
-    got = [l for l in proc.stdout.splitlines() if l.startswith("EVENT=")]
-    assert (got[0] == f"EVENT={expect_event}") if expect_event else not got
-
-
-def test_round2_blocking_adds_needs_human(labels_script, fake_gh, tmp_path):
-    out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="2", blocking_count=1)
-    assert "labelled: devteam:needs-human" in out
-    assert any("-X POST" in c and "/labels" in c for c in calls)
-    assert "un-labelled: devteam:awaiting-fixes" in out  # never write both
-
-
-def test_round2_blocking_with_awaiting_fixes_live_keeps_it_and_does_not_escalate(
-    labels_script, fake_gh, tmp_path
-):
-    outputs = tmp_path / "o"
-    out, calls = _run_labels(
-        labels_script, fake_gh, tmp_path, round_="2", blocking_count=1,
-        live_labels="devteam:awaiting-fixes", outputs=outputs,
-    )
-    assert "labelled: devteam:needs-human" not in out
-    assert not [c for c in calls if "-X POST" in c or "-X DELETE" in c], calls
-    assert "escalated=false" in outputs.read_text()
-
-
-def test_a_fix_push_run_escalates_even_if_the_gate_drop_failed(labels_script, fake_gh, tmp_path):
-    """The label is still live because the drop DELETE failed; the run IS the
-    push, so the coder owes nothing and the blocker must escalate."""
-    outputs = tmp_path / "o"
-    out, _ = _run_labels(
-        labels_script, fake_gh, tmp_path, round_="2", blocking_count=1,
-        live_labels="devteam:awaiting-fixes", outputs=outputs, fix_push="true",
-    )
-    assert "labelled: devteam:needs-human" in out
-    assert "escalated=true" in outputs.read_text()
-
-
-def test_round2_blocking_without_awaiting_fixes_escalates_and_reports_it(
-    labels_script, fake_gh, tmp_path
-):
-    outputs = tmp_path / "o"
-    out, _ = _run_labels(
-        labels_script, fake_gh, tmp_path, round_="2", blocking_count=1,
-        live_labels="devteam:review-1", outputs=outputs,
-    )
-    assert "labelled: devteam:needs-human" in out
-    assert "escalated=true" in outputs.read_text()
-
-
-def test_round2_blocking_escalates_when_the_live_read_fails(labels_script, tmp_path):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    gh = bin_dir / "gh"
-    gh.write_text('#!/bin/bash\nif [[ "$*" == *"-X "* ]]; then exit 0; fi\nexit 1\n')
-    gh.chmod(0o755)
-    outputs = tmp_path / "o"
-    out, _ = _run_labels(
-        labels_script, bin_dir, tmp_path, round_="2", blocking_count=1, outputs=outputs
-    )
-    assert "labelled: devteam:needs-human" in out
-    assert "escalated=true" in outputs.read_text()
-
-
-def test_round1_findings_also_clear_a_stray_needs_human(labels_script, fake_gh, tmp_path):
-    out, _ = _run_labels(labels_script, fake_gh, tmp_path, round_="1", findings_count=1)
-    assert "un-labelled: devteam:needs-human" in out
-
-
-def test_a_clean_needs_human_round_removes_its_own_label(labels_script, fake_gh, tmp_path):
-    """The re-arm: an escalated PR that comes back clean has the label
-    pulled by the review itself, the same re-arm a human removing it by
-    hand would have produced."""
-    out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="needs-human", blocking_count=0)
-    assert "un-labelled: devteam:needs-human" in out
-    deletes = [c for c in calls if "-X DELETE" in c]
-    assert len(deletes) == 1, f"expected exactly one DELETE, got {calls}"
-    assert "labels/devteam%3Aneeds-human" in deletes[0], (
-        "the colon in the label name must be percent-encoded in the URL path "
-        "or GitHub's API 404s on the literal string"
-    )
-
-
-def test_a_still_blocking_needs_human_round_leaves_the_label_alone(labels_script, fake_gh, tmp_path):
-    out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="needs-human", blocking_count=1)
-    assert "no label change" in out
-    assert calls == [], f"no gh call should have been made, got {calls}"
-
-
-def test_a_clean_round1_or_round2_makes_no_label_call(labels_script, fake_gh, tmp_path):
-    for round_ in ("1", "2"):
-        out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_=round_)
-        assert "no label change" in out
-        assert calls == [], f"round {round_}: no gh call should have been made, got {calls}"
-
-
 # --------------------------------------------------------------------------
-# `synchronize` is the fix-cycle rounds' automatic trigger, and ONLY theirs
-# --------------------------------------------------------------------------
-#
-# v1.3.0 adds `synchronize` to the callers' trigger surface so the coder's
-# fix push enters round 2 by itself, replacing a manual `/aw-review`. The
-# budget rationale that kept `synchronize` out for four releases has not
-# changed though: one deep review is a judge run plus up to 3 research runs
-# of real subscription budget, and PR-Agent already reviews every push. So
-# the gate has to refuse a synchronize on round 1 — the author is still
-# iterating, before any review has run, which is the high-volume case that
-# rationale was written for.
-#
-# v1.10.0 admits `needs-human` too. Refusing it was the worse of the two
-# costs: `devteam/code-review` is a per-commit status, so a silently-skipped
-# synchronize leaves the PREVIOUS commit's pass on display, reading as "the
-# escalated finding is resolved" when nothing reviewed the fix at all (hit
-# live on AP-MT PR #72). The window is self-closing — the first clean
-# `blocks_merge` verdict removes the label — and a still-blocking re-run
-# posts no new escalate event, so repeated pushes spend budget but never
-# re-ping a human.
+# `synchronize` carries the coder's fix push: the gate never refuses it on
+# label state. After a completed review 1 it is cleared (bypass) without a
+# second deep review; before one it is reviewed as review 1.
 
 
 @pytest.fixture(scope="module")
@@ -992,8 +609,7 @@ def test_synchronize_drops_awaiting_fixes_and_still_reviews(synchronize_script, 
         synchronize_script, fake_gh, tmp_path, labels="devteam:awaiting-fixes", action="synchronize"
     )
     assert _drops_awaiting_fixes(got), got["_calls"]
-    assert got["round"] == "2" and got["allowed"] == "true"
-    assert got["fix_push"] == "true"
+    assert got["round"] == "1" and got["allowed"] == "true"
 
 
 @pytest.mark.parametrize("action", ["opened", "reopened", "ready_for_review", "created"])
@@ -1021,7 +637,7 @@ def test_a_failed_drop_is_a_warning_not_a_failure(synchronize_script, tmp_path):
     gh.write_text(
         "#!/bin/bash\n"
         'if [[ "$*" == *"-X DELETE"* ]]; then exit 1; fi\n'
-        "printf '%s\\n' devteam:awaiting-fixes\n"
+        'if [[ "$*" == *"/labels"* ]]; then printf "%s\\n" devteam:awaiting-fixes; fi\n'
     )
     gh.chmod(0o755)
     got = _decide_allowed(
@@ -1029,30 +645,6 @@ def test_a_failed_drop_is_a_warning_not_a_failure(synchronize_script, tmp_path):
     )
     assert got["allowed"] == "true"
     assert "::warning::could not drop devteam:awaiting-fixes" in got["_log"]
-
-
-@pytest.mark.parametrize(
-    "labels,expected",
-    [
-        ("devteam:awaiting-fixes", "true"),          # round 2 — the whole point
-        ("", "false"),                               # round 1, author iterating
-        ("bug", "false"),
-        ("devteam:needs-human", "true"),             # escalated: a fix push IS reviewed
-        ("devteam:awaiting-fixes devteam:needs-human", "true"),
-        ("devteam:fix-cycle", "true"),               # durable round memory once awaiting-fixes was dropped
-        ("devteam:review-1", "false"),               # ceiling counter only: round 1, refused
-        ("devteam:review-capped", "false"),          # not a counter label
-    ],
-)
-def test_synchronize_is_admitted_on_the_fix_cycle_rounds_only(
-    synchronize_script, fake_gh, tmp_path, labels, expected
-):
-    got = _decide_allowed(
-        synchronize_script, fake_gh, tmp_path, labels=labels, action="synchronize"
-    )
-    assert got["allowed"] == expected, (
-        f"synchronize on labels {labels!r} -> allowed={got['allowed']}\n{got['_log']}"
-    )
 
 
 @pytest.mark.parametrize("action", ["opened", "reopened", "ready_for_review"])
@@ -2526,10 +2118,8 @@ def _run_report_round(
         "PR_NUMBER": "42",
         "HEAD_SHA": "a" * 40,
         "ROUND": round_,
-        "ESCALATED": "true",  # the label step wrote needs-human
         "FINDINGS_COUNT": str(len(findings)),
         "BLOCKING_COUNT": str(len(blocking)),
-        "MISSING_BLOCKS_MERGE": "0",
         "ELIGIBLE": "true" if not blocking else "false",
         "PR_URL": "https://github.com/tekflox/aw-app-template/pull/42",
         "RUNNER_TEMP": str(tmp_path),
@@ -2557,66 +2147,6 @@ def test_a_round1_clean_pr_sends_cleared_with_an_empty_digest(
     assert sent["head_sha"] == "a" * 40
 
 
-def test_a_round2_clean_pr_sends_cleared_with_the_leftover_digest(
-    report_round_script, tmp_path, fake_curl
-):
-    """Round 2 clean (no finding blocks the merge) still carries whatever
-    non-blocking findings survived, `blocks_merge` flags and all — that is
-    precisely what the close-gate files as low/medium Backlog cards."""
-    leftovers = [HIGH_NON_BLOCKING, MINOR]
-    sent = _run_report_round(
-        report_round_script, tmp_path, fake_curl,
-        findings=leftovers, blocking=[], counts={"high": 1, "low": 1}, round_="2",
-    )
-    assert sent["event"] == "cleared"
-    assert len(sent["findings"]) == 2
-    assert {f["blocks_merge"] for f in sent["findings"] if "blocks_merge" in f} == {False}
-    assert sent["blocking"] == []
-
-
-@pytest.mark.parametrize(
-    "round_,findings,blocking,expected_event",
-    [
-        ("1", [MINOR], [], "findings"),  # unchanged: round 1 with findings wakes the coder
-        ("2", [MEDIUM_BLOCKING], [MEDIUM_BLOCKING], "escalate"),  # unchanged: round 2 blocking
-    ],
-)
-def test_non_eligible_rounds_are_unaffected_by_the_cleared_change(
-    report_round_script, tmp_path, fake_curl, round_, findings, blocking, expected_event
-):
-    sent = _run_report_round(
-        report_round_script, tmp_path, fake_curl,
-        findings=findings, blocking=blocking, counts={"x": 1}, round_=round_,
-    )
-    assert sent["event"] == expected_event
-
-
-def test_needs_human_round_sends_cleared_when_it_clears(report_round_script, tmp_path, fake_curl):
-    """The platform-event half of the re-arm: a clean `needs-human` round
-    reports exactly like any other eligible round, so the close-gate's
-    head_sha lookup finds it the same way."""
-    sent = _run_report_round(
-        report_round_script, tmp_path, fake_curl,
-        findings=[], blocking=[], counts={}, round_="needs-human",
-    )
-    assert sent["event"] == "cleared"
-    assert sent["round"] == "needs-human"
-
-
-def test_needs_human_round_still_blocking_sends_no_new_event(
-    report_round_script, tmp_path, fake_curl
-):
-    """`escalate` already fired on the round that set the label — a repeat
-    push/`/aw-review` that is still blocking must not re-ping a human who
-    already knows."""
-    sent = _run_report_round(
-        report_round_script, tmp_path, fake_curl,
-        findings=[MEDIUM_BLOCKING], blocking=[MEDIUM_BLOCKING], counts={"medium": 1},
-        round_="needs-human",
-    )
-    assert sent == {}, f"expected nothing posted, got {sent}"
-
-
 def test_an_unset_secret_still_skips_cleanly_without_posting(
     report_round_script, tmp_path, fake_curl
 ):
@@ -2637,7 +2167,6 @@ def test_an_unset_secret_still_skips_cleanly_without_posting(
         "ROUND": "1",
         "FINDINGS_COUNT": "0",
         "BLOCKING_COUNT": "0",
-        "MISSING_BLOCKS_MERGE": "0",
         "ELIGIBLE": "true",
         "PR_URL": "https://github.com/tekflox/aw-app-template/pull/42",
         "RUNNER_TEMP": str(tmp_path),
@@ -2772,25 +2301,6 @@ def _assert_rejected(proc, tmp_path):
     assert (tmp_path / "gh_output").read_text() == ""
 
 
-@pytest.mark.parametrize("round_", ["2", "needs-human"])
-@pytest.mark.parametrize("bad", [None, "false", 0, 1, "true", []])
-def test_blocks_merge_must_be_a_json_boolean(eligibility_script, tmp_path, fake_gh, round_, bad):
-    finding = {**MINOR, "blocks_merge": bad}
-    proc = _run_raw_content(
-        eligibility_script, tmp_path, fake_gh,
-        json.dumps({"findings": [finding], "counts": {"low": 1}}), round_=round_,
-    )
-    _assert_rejected(proc, tmp_path)
-
-
-def test_blocks_merge_booleans_still_work(eligibility_script, tmp_path, fake_gh):
-    got = _run_eligibility(
-        eligibility_script, tmp_path, fake_gh,
-        findings=[HIGH_NON_BLOCKING], counts={"high": 1}, round_="2",
-    )
-    assert got["eligible"] == "true"
-
-
 @pytest.mark.parametrize("findings,counts", [
     ([], {"high": 1}),
     ([], {"low": 2}),
@@ -2801,7 +2311,7 @@ def test_blocks_merge_booleans_still_work(eligibility_script, tmp_path, fake_gh)
     ([MINOR], {"low": True}),
     ([MINOR], {"low": -1}),
 ])
-@pytest.mark.parametrize("round_", ["1", "2"])
+@pytest.mark.parametrize("round_", ["1", "informational"])
 def test_counts_that_contradict_findings_are_rejected(
     eligibility_script, tmp_path, fake_gh, findings, counts, round_,
 ):
@@ -2898,6 +2408,36 @@ def test_a_rejected_verdict_publishes_failure_and_never_eligibility(
     assert "state=success" not in calls
     assert "merge-eligible" not in calls
     assert not any("merge-eligible" in c for c in _gh_calls(tmp_path))
+
+
+@pytest.mark.parametrize("round_,context", [
+    ("informational", "devteam/code-review-advisory"),
+    ("1", "devteam/code-review"),
+    ("bypass", "devteam/code-review"),
+])
+def test_an_informational_review_never_writes_the_merge_authorizing_context(
+    tmp_path, fake_gh, round_, context,
+):
+    script = tmp_path / "publish.sh"
+    script.write_text(_extract_run("Publish code-review status"))
+    log = tmp_path / "publish.log"
+    env = {
+        **os.environ, "PATH": f"{fake_gh}{os.pathsep}{os.environ['PATH']}",
+        "GH_LOG": str(log), "GH_TOKEN": "fake", "ROUND": round_, "MODE": "review",
+        "DISPATCH_OUTCOME": "success", "FINDINGS_OUTCOME": "success", "DESC": "clean",
+    }
+    subprocess.run(["bash", str(script)], check=True, capture_output=True, text=True, env=env)
+    calls = log.read_text()
+    assert f"context={context}" in calls
+    if round_ == "informational":
+        assert "context=devteam/code-review " not in calls and "context=devteam/code-review\n" not in calls
+
+
+def test_the_pending_status_of_an_informational_run_is_advisory_too():
+    text = WORKFLOW.read_text()
+    step = text[text.index("      - name: Mark code review pending"):text.index("      # Agent-scoped Agents Platform ApiKey")]
+    assert "round == 'informational' && 'devteam/code-review-advisory'" in step
+    assert "devteam/code-review-advisory" in text[text.index("ADVISORY = {"):text.index("ADVISORY = {") + 400]
 
 
 # --------------------------------------------------------------------------
@@ -3016,16 +2556,6 @@ def test_a_single_fence_with_prose_around_it_still_parses(eligibility_script, tm
     assert proc.returncode == 0, proc.stderr
 
 
-@pytest.mark.parametrize("round_", ["2", "needs-human"])
-def test_duplicate_blocks_merge_keys_are_rejected(eligibility_script, tmp_path, fake_gh, round_):
-    content = (
-        '{"findings": [{"severity": "high", "title": "t", "blocks_merge": true, '
-        '"blocks_merge": false}], "counts": {"high": 1}}'
-    )
-    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content, round_=round_)
-    _assert_rejected(proc, tmp_path)
-
-
 @pytest.mark.parametrize("content", [
     '{"findings": [], "counts": {}, "findings": []}',
     '{"findings": [], "counts": {"high": 0, "high": 0}}',
@@ -3092,7 +2622,7 @@ def test_non_canonical_count_keys_are_rejected(eligibility_script, tmp_path, fak
     high = {**HIGH_NON_BLOCKING}
     proc = _run_raw_content(
         eligibility_script, tmp_path, fake_gh,
-        json.dumps({"findings": [high], "counts": counts}), round_="2",
+        json.dumps({"findings": [high], "counts": counts}), round_="1",
     )
     _assert_rejected(proc, tmp_path)
 
@@ -3178,9 +2708,9 @@ _PR46_REAL = (
     "Returns `{}` or `[]` on a miss, `[1, 2]` otherwise.\n" + _EMPTY + "\n}",
 ])
 def test_a_verdict_is_found_among_prose_braces(eligibility_script, tmp_path, fake_gh, content):
-    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content, round_="2")
+    proc = _run_raw_content(eligibility_script, tmp_path, fake_gh, content, round_="1")
     assert proc.returncode == 0, proc.stderr
-    assert any("statuses" in c for c in _gh_calls(tmp_path))
+    assert "findings_count=" in (tmp_path / "gh_output").read_text()
 
 
 def test_the_pr46_verdict_keeps_its_finding(eligibility_script, tmp_path, fake_gh):
@@ -3307,50 +2837,17 @@ def _st(state, desc, ctx="devteam/code-review"):
     return {"context": ctx, "state": state, "description": desc}
 
 
-def test_first_needs_human_push_is_reviewed_and_stamped(gate_tail_script, cap_gh, tmp_path):
-    _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="needs-human",
-                          labels="devteam:needs-human")
-    assert "allowed=true" in out
-    assert any("labels[]=devteam:review-capped" in c for c in calls)
-
-
-def test_second_needs_human_push_is_refused(gate_tail_script, cap_gh, tmp_path):
-    _, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="needs-human",
-                      labels="devteam:needs-human\ndevteam:review-capped")
-    assert "allowed=false" in out and "allowed=true" not in out
-
-
-def test_aw_review_comment_rearms_the_cap_and_still_reviews(gate_tail_script, cap_gh, tmp_path):
-    _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="needs-human",
-                          action="created", labels="devteam:needs-human\ndevteam:review-capped")
-    assert "allowed=true" in out
-    assert any("-X DELETE" in c and "review-capped" in c for c in calls)
-
-
-def test_a_failed_stamp_write_fails_open_to_review(gate_tail_script, cap_gh, tmp_path):
-    _, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="needs-human",
-                      labels="devteam:needs-human", label_post_fail=True)
-    assert "allowed=true" in out
-
-
 def test_unchanged_sha_round_mode_reuses_the_verdict(gate_tail_script, cap_gh, tmp_path):
     _, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="created",
                       statuses=[_st("success", "2 findings [rk r=1 m=review]")])
     assert "allowed=false" in out and "allowed=true" not in out
 
 
-def test_v2_verdict_reuse_restores_a_missing_reviewed_label(gate_tail_script, cap_gh, tmp_path, monkeypatch):
-    monkeypatch.setenv("LIFECYCLE", "v2")
+def test_verdict_reuse_restores_a_missing_reviewed_label(gate_tail_script, cap_gh, tmp_path):
     _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="created",
                           statuses=[_st("success", "1 finding [rk r=1 m=review]")])
     assert "allowed=false" in out
     assert any("-X POST" in c and "labels[]=devteam:reviewed" in c for c in calls), calls
-
-
-def test_v1_verdict_reuse_writes_no_label(gate_tail_script, cap_gh, tmp_path):
-    _, _, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="created",
-                        statuses=[_st("success", "1 finding [rk r=1 m=review]")])
-    assert not any("devteam:reviewed" in c for c in calls), calls
 
 
 @pytest.mark.parametrize("case", ["round", "mode", "failure", "pending", "eligible", "unstamped", "lookup"])
@@ -3378,48 +2875,10 @@ def test_reuse_never_applies_when_any_key_part_differs_or_lookup_is_unsafe(
     assert "allowed=true" in out, case
 
 
-@pytest.mark.parametrize("case", [
-    "r2_then_needs_human", "needs_human_then_r2", "blocking_then_improve",
-    "blocking_then_error", "blocking_then_pending", "eligible", "other_sha", "round1_exact",
-])
-def test_lenient_lens_is_one_reuse_class(gate_tail_script, cap_gh, tmp_path, case):
-    """Round 2 and needs-human share a lens: a completed non-eligible verdict
-    from either blocks any further lenient-lens review of the same sha."""
-    blocked = "x [rk r=2 m=review]"
-    cur = "needs-human"
-    sts, expect = [_st("success", blocked)], "false"
-    if case == "needs_human_then_r2":
-        sts, cur = [_st("success", "x [rk r=needs-human m=review]")], "2"
-    elif case == "blocking_then_improve":
-        sts = [_st("success", "y [rk r=1 m=improve]"), _st("success", blocked)]
-    elif case == "blocking_then_error":
-        sts = [_st("error", "code review cancelled"), _st("failure", "failed"), _st("success", blocked)]
-    elif case == "blocking_then_pending":
-        sts = [_st("pending", "in progress"), _st("success", blocked)]
-    elif case == "eligible":
-        sts, expect = [_st("success", "cleared", "devteam/merge-eligible"), _st("success", blocked)], "true"
-    elif case == "other_sha":
-        sts, expect = [], "true"  # statuses are per-sha: a new head has none
-    elif case == "round1_exact":
-        sts, cur, expect = [_st("success", "x [rk r=1 m=review]")], "2", "true"
-    _, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_=cur, action="created",
-                      labels="devteam:needs-human", statuses=sts)
-    assert f"allowed={expect}" in out, (case, out)
-
-
 def test_reuse_log_names_the_reused_round(gate_tail_script, cap_gh, tmp_path):
-    proc, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="needs-human", action="created",
-                         labels="devteam:needs-human", statuses=[_st("success", "x [rk r=2 m=review]")])
-    assert "allowed=false" in out and "round=2" in proc.stdout, proc.stdout
-
-
-def test_aw_improve_never_rearms_the_cap(gate_tail_script, cap_gh, tmp_path):
-    """/aw-improve is not a review round: it must not clear the cap stamp."""
-    _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="informational",
-                          action="created", mode="improve",
-                          labels="devteam:needs-human\ndevteam:review-capped")
-    assert "allowed=true" in out, "a fresh /aw-improve must still reach dispatch"
-    assert not any("-X DELETE" in c and "review-capped" in c for c in calls), calls
+    proc, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="created",
+                         statuses=[_st("success", "x [rk r=1 m=review]")])
+    assert "allowed=false" in out and "round=1" in proc.stdout, proc.stdout
 
 
 # --------------------------------------------------------------------------
@@ -3455,7 +2914,7 @@ def ceil_gh(tmp_path_factory) -> Path:
 
 
 def _ceil(script, ceil_gh, tmp_path, *, used=0, max_reviews="3", labels="", action="created",
-          round_="needs-human", mode="review", timeline_fail=False, label_post_fail=False):
+          round_="1", mode="review", timeline_fail=False, label_post_fail=False):
     tl = tmp_path / "timeline"
     if not tl.exists():
         tl.write_text("ev\n" * used)
@@ -3516,11 +2975,18 @@ def test_exhausted_marker_is_stamped_only_after_delivery():
     assert step.index("context=devteam/review-cap") < step.index("labels[]=devteam:review-exhausted")
 
 
+def test_the_ceiling_escalate_event_does_not_promise_a_nudge():
+    # No nudge job exists any more. nudge_follows=true makes the platform only
+    # STORE an escalate event, so nobody would ever be told the budget ran out.
+    text = WORKFLOW.read_text()
+    step = text[text.index("      - name: Report review ceiling"):text.index("  code-review:\n    needs: gate")]
+    assert '"event": "escalate"' in step
+    assert '"nudge_follows": False' in step and '"nudge_follows": True' not in step
+
+
 @pytest.mark.parametrize("action,round_", [
-    ("created", "needs-human"),      # a coder/anyone running /aw-review
-    ("synchronize", "needs-human"),
-    ("synchronize", "2"),
-    ("created", "1"),
+    ("created", "1"),      # a coder/anyone running /aw-review
+    ("synchronize", "1"),
 ])
 def test_no_trigger_and_no_label_state_overrides_the_ceiling(
     gate_tail_script, ceil_gh, tmp_path, action, round_
@@ -3536,7 +3002,7 @@ def test_pr15_replay_yields_at_most_max_reviews_dispatches(gate_tail_script, cei
     stripped between each one. Dispatches must stop at the ceiling."""
     allowed = 0
     for i in range(12):
-        action, round_ = ("created", "needs-human") if i % 2 else ("synchronize", "needs-human")
+        action, round_ = ("created", "1") if i % 2 else ("synchronize", "1")
         (tmp_path / "calls.log").write_text("")
         _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0, labels="",
                           action=action, round_=round_)
@@ -3574,17 +3040,6 @@ def test_zero_disables_the_ceiling_and_garbage_falls_back_to_three(gate_tail_scr
         (tmp_path / "timeline").unlink()
         _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=3, max_reviews=bad)
         assert out.get("capped") == "true", bad
-
-
-def test_free_refusals_do_not_spend_budget(gate_tail_script, ceil_gh, tmp_path):
-    """An unchanged-verdict reuse refuses BEFORE the ceiling, so it must
-    neither stamp a label nor count."""
-    # gate_tail's own `gh .../statuses` stub returns []; use a synchronize on
-    # round 1 instead: refused by the earlier guard, no ceiling work at all.
-    _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0, action="synchronize",
-                          round_="1")
-    assert out["allowed"] == "false" and "capped" not in out
-    assert not any("labels[]=devteam:review-" in c for c in calls)
 
 
 def test_the_ceiling_status_is_advisory_to_the_merge_job():
@@ -3632,10 +3087,10 @@ def test_the_drop_happens_even_when_the_push_is_then_refused(
             "allowlist=x\n" + gate_tail_script.read_text().replace("is_trusted() { return 0; }", "is_trusted() { return 1; }")
         )
     elif case == "reused":
-        kw["statuses"] = [_st("success", "x [rk r=2 m=review]")]
+        kw["statuses"] = [_st("success", "x [rk r=1 m=review]")]
     else:
         gh_dir = ceiling_gh
-    proc, out, calls = _gate(script, gh_dir, tmp_path, round_="2", labels="devteam:awaiting-fixes", **kw)
+    proc, out, calls = _gate(script, gh_dir, tmp_path, round_="1", labels="devteam:awaiting-fixes", **kw)
     assert "allowed=false" in out, proc.stdout + proc.stderr + out
     assert any("-X DELETE" in c and "labels/devteam%3Aawaiting-fixes" in c for c in calls), calls
 
@@ -3767,13 +3222,6 @@ def test_nudge_run_id_is_empty_with_only_a_card_label(nudge_script, nudge_bin, t
     assert posts[0]["run_id"] == ""
 
 
-def test_nudge_reports_the_last_needs_human_labeler(nudge_script, nudge_bin, tmp_path):
-    events = '{"login": "bot1", "type": "Bot"}\n{"login": "frederico", "type": "User"}\n'
-    _, _, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, events=events,
-                             labels=("aw-run:" + "r" * 32, "devteam:needs-human"))
-    assert posts[0]["needs_human_actor"] == {"login": "frederico", "type": "User"}
-
-
 @pytest.mark.parametrize("case", ["closed", "merged", "no_agent_label", "label_wrong",
                                   "label_gone", "no_pr", "no_secret"])
 def test_nudge_skips_quietly_and_never_posts(nudge_script, nudge_bin, tmp_path, case):
@@ -3899,19 +3347,6 @@ def test_nudge_workflow_is_continue_on_error_and_bounded_with_no_checkout():
     assert "event_url" in code and "https://agents-platform.aw.tekflox.com" in code
 
 
-def test_the_review_workflow_ends_with_a_nudge_job_that_waits_for_everything():
-    text = WORKFLOW.read_text()
-    job = _code_only(_job(text, "nudge"))
-    assert "devteam-nudge-reusable.yml@master" in job
-    assert "needs: [gate, code-review, provenance-gate, merge-attempt]" in job
-    assert "always()" in job and "github.event.action != 'closed'" in job
-    assert "github.event.sender.type != 'Bot'" in job
-    for kind in ("ci_done", "review_done", "comment", "push_unreviewed"):
-        assert f"'{kind}'" in job
-    assert "needs.merge-attempt.outputs.pr_number" in job
-    assert "AW_DEVTEAM_EVENT_SECRET: ${{ secrets.AW_DEVTEAM_EVENT_SECRET }}" in job
-
-
 def test_merge_attempt_exposes_the_pr_it_resolves_and_the_nudge_is_advisory():
     text = WORKFLOW.read_text()
     assert "pr_number: ${{ steps.merge.outputs.pr_number }}" in _job(text, "merge-attempt")
@@ -3919,16 +3354,6 @@ def test_merge_attempt_exposes_the_pr_it_resolves_and_the_nudge_is_advisory():
     assert 'pr_number={pr_number}' in src and "GITHUB_OUTPUT" in src
     advisory = src[src.index("ADVISORY = {"):src.index("}", src.index("ADVISORY = {"))]
     assert '"nudge"' in advisory and '"devteam-nudge"' in advisory
-
-
-def test_the_review_event_payloads_announce_that_a_nudge_follows():
-    report = _extract_heredoc("- name: Report round outcome to the platform")
-    cap = _extract_heredoc("python3 - <<'PYEOF'\n          import hashlib, hmac, json, os, subprocess\n          TMP")
-    assert '"nudge_follows": True' in report
-    assert '"nudge_follows": True' in cap
-    # the merged event is untouched
-    merged = _extract_heredoc("- name: Report the merge to the platform")
-    assert "nudge_follows" not in merged
 
 
 def test_the_reference_label_caller_matches_the_design():
@@ -3962,35 +3387,9 @@ def test_ceiling_jq_counts_both_label_families():
     assert 'test("^(devteam:review-|review-count:)[0-9]+$")' in src
 
 # --------------------------------------------------------------------------
-# QA rework (card 41e5bf3b): the legacy cap's refusal must not bypass the
-# ceiling report, and escalation delivery is tracked apart from the comment.
+# QA rework (card 41e5bf3b): escalation delivery is tracked apart from the
+# comment.
 # --------------------------------------------------------------------------
-
-_LEGACY = "devteam:needs-human\ndevteam:review-capped"
-
-
-def test_legacy_cap_refusal_on_an_exhausted_budget_is_surfaced(gate_tail_script, ceil_gh, tmp_path):
-    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=3, labels=_LEGACY,
-                             action="synchronize")
-    assert out["allowed"] == "false" and out["capped"] == "true", proc.stdout + proc.stderr
-    assert out["first_cap"] == "true" and out["review_count"] == "3"
-    assert not any("labels[]=review-count:4" in c for c in calls)
-
-
-def test_legacy_cap_refusal_with_budget_left_stays_free_and_uncharged(gate_tail_script, ceil_gh, tmp_path):
-    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=1, labels=_LEGACY,
-                             action="synchronize")
-    assert out["allowed"] == "false" and "capped" not in out, proc.stdout + proc.stderr
-    assert not any("labels[]=review-count:" in c for c in calls), calls
-
-
-@pytest.mark.parametrize("kw", [{"timeline_fail": True}, {"max_reviews": "0"}])
-def test_legacy_cap_refusal_holds_when_the_ceiling_cannot_decide(gate_tail_script, ceil_gh, tmp_path, kw):
-    _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0, labels=_LEGACY,
-                          action="synchronize", **kw)
-    assert out["allowed"] == "false", kw
-    assert not any("labels[]=review-count:" in c for c in calls), calls
-
 
 def test_gate_reports_whether_the_escalation_was_already_delivered(gate_tail_script, ceil_gh, tmp_path):
     _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=3)
@@ -4027,7 +3426,7 @@ def _report(script, tmp_path, *, first="true", escalated="false", http="200", se
         **os.environ, "PATH": f"{d}{os.pathsep}{os.environ['PATH']}",
         "GH_LOG": str(tmp_path / "calls.log"), "RUNNER_TEMP": str(tmp_path),
         "AW_DEVTEAM_EVENT_SECRET": secret, "EVENT_URL": "http://ev.invalid", "REPO": "o/r",
-        "PR_NUMBER": "7", "HEAD_SHA": "abcdef1234", "ROUND": "needs-human", "USED": "3",
+        "PR_NUMBER": "7", "HEAD_SHA": "abcdef1234", "ROUND": "1", "USED": "3",
         "MAX": "3", "FIRST": first, "ESCALATED": escalated, "PR_URL": "u", "RUN_URL": "r",
     }
     proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
@@ -4106,16 +3505,12 @@ def test_nudge_does_not_stamp_escalated_without_the_exhausted_label(nudge_script
 # lifecycle v2 (Kanban 41f5bf3b): one blocking review, later pushes merge
 # --------------------------------------------------------------------------
 
-V2_ENV = {"LIFECYCLE": "v2", "BLOCK_SEVERITY": "medium"}
-
-
 def _run_eligibility_v2(script, tmp_path, fake_gh, findings, monkeypatch, round_="1", is_draft="false"):
     counts: dict = {}
     for f in findings:
         sev = str(f.get("severity", "info")).lower()
         counts[sev] = counts.get(sev, 0) + 1
-    for k, v in V2_ENV.items():
-        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("BLOCK_SEVERITY", "medium")
     return _run_eligibility(script, tmp_path, fake_gh, findings=findings, counts=counts,
                             round_=round_, is_draft=is_draft)
 
@@ -4145,8 +3540,7 @@ def test_v2_review1_missing_or_unknown_severity_fails_closed(eligibility_script,
         f = {"title": "x", "body": "x", **({} if sev is None else {"severity": sev})}
         # the verdict validator lowercases a missing severity to "info"
         # for the tally, so give it a consistent counts object
-        for k, v in V2_ENV.items():
-            monkeypatch.setenv(k, v)
+        monkeypatch.setenv("BLOCK_SEVERITY", "medium")
         got = _run_eligibility(eligibility_script, tmp_path, fake_gh, findings=[f],
                                counts={str(f.get("severity", "info")).lower(): 1}, round_="1")
         if sev is None:
@@ -4161,25 +3555,10 @@ def test_v2_a_draft_is_still_never_eligible(eligibility_script, tmp_path, fake_g
     assert got["eligible"] == "false"
 
 
-def test_v1_default_still_blocks_on_any_finding(eligibility_script, tmp_path, fake_gh):
-    got = _run_eligibility(eligibility_script, tmp_path, fake_gh, findings=[MINOR],
-                           counts={"low": 1}, round_="1")
-    assert got["eligible"] == "false"
-
-
-def _v2_labels(labels_script, fake_gh, tmp_path, **kw):
-    # `_run_labels` has no LIFECYCLE knob; add it through the environment.
-    os.environ["LIFECYCLE"] = "v2"
-    try:
-        return _run_labels(labels_script, fake_gh, tmp_path, **kw)
-    finally:
-        del os.environ["LIFECYCLE"]
-
-
 @pytest.mark.parametrize("findings,blocking", [(0, 0), (1, 0), (2, 1)])
 def test_v2_every_completed_review1_writes_reviewed_and_nothing_else(
         labels_script, fake_gh, tmp_path, findings, blocking):
-    out, calls = _v2_labels(labels_script, fake_gh, tmp_path, round_="1",
+    out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="1",
                             findings_count=findings, blocking_count=blocking)
     posts = [c for c in calls if "-X POST" in c]
     assert len(posts) == 1 and "labels[]=devteam:reviewed" in posts[0], posts
@@ -4189,16 +3568,22 @@ def test_v2_every_completed_review1_writes_reviewed_and_nothing_else(
 def test_v2_no_reviewed_label_when_the_round1_status_publish_failed(labels_script, fake_gh, tmp_path):
     os.environ["PUBLISH_OUTCOME"] = "failure"
     try:
-        out, calls = _v2_labels(labels_script, fake_gh, tmp_path, round_="1", findings_count=1, blocking_count=1)
+        out, calls = _run_labels(labels_script, fake_gh, tmp_path, round_="1", findings_count=1, blocking_count=1)
     finally:
         del os.environ["PUBLISH_OUTCOME"]
     assert not [c for c in calls if "-X POST" in c], calls
     assert "labelled: devteam:reviewed" not in out
 
 
-def test_v2_labels_nothing_on_an_informational_run(labels_script, fake_gh, tmp_path):
-    _, calls = _v2_labels(labels_script, fake_gh, tmp_path, round_="informational", findings_count=1)
-    assert not [c for c in calls if "-X POST" in c]
+def test_labels_and_event_steps_run_on_review_1_only():
+    """The label write and the platform event are gated on round 1 in the step
+    `if:` (bypass and informational runs write nothing)."""
+    code = _code_only(WORKFLOW.read_text())
+    for name in ("- name: Set round labels", "- name: Report round outcome to the platform"):
+        step = code[code.index(name):]
+        cond = step[:step.index("env:")]
+        assert "needs.gate.outputs.round == '1'" in cond, name
+        assert "'2'" not in cond and "needs-human" not in cond, name
 
 
 @pytest.fixture(scope="module")
@@ -4208,16 +3593,14 @@ def bypass_script(tmp_path_factory) -> Path:
     and the caps, which have their own tests)."""
     text = WORKFLOW.read_text()
     a = text.index("# ---- round, from the PR's LIVE labels ----")
-    b = text.index("          # lifecycle v2 round memory")
-    c = text.index("          # lifecycle v2 bypass")
+    b = text.index("          # Round memory (see the DECIDE note above this step).")
+    c = text.index("          # Bypass (see the DECIDE note above this step).")
     d = text.index("          # ---- (2) reuse the verdict")
     labels_fetch = text[a:b]
     reviewed = text[b:text.index("          if [ \"$mode\" = \"improve\" ]; then", b)]
     chain_start = text.index("          if [ \"$mode\" = \"improve\" ]; then", b)
     chain_end = text.index('          echo "round=$round', chain_start)
     chain = text[chain_start:chain_end]
-    # only the v2 arm of the chain matters here; cut the legacy arms
-    chain = chain[:chain.index("          elif has_label \"devteam:awaiting-fixes\"")] + "          fi\n"
     body = (labels_fetch + reviewed + chain + text[c:d])
     for k, v in {
         "${{ github.repository }}": "o/r", "${{ github.event_name }}": "${EVENT_NAME}",
@@ -4261,7 +3644,7 @@ def _run_bypass(script, v2_gh, tmp_path, *, timeline="0", event="pull_request", 
     out = tmp_path / "out"
     out.write_text("")
     log = tmp_path / "ghlog"
-    env = {**os.environ, "PATH": f"{v2_gh}{os.pathsep}{os.environ['PATH']}", "LIFECYCLE": "v2",
+    env = {**os.environ, "PATH": f"{v2_gh}{os.pathsep}{os.environ['PATH']}",
            "GH_LOG": str(log), "FAKE_TIMELINE": timeline, "FAKE_VERDICT": verdict, "EVENT_NAME": event, "MODE_IN": mode,
            "DRAFT": draft, "OUT": str(out), "GH_TOKEN": "x"}
     proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
@@ -4320,40 +3703,6 @@ def test_v2_an_unreadable_timeline_fails_closed(bypass_script, v2_gh, tmp_path):
     assert not [c for c in calls if "/statuses/" in c]
 
 
-def test_v2_only_a_bot_written_label_counts_as_review1_memory():
-    text = WORKFLOW.read_text()
-    i = text.index("# lifecycle v2 round memory")
-    frag = text[i:i + 1800]
-    assert 'actor.login=="github-actions[bot]"' in frag
-    assert '"devteam:reviewed","devteam:fix-cycle"' in frag
-
-
-def test_v2_wiring_blocking_step_is_last_and_bypass_reaches_merge_attempt():
-    text = WORKFLOW.read_text()
-    code = _code_only(text)
-    assert "inputs.lifecycle" in code and "default: 'v1'" in code
-    fail = code.index("- name: Fail the job on a blocking review 1 (lifecycle v2)")
-    for earlier in ("- name: Publish code-review status", "- name: Set round labels",
-                    "- name: Report round outcome to the platform"):
-        assert code.index(earlier) < fail
-    assert code.index("  provenance-gate:") > fail, "the red step must close the code-review job"
-    ma = code[code.index("  merge-attempt:"):]
-    assert "needs.gate.outputs.bypass == 'true'" in ma[:ma.index("steps:")]
-    pg = code[code.index("  provenance-gate:"):]
-    assert "needs.gate.outputs.bypass == 'true'" in pg[:pg.index("steps:")]
-    nudge = code[code.index("  nudge:"):]
-    assert "inputs.lifecycle != 'v2'" in nudge[:nudge.index("uses:")]
-
-
-def test_v2_the_check_status_stays_success_when_the_job_goes_red():
-    """The job fails via a final step, never by writing a failure status:
-    the gate's reuse check reads state==success to avoid a paid re-dispatch."""
-    text = WORKFLOW.read_text()
-    i = text.index("- name: Fail the job on a blocking review 1 (lifecycle v2)")
-    step = text[i:i + 900]
-    assert "statuses" not in step and "exit 1" in step
-
-
 def test_no_run_script_exceeds_githubs_21000_char_limit():
     """GitHub rejects a `run:` over 21,000 characters as a bare 'workflow file
     issue' (no job, no log): lifecycle v2's first cut put `Decide` at 21,496
@@ -4381,3 +3730,250 @@ def test_every_label_read_paginates():
     for pos in reads:
         window = text[pos:pos + 120]
         assert window.index("--paginate") < window.index("--jq"), text[pos - 40:pos + 120]
+
+
+# --------------------------------------------------------------------------
+# ONE lifecycle (no opt-in): the `lifecycle` input is deprecated and ignored,
+# `devteam:needs-human` is never written or read and a stray one is deleted.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def timeline_gh(tmp_path):
+    """fake gh: `/labels` -> $FAKE_LABELS, `/timeline` -> N `devteam:reviewed`
+    lines (the bot-written label events), everything else logged and exit 0."""
+    bin_dir = tmp_path / "tlbin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$*" >> "${GH_LOG:-/dev/null}"\n'
+        'if [[ "$*" == *"/timeline"* ]]; then\n'
+        '  n=${FAKE_TIMELINE:-0}; for i in $(seq 1 $n); do echo devteam:reviewed; done; exit 0\n'
+        "fi\n"
+        'if [[ "$*" == *"/labels"* && "$*" != *"-X "* ]]; then printf "%s\\n" $FAKE_LABELS; exit 0; fi\n'
+        "exit 0\n"
+    )
+    gh.chmod(0o755)
+    return bin_dir
+
+
+def _round(script, gh_dir, *, labels="", timeline="0", event="pull_request", mode="review",
+           extra_env=None):
+    env = {
+        **os.environ, **(extra_env or {}),
+        "PATH": f"{gh_dir}{os.pathsep}{os.environ['PATH']}",
+        "MODE_IN": mode, "FAKE_LABELS": labels, "FAKE_TIMELINE": timeline,
+        "EVENT_NAME": event, "EVENT_ACTION": "synchronize", "GH_TOKEN": "x",
+    }
+    proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    got = [l.split("=", 1)[1] for l in proc.stdout.splitlines() if l.startswith("FINAL_ROUND=")]
+    return proc.returncode, (got[0] if got else None)
+
+
+@pytest.mark.parametrize("labels,timeline,event,mode,expected", [
+    ("", "0", "pull_request", "review", "1"),
+    ("bug", "0", "pull_request", "review", "1"),
+    ("devteam:awaiting-fixes", "0", "pull_request", "review", "1"),
+    # a stray needs-human is not state any more
+    ("devteam:needs-human", "0", "pull_request", "review", "1"),
+    ("devteam:needs-human", "1", "pull_request", "review", "bypass"),
+    # hand-added round memory is not memory: only the bot's timeline event is
+    ("devteam:fix-cycle", "0", "pull_request", "review", "1"),
+    ("devteam:reviewed", "0", "pull_request", "review", "1"),
+    ("", "1", "pull_request", "review", "bypass"),
+    ("devteam:awaiting-fixes devteam:needs-human", "2", "pull_request", "review", "bypass"),
+    ("", "1", "issue_comment", "review", "informational"),
+    ("", "1", "issue_comment", "improve", "informational"),
+    ("", "0", "issue_comment", "improve", "informational"),
+])
+def test_round_comes_only_from_the_bot_written_review_memory(
+    round_script, timeline_gh, labels, timeline, event, mode, expected
+):
+    rc, round_ = _round(round_script, timeline_gh, labels=labels, timeline=timeline,
+                        event=event, mode=mode)
+    assert rc == 0 and round_ == expected
+
+
+@pytest.mark.parametrize("value", ["", "v1", "v2", "garbage"])
+def test_the_deprecated_lifecycle_input_is_ignored_by_the_gate(round_script, timeline_gh, value):
+    """Whatever a caller still passes, the lifecycle is the same one."""
+    for tl, expected in (("0", "1"), ("1", "bypass")):
+        rc, round_ = _round(round_script, timeline_gh, timeline=tl,
+                            extra_env={"LIFECYCLE": value})
+        assert rc == 0 and round_ == expected, (value, tl)
+
+
+def test_the_lifecycle_input_is_declared_but_deprecated_and_never_read():
+    import yaml
+    doc = yaml.safe_load(WORKFLOW.read_text())
+    spec = doc[True]["workflow_call"]["inputs"]["lifecycle"]  # PyYAML parses `on` as True
+    assert spec["type"] == "string" and not spec.get("required")
+    assert "DEPRECATED" in spec["description"] and "IGNORED" in spec["description"]
+    # Declared so `with: lifecycle: v2` is not an invalid-input error; but no
+    # step, `if:` or env may branch on it: that would be a second lifecycle.
+    code = _code_only(WORKFLOW.read_text())
+    assert "LIFECYCLE" not in code
+    assert len(re.findall(r"inputs\.lifecycle", code)) == 0
+    assert "lifecycle" in code  # the declaration itself
+
+
+def test_there_is_no_nudge_job_and_nothing_writes_needs_human():
+    text = WORKFLOW.read_text()
+    code = _code_only(text)
+    assert not re.search(r"^  nudge:", text, re.M)
+    assert "devteam-nudge-reusable.yml" not in code
+    assert "labels[]=devteam:needs-human" not in code
+    assert 'add_label "devteam:needs-human"' not in code
+    assert '"needs-human"' not in code and "round == 'needs-human'" not in code
+    assert "review-capped" not in code
+
+
+@pytest.fixture(scope="module")
+def stray_script(tmp_path_factory) -> Path:
+    text = WORKFLOW.read_text()
+    start = text.index("          # ---- a stray `devteam:needs-human` is ignored and deleted ----")
+    end = text.index("          # ---- a push means the coder paid its debt")
+    body = text[start:end].replace("${{ github.repository }}", "tekflox/aw-app-template")
+    path = tmp_path_factory.mktemp("wf") / "stray.sh"
+    path.write_text(
+        'set -euo pipefail\npr_number=42\nlabels="$FAKE_LABELS"\n'
+        'has_label() { printf "%s\\n" "$labels" | grep -Fxq "$1"; }\n' + body
+    )
+    return path
+
+
+def _stray(script, gh_dir, labels, tmp_path):
+    log = tmp_path / "gh.log"
+    env = {**os.environ, "PATH": f"{gh_dir}{os.pathsep}{os.environ['PATH']}",
+           "FAKE_LABELS": labels, "GH_LOG": str(log)}
+    proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    calls = log.read_text().splitlines() if log.exists() else []
+    return proc, [c for c in calls if "-X DELETE" in c]
+
+
+def test_a_stray_needs_human_label_is_deleted(stray_script, timeline_gh, tmp_path):
+    proc, deletes = _stray(stray_script, timeline_gh, "bug\ndevteam:needs-human", tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert len(deletes) == 1 and "labels/devteam%3Aneeds-human" in deletes[0], deletes
+
+
+@pytest.mark.parametrize("labels", ["", "bug", "devteam:awaiting-fixes", "devteam:reviewed",
+                                    "devteam:needs-human-but-not-really"])
+def test_nothing_is_deleted_when_there_is_no_stray_needs_human(stray_script, timeline_gh, tmp_path, labels):
+    proc, deletes = _stray(stray_script, timeline_gh, labels, tmp_path)
+    assert proc.returncode == 0 and deletes == []
+
+
+def test_a_failed_stray_delete_is_a_warning_not_a_failure(stray_script, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text('#!/bin/bash\nif [[ "$*" == *"-X DELETE"* ]]; then exit 1; fi\nexit 0\n')
+    gh.chmod(0o755)
+    proc, _ = _stray(stray_script, bin_dir, "devteam:needs-human", tmp_path)
+    assert proc.returncode == 0
+    assert "::warning::could not remove stray devteam:needs-human" in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("labels", ["", "bug", "devteam:awaiting-fixes", "devteam:needs-human",
+                                    "devteam:review-capped", "devteam:fix-cycle"])
+def test_synchronize_is_never_refused_by_label_state(synchronize_script, fake_gh, tmp_path, labels):
+    """No v1 round-1 synchronize guard: a push is either reviewed (review 1)
+    or cleared (bypass), never silently skipped for lack of a label."""
+    got = _decide_allowed(synchronize_script, fake_gh, tmp_path, labels=labels, action="synchronize")
+    assert got["allowed"] == "true", got["_log"]
+
+
+def test_a_stray_review_capped_label_is_ignored(gate_tail_script, cap_gh, tmp_path):
+    """The v1 cap stamp is dead: neither read, written nor cleared."""
+    _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="synchronize",
+                          labels="devteam:review-capped")
+    assert "allowed=true" in out
+    assert not any("review-capped" in c for c in calls if "-X " in c), calls
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"findings": [MEDIUM_BLOCKING], "counts": {"medium": 1}, "round_": "1"},
+    {"findings": [], "counts": {}, "round_": "informational"},
+    {"findings": [], "counts": {}, "round_": "1", "is_draft": "true"},
+], ids=["round1-blocking", "informational", "draft"])
+def test_the_eligible_status_is_never_published_when_not_eligible(
+    eligibility_script, tmp_path, fake_gh, kwargs
+):
+    got = _run_eligibility(eligibility_script, tmp_path, fake_gh, **kwargs)
+    assert got["eligible"] == "false"
+    assert _status_posts(tmp_path) == []
+
+
+def test_round1_blocks_on_block_severity_not_on_blocks_merge(eligibility_script, tmp_path, fake_gh):
+    """`blocks_merge` is a retired round-2 field: severity is the only gate."""
+    low = _run_eligibility(eligibility_script, tmp_path, fake_gh,
+                           findings=[{**MINOR, "blocks_merge": True}], counts={"low": 1}, round_="1")
+    assert low["eligible"] == "true" and low["blocking_count"] == "0"
+    (tmp_path / "second").mkdir()
+    high = _run_eligibility(eligibility_script, tmp_path / "second", fake_gh,
+                            findings=[{**HIGH_NON_BLOCKING}], counts={"high": 1}, round_="1")
+    assert high["eligible"] == "false" and high["blocking_count"] == "1"
+
+
+def test_a_failed_reviewed_write_fails_the_step(labels_script, tmp_path):
+    bin_dir = _failing_gh(tmp_path, "labels[]=devteam:reviewed")
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "ROUND": "1",
+           "GH_TOKEN": "x", "GH_LOG": str(tmp_path / "l"), "GITHUB_OUTPUT": "/dev/null"}
+    proc = subprocess.run(["bash", str(labels_script)], capture_output=True, text=True, env=env)
+    assert proc.returncode != 0
+
+
+@pytest.mark.parametrize("blocking,expected", [([MEDIUM_BLOCKING], "findings"), ([], "cleared")])
+def test_the_event_is_findings_only_for_a_blocking_review_1(
+    report_round_script, tmp_path, fake_curl, blocking, expected
+):
+    """A non-blocking digest (LOW/INFO) is `cleared`: stored, no wake. And the
+    event says no nudge follows: the platform must wake the coder directly."""
+    findings = blocking + [MINOR]
+    sent = _run_report_round(
+        report_round_script, tmp_path, fake_curl, findings=findings, blocking=blocking,
+        counts={"low": 1, **({"medium": 1} if blocking else {})}, round_="1",
+    )
+    assert sent["event"] == expected
+    assert sent["nudge_follows"] is False
+    assert len(sent["findings"]) == len(findings)
+
+
+def test_the_blocking_step_is_last_and_bypass_reaches_merge_attempt():
+    code = _code_only(WORKFLOW.read_text())
+    fail = code.index("- name: Fail the job on a blocking review 1")
+    for earlier in ("- name: Publish code-review status", "- name: Set round labels",
+                    "- name: Report round outcome to the platform"):
+        assert code.index(earlier) < fail
+    assert code.index("  provenance-gate:") > fail, "the red step must close the code-review job"
+    ma = code[code.index("  merge-attempt:"):]
+    assert "needs.gate.outputs.bypass == 'true'" in ma[:ma.index("steps:")]
+    pg = code[code.index("  provenance-gate:"):]
+    assert "needs.gate.outputs.bypass == 'true'" in pg[:pg.index("steps:")]
+
+
+def test_the_check_status_stays_success_when_the_job_goes_red():
+    """The job fails via a final step, never by writing a failure status:
+    the gate's reuse check reads state==success to avoid a paid re-dispatch."""
+    text = WORKFLOW.read_text()
+    i = text.index("- name: Fail the job on a blocking review 1")
+    step = text[i:i + 900]
+    assert "statuses" not in step and "exit 1" in step
+
+
+def test_only_a_bot_written_label_counts_as_review1_memory():
+    text = WORKFLOW.read_text()
+    i = text.index("# Round memory (see the DECIDE note above this step).")
+    frag = text[i:i + 1800]
+    assert 'actor.login=="github-actions[bot]"' in frag
+    assert '"devteam:reviewed","devteam:fix-cycle"' in frag
+
+
+def test_the_nudge_payload_no_longer_reads_the_needs_human_label(nudge_script, nudge_bin, tmp_path):
+    events = '{"login": "frederico", "type": "User"}\n'
+    _, state, posts = _run_nudge(nudge_script, nudge_bin, tmp_path, events=events,
+                                 labels=("aw-run:" + "r" * 32, "devteam:needs-human"))
+    assert posts[0]["needs_human_actor"] is None
+    assert "/events" not in (state / "gh.log").read_text()

@@ -7,8 +7,8 @@ repos. One file, several callers, no copy-paste drift.
 
 | Workflow | Purpose |
 |---|---|
-| `.github/workflows/code-review-reusable.yml` | The Dev Team's two-round PR review → merge loop (`workflow_call`). |
-| `.github/workflows/devteam-nudge-reusable.yml` | Posts a PR's live state to the Agents Platform so it can wake the coder / ask / wait (`workflow_call`). Called by the review workflow's final `nudge` job and by the label caller. |
+| `.github/workflows/code-review-reusable.yml` | The Dev Team's PR review → merge lifecycle: one blocking review, then clearance on green CI (`workflow_call`). |
+| `.github/workflows/devteam-nudge-reusable.yml` | Posts a PR's live state to the Agents Platform so it can wake the coder / ask / wait (`workflow_call`). Called by the label caller. |
 | `.github/workflows/devteam-nudge.yml` | This repo's own caller for the human `devteam:awaiting-fixes` label; the reference copy consumers get. |
 | `.github/workflows/security-scan-reusable.yml` | Weekly Semgrep + Trivy + Gitleaks scan, SARIF to code scanning (`workflow_call`). |
 | `.github/workflows/test.yml` | This repo's own CI — runs `tests/`. |
@@ -181,7 +181,7 @@ behaviours the release exists for.
 
 | Trigger | What it buys |
 |---|---|
-| `pull_request: synchronize` | Round 2 starts by itself on the coder's fix push. Before this, every round 2 needed a manual `/aw-review` comment. |
+| `pull_request: synchronize` | A fix push to an already-reviewed PR is cleared to merge on green CI by itself, without a new deep review. |
 | `workflow_run: [completed]` on the caller's own CI | The merge re-attempts when CI *actually* finishes, however long that takes. This replaced a 20-minute poll that gave up — see below. |
 
 Three ways to get that block wrong, all of which fail silently:
@@ -201,9 +201,9 @@ Three ways to get that block wrong, all of which fail silently:
   enables. Land it, then prove it on the next PR. (That is why v1.3.0's
   canary took two PRs on aw-app-template.)
 
-`synchronize` costs nothing on PRs that are not mid-fix-cycle: the gate
-reads the PR's labels and refuses a non-round-2 synchronize before any paid
-judge run.
+`synchronize` never buys a second deep review: after a completed review 1
+the gate clears the new head without one, and before it the push is reviewed
+as review 1.
 
 ### How the merge works (and why it stopped polling)
 
@@ -371,10 +371,10 @@ rather than a confusing downstream 401 or 500.
 - **`concurrency`** — keyed on the caller's PR number, with the
   `workflow_run.head_branch` fallback arm. A reusable workflow's own
   `concurrency` would key on this file's identity instead.
-- **Two labels** — `devteam:awaiting-fixes` (`#FBCA04`) and `devteam:needs-human`
-  (`#B60205`). The round state machine lives in them, and
-  `devteam:awaiting-fixes` is now also what admits an automatic round 2 on a
-  fix push.
+- **No labels to create.** The round memory (`devteam:reviewed`) and the
+  ceiling counter (`review-count:N`) are auto-created on first use.
+  `devteam:needs-human` is gone: the gate neither writes nor reads it and
+  deletes a stray one left on an old PR.
 - **Optional `AW_REVIEW_TRUSTED_AUTHORS`** repo variable (comma-separated
   logins). Unset falls back to `fredericowu` in the gate's own code.
 
@@ -383,13 +383,13 @@ workflow file itself.
 
 ## `devteam-nudge-reusable.yml` (event-driven PR lifecycle)
 
-After every event `code-review-reusable.yml` handles, its final `nudge` job
-calls this workflow, which reads the PR's live labels and `gh pr view` JSON
+A person adding `devteam:awaiting-fixes` calls this workflow (via the label
+caller below), which reads the PR's live labels and `gh pr view` JSON
 and posts one HMAC-signed call (`AW_DEVTEAM_EVENT_SECRET`, same secret as the
 review events) to `<event_url>/api/github/devteam-pr-nudge`. The platform
 decides wake / ask / wait / nothing; **this workflow holds no decision
-logic.** The review-event payloads carry `nudge_follows: true`, so the
-platform only stores the digest and lets the nudge decide.
+logic.** `code-review-reusable.yml` has no nudge job: its review events carry
+`nudge_follows: false`, so the platform wakes the coder directly.
 
 - **Never fails a PR.** Every path exits 0: an unset secret, a 404 (platform
   not deployed yet) or a persistent 5xx is a warning. Retries 3 times on
@@ -398,12 +398,11 @@ platform only stores the digest and lets the nudge decide.
   label, or (label trigger) the label is not a still-live
   `devteam:awaiting-fixes`.
 - `trigger_kind` is `review_done`, `push_unreviewed`, `ci_done`, `comment`
-  or `label`. For `label` and `comment`, when the platform did not wake
+  or `label` (the review workflow only ever sends `label` now). When the platform did not wake
   anyone, the job posts one short PR comment with the verdict and reason.
 - Never checks out PR code (the label caller is `pull_request_target`).
 
-Review-event nudges reach every consumer through `@master` with no consumer
-edit. Only the **human label trigger** needs a per-repo file: copy
+The **human label trigger** needs a per-repo file: copy
 [`.github/workflows/devteam-nudge.yml`](.github/workflows/devteam-nudge.yml)
 as is. Labels written by the pipeline itself use `GITHUB_TOKEN` and start no
 workflow, so only a person (or a PAT) adding `devteam:awaiting-fixes` fires it.
@@ -593,20 +592,30 @@ jobs came across, and every design comment came with them. One thing was
 original did not need because it read a repo secret directly instead of a
 `workflow_call` one.
 
-## `lifecycle: v2` (PR lifecycle v2)
+## The PR lifecycle (`code-review-reusable.yml`)
 
-Opt-in per caller via `with: lifecycle: v2` on `code-review-reusable.yml`
-(default `v1` = the two-round loop, unchanged; `block_severity` default
-`medium`). Review 1 is the only review that can block: a finding at or above
-`block_severity` (or with a missing/unknown severity) turns the `code-review`
-job red as its last step and withholds `devteam/merge-eligible`. Any
-`pull_request` event after a completed review 1 (memory = a
-`github-actions[bot]`-written `devteam:reviewed` or legacy `devteam:fix-cycle`
-label, read from the PR timeline; an unreadable timeline fails closed) writes
-`devteam/code-review` + `devteam/merge-eligible` success with one shared
-attempt URL and merges once CI is green, with no new deep review. Drafts get no
-clearance; forks and untrusted authors never reach it. A manual `/aw-review`
-after review 1 is advisory only. The nudge job is skipped under v2, and the
-review event is sent with `nudge_follows: false` so AP-MT wakes the coder
+There is one lifecycle. It is not opt-in and there is no second version:
+every caller pinned to `@master` follows it with no change in its own repo.
+The `lifecycle` input is **deprecated and ignored**; it is still declared so a
+caller that passes `lifecycle: v2` is not rejected, and it never branches
+behaviour. Delete it from callers whenever convenient.
+
+Review 1 is the only review that can block: a finding at or above
+`block_severity` (default `medium`; a finding with a missing/unknown severity
+always blocks) turns the `code-review` job red as its last step and withholds
+`devteam/merge-eligible`. Any `pull_request` event after a completed review 1
+(memory = a `github-actions[bot]`-written `devteam:reviewed`, or legacy
+`devteam:fix-cycle`, label, read from the PR timeline; an unreadable timeline
+fails closed) writes `devteam/code-review` + `devteam/merge-eligible` success
+with one shared attempt URL and merges once CI is green, with no new deep
+review. Drafts get no clearance; forks and untrusted authors never reach it. A
+manual `/aw-review` or `/aw-improve` after review 1 is advisory only. The
+per-PR review ceiling (`max_reviews`, `review-count:N`) is unchanged.
+
+Labels: the gate writes only `devteam:reviewed` and `review-count:N`. It never
+writes or reads `devteam:needs-human` (human-needed state lives on the Kanban
+card / `ask_human`, not on the PR) and deletes a stray one left on an old PR;
+a stray `devteam:awaiting-fixes` is dropped on push. There is no nudge job: the
+review event carries `nudge_follows: false` so the platform wakes the coder
 directly. The merge is reported by the org webhook; the merged-event job stays
 until slice C and the platform dedupes both on one ledger key.
