@@ -1466,6 +1466,30 @@ def test_all_three_labels_are_applied_when_everything_resolves(
     assert "aw-agent:coder-sonnet" in state["pr_labels"]
 
 
+@pytest.mark.parametrize("run_id,expected", [
+    # bare 32-hex trailer value -> dashed 8-4-4-4-12 (what AP-MT looks up)
+    ("f582d363e34e47cbb908ad38d6d9b10a", "f582d363-e34e-47cb-b908-ad38d6d9b10a"),
+    # already dashed -> unchanged
+    ("f582d363-e34e-47cb-b908-ad38d6d9b10a", "f582d363-e34e-47cb-b908-ad38d6d9b10a"),
+    # junk: wrong length / non-hex -> unchanged
+    ("not-a-run-id", "not-a-run-id"),
+    ("f582d363e34e47cbb908ad38d6d9b10", "f582d363e34e47cbb908ad38d6d9b10"),
+    ("g" * 32, "g" * 32),
+])
+def test_aw_run_label_is_normalised_to_the_dashed_form(
+    provenance_labels_script, provenance_label_gh, tmp_path, run_id, expected
+):
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path,
+        run_id=run_id, card_id="4205bf3b-9510-818d-bc3a-c441daadd282",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"aw-run:{expected}" in state["pr_labels"]
+    assert len(f"aw-run:{expected}") <= 50
+    # aw-card keeps its existing dash-stripping behaviour
+    assert "aw-card:4205bf3b9510818dbc3ac441daadd282" in state["pr_labels"]
+
+
 def test_an_empty_value_produces_no_label_for_that_prefix(
     provenance_labels_script, provenance_label_gh, tmp_path
 ):

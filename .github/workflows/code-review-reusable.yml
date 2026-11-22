@@ -1763,7 +1763,7 @@ jobs:
           AGENT_SLUG: ${{ steps.provenance.outputs.agent_slug }}
         run: |
           python3 <<'PYEOF'
-          import json, os, subprocess, sys, urllib.parse
+          import json, os, re, subprocess, sys, urllib.parse
 
           def main():
               REPO = os.environ["REPO"]
@@ -1771,8 +1771,17 @@ jobs:
 
               # Data-driven: {label prefix: (value, color, description)}. A
               # future `aw-plan` entry is one line here, not a redesign.
+              # The trailer carries the run id as 32 bare hex chars, but AP-MT
+              # looks runs up in the dashed 8-4-4-4-12 form, so a bare label
+              # resolves to "run not found". Normalise exactly-32-hex values;
+              # leave already-dashed and non-hex values untouched.
+              run_id = os.environ.get("RUN_ID", "")
+              if re.fullmatch(r"[0-9a-fA-F]{32}", run_id):
+                  run_id = (f"{run_id[:8]}-{run_id[8:12]}-{run_id[12:16]}-"
+                            f"{run_id[16:20]}-{run_id[20:]}")
+
               LABELS = {
-                  "aw-run": (os.environ.get("RUN_ID", ""), "0e8a16",
+                  "aw-run": (run_id, "0e8a16",
                              "Dev Team provenance: the agent run that created this PR"),
                   "aw-card": (os.environ.get("CARD_ID", "").replace("-", ""), "1d76db",
                               "Dev Team provenance: the Kanban card this PR implements"),
