@@ -2410,6 +2410,36 @@ def test_a_rejected_verdict_publishes_failure_and_never_eligibility(
     assert not any("merge-eligible" in c for c in _gh_calls(tmp_path))
 
 
+@pytest.mark.parametrize("round_,context", [
+    ("informational", "devteam/code-review-advisory"),
+    ("1", "devteam/code-review"),
+    ("bypass", "devteam/code-review"),
+])
+def test_an_informational_review_never_writes_the_merge_authorizing_context(
+    tmp_path, fake_gh, round_, context,
+):
+    script = tmp_path / "publish.sh"
+    script.write_text(_extract_run("Publish code-review status"))
+    log = tmp_path / "publish.log"
+    env = {
+        **os.environ, "PATH": f"{fake_gh}{os.pathsep}{os.environ['PATH']}",
+        "GH_LOG": str(log), "GH_TOKEN": "fake", "ROUND": round_, "MODE": "review",
+        "DISPATCH_OUTCOME": "success", "FINDINGS_OUTCOME": "success", "DESC": "clean",
+    }
+    subprocess.run(["bash", str(script)], check=True, capture_output=True, text=True, env=env)
+    calls = log.read_text()
+    assert f"context={context}" in calls
+    if round_ == "informational":
+        assert "context=devteam/code-review " not in calls and "context=devteam/code-review\n" not in calls
+
+
+def test_the_pending_status_of_an_informational_run_is_advisory_too():
+    text = WORKFLOW.read_text()
+    step = text[text.index("      - name: Mark code review pending"):text.index("      # Agent-scoped Agents Platform ApiKey")]
+    assert "round == 'informational' && 'devteam/code-review-advisory'" in step
+    assert "devteam/code-review-advisory" in text[text.index("ADVISORY = {"):text.index("ADVISORY = {") + 400]
+
+
 # --------------------------------------------------------------------------
 # dispatch retry on transient failure
 # --------------------------------------------------------------------------

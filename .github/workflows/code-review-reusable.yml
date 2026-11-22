@@ -850,7 +850,7 @@ jobs:
         run: |
           gh api -X POST "repos/${{ github.repository }}/statuses/${{ needs.gate.outputs.sha }}" \
             -f state=pending \
-            -f context=devteam/code-review \
+            -f context=${{ needs.gate.outputs.round == 'informational' && 'devteam/code-review-advisory' || 'devteam/code-review' }} \
             -f description="Dev Team deep review in progress" \
             -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}" \
             --silent
@@ -1356,13 +1356,18 @@ jobs:
             state=failure
             description="code review failed or timed out - see run log"
           fi
+          # An informational run (/aw-review or /aw-improve on a reviewed head) is
+          # advisory: it must NOT replace the attempt URL on `devteam/code-review`,
+          # which `merge-attempt` matches against `devteam/merge-eligible`.
+          context=devteam/code-review
+          [ "${ROUND:-}" = informational ] && context=devteam/code-review-advisory
           gh api -X POST "repos/${{ github.repository }}/statuses/${{ needs.gate.outputs.sha }}" \
             -f state="$state" \
-            -f context=devteam/code-review \
+            -f context="$context" \
             -f description="$description" \
             -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}" \
             --silent
-          echo "devteam/code-review -> $state ($description)"
+          echo "$context -> $state ($description)"
 
       # ---- the round memory's write to the PR ----
       # Writes `devteam:reviewed` once review 1 COMPLETED (any verdict) and its
@@ -1965,7 +1970,7 @@ jobs:
           # on success. See `PROVENANCE_CONTEXT` below.
           ADVISORY = {"devteam/ai-review", "devteam/code-review",
                       "devteam/merge-eligible", "devteam/provenance",
-                      "devteam/review-cap",
+                      "devteam/review-cap", "devteam/code-review-advisory",
                       "ai-review", "code-review", "merge-eligible",
                       "provenance-gate", "gate", "fork-notice",
                       "merged-event", "merge-attempt", "CodeRabbit",
