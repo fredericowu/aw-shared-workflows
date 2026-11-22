@@ -4138,8 +4138,8 @@ def bypass_script(tmp_path_factory) -> Path:
     and the caps, which have their own tests)."""
     text = WORKFLOW.read_text()
     a = text.index("# ---- round, from the PR's LIVE labels ----")
-    b = text.index("          # ---- lifecycle v2: is review 1 already COMPLETED")
-    c = text.index("          # ---- lifecycle v2 bypass:")
+    b = text.index("          # lifecycle v2 round memory")
+    c = text.index("          # lifecycle v2 bypass")
     d = text.index("          # ---- (2) reuse the verdict")
     labels_fetch = text[a:b]
     reviewed = text[b:text.index("          if [ \"$mode\" = \"improve\" ]; then", b)]
@@ -4234,7 +4234,7 @@ def test_v2_an_unreadable_timeline_fails_closed(bypass_script, v2_gh, tmp_path):
 
 def test_v2_only_a_bot_written_label_counts_as_review1_memory():
     text = WORKFLOW.read_text()
-    i = text.index("# ---- lifecycle v2: is review 1 already COMPLETED")
+    i = text.index("# lifecycle v2 round memory")
     frag = text[i:i + 1800]
     assert 'actor.login=="github-actions[bot]"' in frag
     assert '"devteam:reviewed","devteam:fix-cycle"' in frag
@@ -4264,3 +4264,15 @@ def test_v2_the_check_status_stays_success_when_the_job_goes_red():
     i = text.index("- name: Fail the job on a blocking review 1 (lifecycle v2)")
     step = text[i:i + 900]
     assert "statuses" not in step and "exit 1" in step
+
+
+def test_no_run_script_exceeds_githubs_21000_char_limit():
+    """GitHub rejects a `run:` over 21,000 characters as a bare 'workflow file
+    issue' (no job, no log): lifecycle v2's first cut put `Decide` at 21,496
+    and every caller on @master went red at once. Keep headroom."""
+    import yaml
+    for path in WORKFLOW.parent.glob("*.yml"):
+        doc = yaml.safe_load(path.read_text())
+        for jname, job in (doc.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                assert len(step.get("run", "")) <= 20500, (path.name, jname, step.get("name"), len(step["run"]))

@@ -429,6 +429,21 @@ jobs:
       is_draft: ${{ steps.decide.outputs.is_draft }}
       bypass: ${{ steps.decide.outputs.bypass }}
     steps:
+      # DECIDE, lifecycle v2 (inputs.lifecycle == 'v2'). Comments live HERE, not
+      # in the script: GitHub rejects a `run:` over 21,000 characters as a
+      # workflow-file error, and this script is close to that cap.
+      #  * Round memory: "review 1 completed" = a `labeled` timeline event by
+      #    github-actions[bot] for `devteam:reviewed` (written by "Set round
+      #    labels" on any completed round-1 verdict) or the legacy
+      #    `devteam:fix-cycle` (PRs in flight at rollout). A hand-added label is
+      #    not counted. An unreadable timeline fails CLOSED (red, re-runnable).
+      #  * Not reviewed -> round 1. Reviewed + pull_request event -> `bypass`.
+      #    Reviewed + /aw-review -> `informational` (advisory; never grants or
+      #    removes eligibility).
+      #  * Bypass runs after the trusted-author check (forks never pass the job
+      #    `if`) and writes devteam/code-review + devteam/merge-eligible with ONE
+      #    shared target_url, which is what merge-attempt's same-attempt check
+      #    needs. A draft gets no clearance; ready_for_review re-enters here.
       - name: Decide
         id: decide
         env:
@@ -542,14 +557,7 @@ jobs:
           fi
           has_label() { printf '%s\n' "$labels" | grep -Fxq "$1"; }
 
-          # ---- lifecycle v2: is review 1 already COMPLETED on this PR? ----
-          # Bot-attested, like the ceiling below: a `labeled` timeline event
-          # by github-actions[bot] for `devteam:reviewed` (written by "Set
-          # round labels" on ANY completed round-1 verdict) or the legacy
-          # `devteam:fix-cycle` (so a PR in flight at rollout does not get a
-          # second review 1). A label a human hand-adds is not counted. An
-          # unreadable timeline fails CLOSED: no review, no bypass, the run is
-          # red and re-runnable -- never a silent second review 1.
+          # lifecycle v2 round memory (see the DECIDE note above this step).
           reviewed=false
           if [ "${LIFECYCLE:-v1}" = "v2" ] && [ "$mode" != "improve" ]; then
             seen=""
@@ -563,7 +571,7 @@ jobs:
               sleep $(( attempt * 3 ))
             done
             if [ "$seen" = "__FAILED__" ] || [ -z "$seen" ]; then
-              echo "::error::lifecycle v2: could not read PR #$pr_number's timeline after 3 attempts. Refusing to guess whether review 1 already ran; re-run this workflow."
+              echo "::error::lifecycle v2: could not read PR #$pr_number's timeline; re-run"
               exit 1
             fi
             [ "$seen" -gt 0 ] && reviewed=true
@@ -577,12 +585,8 @@ jobs:
             if [ "$reviewed" != "true" ]; then
               round=1
             elif [ "${{ github.event_name }}" = "pull_request" ]; then
-              # A push (or reopen / ready_for_review) after a completed
-              # review 1: never re-reviewed; cleared on green CI below.
               round=bypass
             else
-              # Manual /aw-review after review 1: an advisory rerun. It posts
-              # comments and never blocks, grants or removes eligibility.
               round=informational
             fi
           elif has_label "devteam:awaiting-fixes"; then
@@ -722,14 +726,7 @@ jobs:
             exit 0
           fi
 
-          # ---- lifecycle v2 bypass: review 1 is done, this push merges on green CI ----
-          # Reached only for a same-repo (fork PRs never pass the job `if`),
-          # TRUSTED-author pull_request event on a PR whose review 1 completed.
-          # Both statuses carry the SAME target_url: merge-attempt requires the
-          # latest successful devteam/code-review and devteam/merge-eligible to
-          # share one attempt URL, and this satisfies that check rather than
-          # weakening it. A draft is never cleared here (merge-attempt also
-          # re-checks live); ready_for_review re-enters this branch.
+          # lifecycle v2 bypass (see the DECIDE note above this step).
           if [ "$round" = "bypass" ]; then
             if [ "$is_draft" = "true" ]; then
               echo "lifecycle v2: PR #$pr_number is a draft - no clearance written; ready_for_review will write it."
