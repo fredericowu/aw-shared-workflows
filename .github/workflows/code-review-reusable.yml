@@ -1149,8 +1149,11 @@ jobs:
                     empty_retries=$((empty_retries + 1))
                     http_code=empty-reviewer-message
                   elif jq -e '(.aw_status // "success") != "success"
-                      and ([.. | strings] | join(" ")
-                           | test("upstream unreachable|connection refused"))' \
+                      and (((.choices[0].message.content // "") | fromjson? // {}) as $c
+                           | [($c.error // empty), (($c.errors // {}) | .[]?)]
+                             | map(tostring) as $e
+                           | ($e | any(test("upstream unreachable|connection refused")))
+                             and ($e | all(test("no activity for") | not)))' \
                       "$RUNNER_TEMP/dispatch_response.json" >/dev/null 2>&1; then
                     # The platform answers 200 + aw_status=error when the
                     # runner's own upstream is down (e.g. its core was

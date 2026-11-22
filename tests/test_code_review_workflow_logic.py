@@ -2898,6 +2898,7 @@ def dispatch_env(tmp_path, fake_gh):
         'out=""; while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\n'
         'if [[ "$code" == CURLFAIL:* ]]; then echo "curl: (7) refused" >&2; exit "${code#CURLFAIL:}"; fi\n'
         'msg=\'{}\'; if [[ "$code" == E* ]]; then code="${code#E}"; msg=\'\'; fi\n'
+        'if [[ "$code" == N* ]]; then code="${code#N}"; [ -n "$out" ] && echo \'{"aw_status":"error","choices":[{"message":{"content":"{\\"output\\": \\"diag: connection refused\\", \\"errors\\": {\\"review\\": \\"no activity for 600s\\"}}"}}]}\' > "$out"; printf "%s" "$code"; exit 0; fi\n'
         'if [[ "$code" == U* ]]; then code="${code#U}"; [ -n "$out" ] && echo \'{"aw_status":"error","choices":[{"message":{"content":"{\\"errors\\": {\\"review\\": \\"upstream unreachable: dial tcp: connect: connection refused\\"}}"}}]}\' > "$out"; printf "%s" "$code"; exit 0; fi\n'
         '[ -n "$out" ] && jq -n --arg c "$msg" \'{aw_status: "success", choices: [{message: {content: $c}}]}\' > "$out"\n'
         'if [[ "$code" == *:* ]]; then printf "%s" "${code%%:*}"; exit "${code##*:}"; fi\n'
@@ -3188,6 +3189,12 @@ def test_a_runner_upstream_unreachable_200_is_retried(dispatch_env):
     proc, n, sleeps = dispatch_env("U200,U200,200")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert n == 3 and sleeps == ["15", "30"]
+
+
+def test_an_idle_timeout_is_not_retried_even_if_other_output_says_refused(dispatch_env):
+    proc, n, sleeps = dispatch_env("N200")
+    assert proc.returncode == 0  # the findings step, not dispatch, rejects the failed run
+    assert n == 1 and sleeps == []
 
 
 def test_a_runner_unreachable_that_never_recovers_fails_the_dispatch(dispatch_env):
