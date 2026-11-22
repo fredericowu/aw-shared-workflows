@@ -1892,7 +1892,18 @@ jobs:
               if out.returncode != 0:
                   print(f"::error::gh api {path} failed: {out.stderr[:300]}")
                   sys.exit(1)
-              return json.loads(out.stdout or "null")
+              if not paginate:
+                  return json.loads(out.stdout or "null")
+              # `gh api --paginate` prints one JSON array per page, back to
+              # back (`[..][..]`) — decode them one by one and concatenate.
+              dec, text, i, merged = json.JSONDecoder(), out.stdout, 0, []
+              while True:
+                  while i < len(text) and text[i].isspace():
+                      i += 1
+                  if i >= len(text):
+                      return merged
+                  page, i = dec.raw_decode(text, i)
+                  merged.extend(page if isinstance(page, list) else [page])
 
           def publish_cleared(description):
               subprocess.run(
@@ -1915,7 +1926,7 @@ jobs:
           # forbid applying this label themselves; the threat model here is
           # omission (a coder that forgot/lost the hook), not an adversarial
           # agent faking its way past review.
-          labels = api(f"repos/{REPO}/issues/{PR_NUMBER}/labels")
+          labels = api(f"repos/{REPO}/issues/{PR_NUMBER}/labels", paginate=True)
           if any(l.get("name") == "provenance-exempt" for l in (labels or [])):
               publish_cleared("provenance-exempt label applied by a human")
               sys.exit(0)
