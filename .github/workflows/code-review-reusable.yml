@@ -1811,20 +1811,25 @@ jobs:
                             f"GitHub's 50-char label-name limit")
                       continue
 
-                  # Replace-by-prefix: drop any stale same-prefix label whose
-                  # value changed (the colon needs URL-encoding in the path).
                   stale_names = [n for n in existing_names
                                  if n.startswith(f"{prefix}:") and n != label_name]
-                  for stale in stale_names:
-                      encoded = urllib.parse.quote(stale, safe="")
-                      d = gh("api", "-X", "DELETE",
-                             f"repos/{REPO}/issues/{PR_NUMBER}/labels/{encoded}")
-                      if d.returncode != 0:
-                          print(f"::warning::could not remove stale label {stale!r}: "
-                                f"{d.stderr[:200]}")
+
+                  def drop_stale():
+                      # Replace-by-prefix: drop any stale same-prefix label whose
+                      # value changed (the colon needs URL-encoding in the path).
+                      # Only ever called once the replacement is confirmed on the
+                      # PR, so a failed add never leaves the PR with neither.
+                      for stale in stale_names:
+                          encoded = urllib.parse.quote(stale, safe="")
+                          d = gh("api", "-X", "DELETE",
+                                 f"repos/{REPO}/issues/{PR_NUMBER}/labels/{encoded}")
+                          if d.returncode != 0:
+                              print(f"::warning::could not remove stale label {stale!r}: "
+                                    f"{d.stderr[:200]}")
 
                   if label_name in existing_names:
-                      continue  # already applied, nothing to do
+                      drop_stale()
+                      continue  # already applied, only stale ones to clear
 
                   # Ensure the label exists on the repo — create-on-demand,
                   # treating "already exists" (422) as success.
@@ -1842,6 +1847,7 @@ jobs:
                             f"#{PR_NUMBER}: {add.stderr[:200]}")
                   else:
                       print(f"applied label {label_name!r}")
+                      drop_stale()
 
           try:
               main()
