@@ -2945,6 +2945,15 @@ def test_exhausted_marker_is_stamped_only_after_delivery():
     assert step.index("context=devteam/review-cap") < step.index("labels[]=devteam:review-exhausted")
 
 
+def test_the_ceiling_escalate_event_does_not_promise_a_nudge():
+    # No nudge job exists any more. nudge_follows=true makes the platform only
+    # STORE an escalate event, so nobody would ever be told the budget ran out.
+    text = WORKFLOW.read_text()
+    step = text[text.index("      - name: Report review ceiling"):text.index("  code-review:\n    needs: gate")]
+    assert '"event": "escalate"' in step
+    assert '"nudge_follows": False' in step and '"nudge_follows": True' not in step
+
+
 @pytest.mark.parametrize("action,round_", [
     ("created", "1"),      # a coder/anyone running /aw-review
     ("synchronize", "1"),

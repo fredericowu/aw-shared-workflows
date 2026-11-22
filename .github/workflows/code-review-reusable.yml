@@ -789,7 +789,7 @@ jobs:
               "pr_number": int(os.environ["PR_NUMBER"]),
               "pr_url": os.environ["PR_URL"], "head_sha": os.environ["HEAD_SHA"],
               "round": os.environ["ROUND"] or "1",
-              "nudge_follows": True,
+              "nudge_follows": False,  # no nudge job follows: the platform must escalate itself
               "reason": "review_budget_exhausted",
               "counts": {}, "findings": [], "blocking": [],
               "missing_blocks_merge": 0,
