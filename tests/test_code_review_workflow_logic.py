@@ -4294,3 +4294,20 @@ def test_no_run_script_exceeds_githubs_21000_char_limit():
         for jname, job in (doc.get("jobs") or {}).items():
             for step in job.get("steps") or []:
                 assert len(step.get("run", "")) <= 20500, (path.name, jname, step.get("name"), len(step["run"]))
+
+
+# ---- every PR label read must paginate (GitHub returns 30 per page) ----
+
+def test_every_label_read_paginates():
+    """The aw-run: label can sit on page 2; an unpaginated read yields an
+    empty run_id and a partial labels list."""
+    text = WORKFLOW.read_text()
+    # A label READ is a /labels call that is followed by --jq (writes use -X/-f).
+    reads = [m.start() for m in re.finditer(r"/labels[\"']", text)
+             if "--jq" in text[m.start():m.start() + 120]
+             and "--silent" not in text[m.start():m.start() + 120].split("--jq")[0]
+             and "-f" not in text[m.start():m.start() + 120].split("--jq")[0].split()]
+    assert len(reads) >= 5, reads
+    for pos in reads:
+        window = text[pos:pos + 120]
+        assert window.index("--paginate") < window.index("--jq"), text[pos - 40:pos + 120]
