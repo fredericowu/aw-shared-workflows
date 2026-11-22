@@ -1413,6 +1413,8 @@ def provenance_label_gh(tmp_path_factory) -> Path:
         "    state['repo_labels'].append(name); save(); sys.exit(0)\n"
         "if '--paginate' in rest:\n"
         "    print(json.dumps([{'name': n} for n in state['pr_labels']])); sys.exit(0)\n"
+        "if os.environ.get('FAKE_GH_FAIL_ADD'):\n"
+        "    print('HTTP 503', file=sys.stderr); sys.exit(1)\n"
         "name = next(a.split('=', 1)[1] for a in rest if a.startswith('labels[]='))\n"
         "if name not in state['pr_labels']:\n"
         "    state['pr_labels'].append(name)\n"
@@ -1425,6 +1427,7 @@ def provenance_label_gh(tmp_path_factory) -> Path:
 def _run_provenance_labels(
     provenance_labels_script, provenance_label_gh, tmp_path, *, run_id="", card_id="", agent_slug="",
     existing_pr_labels=None, existing_repo_labels=None, always_fail=False,
+    fail_add=False,
 ):
     d = tmp_path / "ghfix"
     d.mkdir(exist_ok=True)
@@ -1445,6 +1448,8 @@ def _run_provenance_labels(
     }
     if always_fail:
         env["FAKE_GH_ALWAYS_FAIL"] = "1"
+    if fail_add:
+        env["FAKE_GH_FAIL_ADD"] = "1"
     proc = subprocess.run(
         [sys.executable, str(provenance_labels_script)], capture_output=True, text=True, env=env
     )
@@ -1464,6 +1469,57 @@ def test_all_three_labels_are_applied_when_everything_resolves(
     assert f"aw-run:{'r' * 32}" in state["pr_labels"]
     assert "aw-card:card1" in state["pr_labels"]
     assert "aw-agent:coder-sonnet" in state["pr_labels"]
+
+
+@pytest.mark.parametrize("run_id,expected", [
+    # bare 32-hex trailer value -> dashed 8-4-4-4-12 (what AP-MT looks up)
+    ("f582d363e34e47cbb908ad38d6d9b10a", "f582d363-e34e-47cb-b908-ad38d6d9b10a"),
+    # already dashed -> unchanged
+    ("f582d363-e34e-47cb-b908-ad38d6d9b10a", "f582d363-e34e-47cb-b908-ad38d6d9b10a"),
+    # junk: wrong length / non-hex -> unchanged
+    ("not-a-run-id", "not-a-run-id"),
+    ("f582d363e34e47cbb908ad38d6d9b10", "f582d363e34e47cbb908ad38d6d9b10"),
+    ("g" * 32, "g" * 32),
+])
+def test_aw_run_label_is_normalised_to_the_dashed_form(
+    provenance_labels_script, provenance_label_gh, tmp_path, run_id, expected
+):
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path,
+        run_id=run_id, card_id="4205bf3b-9510-818d-bc3a-c441daadd282",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"aw-run:{expected}" in state["pr_labels"]
+    assert len(f"aw-run:{expected}") <= 50
+    # aw-card keeps its existing dash-stripping behaviour
+    assert "aw-card:4205bf3b9510818dbc3ac441daadd282" in state["pr_labels"]
+
+
+def test_a_failed_add_keeps_the_existing_bare_aw_run_label(
+    provenance_labels_script, provenance_label_gh, tmp_path
+):
+    """Upgrading a PR from a bare to a dashed aw-run label must not strip the
+    old label before the new one is confirmed on the PR."""
+    bare = "f582d363e34e47cbb908ad38d6d9b10a"
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path,
+        run_id=bare, existing_pr_labels=[f"aw-run:{bare}"], fail_add=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert state["pr_labels"] == [f"aw-run:{bare}"]
+    assert "-X DELETE" not in calls
+
+
+def test_a_successful_add_replaces_the_bare_aw_run_label(
+    provenance_labels_script, provenance_label_gh, tmp_path
+):
+    bare = "f582d363e34e47cbb908ad38d6d9b10a"
+    proc, state, calls = _run_provenance_labels(
+        provenance_labels_script, provenance_label_gh, tmp_path,
+        run_id=bare, existing_pr_labels=[f"aw-run:{bare}"],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert state["pr_labels"] == ["aw-run:f582d363-e34e-47cb-b908-ad38d6d9b10a"]
 
 
 def test_an_empty_value_produces_no_label_for_that_prefix(
