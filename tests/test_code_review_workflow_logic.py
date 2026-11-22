@@ -1450,14 +1450,19 @@ def _commit(message, sha="deadbee"):
 
 
 def _run_provenance(
-    provenance_script, provenance_gh, tmp_path, *, labels=None, commits=None
+    provenance_script, provenance_gh, tmp_path, *, labels=None, commits=None,
+    label_pages=None,
 ):
     d = tmp_path / "ghfix"
     d.mkdir(exist_ok=True)
     for leftover in ("calls.log",):
         if (d / leftover).exists():
             (d / leftover).unlink()
-    (d / "labels.json").write_text(json.dumps(labels if labels is not None else []))
+    if label_pages is not None:
+        # what `gh api --paginate` prints: one array per page, back to back
+        (d / "labels.json").write_text("".join(json.dumps(p) for p in label_pages))
+    else:
+        (d / "labels.json").write_text(json.dumps(labels if labels is not None else []))
     (d / "commits.json").write_text(json.dumps(commits if commits is not None else []))
     out = tmp_path / "gh_output"
     out.write_text("")
@@ -1542,6 +1547,27 @@ def test_the_provenance_exempt_label_skips_the_gate_without_reading_commits(
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "devteam/provenance" in calls and "state=success" in calls
+    assert "repos/tekflox/aw-app-template/pulls/42/commits" not in calls
+
+
+def test_the_provenance_exempt_label_on_page_two_is_honoured(
+    provenance_script, provenance_gh, tmp_path
+):
+    """Labels past the first 30 live on page 2; the lookup must paginate."""
+    proc, outputs, calls = _run_provenance(
+        provenance_script,
+        provenance_gh,
+        tmp_path,
+        label_pages=[
+            [{"name": f"l{i}"} for i in range(30)],
+            [{"name": "provenance-exempt"}],
+        ],
+        commits=[_commit(f"x\n\nAW-Run-Id: {REAL_RUN_ID}")],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "--paginate" in calls
+    assert "state=success" in calls
+    assert "run_id" not in outputs
     assert "repos/tekflox/aw-app-template/pulls/42/commits" not in calls
 
 
@@ -4338,3 +4364,20 @@ def test_no_run_script_exceeds_githubs_21000_char_limit():
         for jname, job in (doc.get("jobs") or {}).items():
             for step in job.get("steps") or []:
                 assert len(step.get("run", "")) <= 20500, (path.name, jname, step.get("name"), len(step["run"]))
+
+
+# ---- every PR label read must paginate (GitHub returns 30 per page) ----
+
+def test_every_label_read_paginates():
+    """The aw-run: label can sit on page 2; an unpaginated read yields an
+    empty run_id and a partial labels list."""
+    text = WORKFLOW.read_text()
+    # A label READ is a /labels call that is followed by --jq (writes use -X/-f).
+    reads = [m.start() for m in re.finditer(r"/labels[\"']", text)
+             if "--jq" in text[m.start():m.start() + 120]
+             and "--silent" not in text[m.start():m.start() + 120].split("--jq")[0]
+             and "-f" not in text[m.start():m.start() + 120].split("--jq")[0].split()]
+    assert len(reads) >= 5, reads
+    for pos in reads:
+        window = text[pos:pos + 120]
+        assert window.index("--paginate") < window.index("--jq"), text[pos - 40:pos + 120]

@@ -536,12 +536,11 @@ jobs:
           # from it. Reading it live is the difference between a round-2 pass
           # and silently re-running round 1 forever.
           #
-          # This fetch FAILS LOUDLY, with retries, and never falls back to an
-          # empty label set — a PR #13 finding on the aw-app-template original.
+          # FAILS LOUDLY, with retries; never falls back to an empty label set.
           labels=""
           for attempt in 1 2 3; do
             if labels="$(gh api "repos/${{ github.repository }}/issues/$pr_number/labels" \
-                           --jq '.[].name')"; then
+                           --paginate --jq '.[].name')"; then
               break
             fi
             echo "label fetch attempt $attempt failed"
@@ -949,7 +948,7 @@ jobs:
               try:
                   r = subprocess.run(
                       ["gh", "api", f"repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/labels",
-                       "--jq", ".[].name"], capture_output=True, text=True, timeout=30)
+                       "--paginate", "--jq", ".[].name"], capture_output=True, text=True, timeout=30)
                   return [x for x in r.stdout.splitlines() if x] if r.returncode == 0 else []
               except Exception:
                   return []
@@ -1682,7 +1681,7 @@ jobs:
             # A synchronize run is the fix push itself: awaiting-fixes cannot
             # still be owed even if the gate's drop failed, so escalate.
             if [ "${FIX_PUSH:-}" != "true" ] \
-               && live="$(gh api "repos/${{ github.repository }}/issues/${{ needs.gate.outputs.pr_number }}/labels" --jq '.[].name')" \
+               && live="$(gh api "repos/${{ github.repository }}/issues/${{ needs.gate.outputs.pr_number }}/labels" --paginate --jq '.[].name')" \
                && printf '%s\n' "$live" | grep -Fxq "devteam:awaiting-fixes"; then
               echo "devteam:awaiting-fixes still live — keeping it, not escalating"
             else
@@ -1793,7 +1792,7 @@ jobs:
               try:
                   r = subprocess.run(
                       ["gh", "api", f"repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/labels",
-                       "--jq", ".[].name"], capture_output=True, text=True, timeout=30)
+                       "--paginate", "--jq", ".[].name"], capture_output=True, text=True, timeout=30)
                   return [x for x in r.stdout.splitlines() if x] if r.returncode == 0 else []
               except Exception:
                   return []
@@ -1918,7 +1917,18 @@ jobs:
               if out.returncode != 0:
                   print(f"::error::gh api {path} failed: {out.stderr[:300]}")
                   sys.exit(1)
-              return json.loads(out.stdout or "null")
+              if not paginate:
+                  return json.loads(out.stdout or "null")
+              # `gh api --paginate` prints one JSON array per page, back to
+              # back (`[..][..]`) — decode them one by one and concatenate.
+              dec, text, i, merged = json.JSONDecoder(), out.stdout, 0, []
+              while True:
+                  while i < len(text) and text[i].isspace():
+                      i += 1
+                  if i >= len(text):
+                      return merged
+                  page, i = dec.raw_decode(text, i)
+                  merged.extend(page if isinstance(page, list) else [page])
 
           def publish_cleared(description):
               subprocess.run(
@@ -1941,7 +1951,7 @@ jobs:
           # forbid applying this label themselves; the threat model here is
           # omission (a coder that forgot/lost the hook), not an adversarial
           # agent faking its way past review.
-          labels = api(f"repos/{REPO}/issues/{PR_NUMBER}/labels")
+          labels = api(f"repos/{REPO}/issues/{PR_NUMBER}/labels", paginate=True)
           if any(l.get("name") == "provenance-exempt" for l in (labels or [])):
               publish_cleared("provenance-exempt label applied by a human")
               sys.exit(0)
@@ -2674,7 +2684,7 @@ jobs:
           # than an unknown round number.
           labels="__FETCH_FAILED__"
           for attempt in 1 2; do
-            if labels="$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name')"; then
+            if labels="$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --paginate --jq '.[].name')"; then
               break
             fi
             echo "::warning::label fetch attempt $attempt failed"
@@ -2721,7 +2731,7 @@ jobs:
               try:
                   r = subprocess.run(
                       ["gh", "api", f"repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/labels",
-                       "--jq", ".[].name"], capture_output=True, text=True, timeout=30)
+                       "--paginate", "--jq", ".[].name"], capture_output=True, text=True, timeout=30)
                   return [x for x in r.stdout.splitlines() if x] if r.returncode == 0 else []
               except Exception:
                   return []
