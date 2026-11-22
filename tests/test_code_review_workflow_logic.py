@@ -3313,6 +3313,20 @@ def test_unchanged_sha_round_mode_reuses_the_verdict(gate_tail_script, cap_gh, t
     assert "allowed=false" in out and "allowed=true" not in out
 
 
+def test_v2_verdict_reuse_restores_a_missing_reviewed_label(gate_tail_script, cap_gh, tmp_path, monkeypatch):
+    monkeypatch.setenv("LIFECYCLE", "v2")
+    _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="created",
+                          statuses=[_st("success", "1 finding [rk r=1 m=review]")])
+    assert "allowed=false" in out
+    assert any("-X POST" in c and "labels[]=devteam:reviewed" in c for c in calls), calls
+
+
+def test_v1_verdict_reuse_writes_no_label(gate_tail_script, cap_gh, tmp_path):
+    _, _, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="created",
+                        statuses=[_st("success", "1 finding [rk r=1 m=review]")])
+    assert not any("devteam:reviewed" in c for c in calls), calls
+
+
 @pytest.mark.parametrize("case", ["round", "mode", "failure", "pending", "eligible", "unstamped", "lookup"])
 def test_reuse_never_applies_when_any_key_part_differs_or_lookup_is_unsafe(
     gate_tail_script, cap_gh, tmp_path, case
@@ -4144,6 +4158,16 @@ def test_v2_every_completed_review1_writes_reviewed_and_nothing_else(
     posts = [c for c in calls if "-X POST" in c]
     assert len(posts) == 1 and "labels[]=devteam:reviewed" in posts[0], posts
     assert not any("awaiting-fixes" in c or "needs-human" in c for c in calls)
+
+
+def test_v2_no_reviewed_label_when_the_round1_status_publish_failed(labels_script, fake_gh, tmp_path):
+    os.environ["PUBLISH_OUTCOME"] = "failure"
+    try:
+        out, calls = _v2_labels(labels_script, fake_gh, tmp_path, round_="1", findings_count=1, blocking_count=1)
+    finally:
+        del os.environ["PUBLISH_OUTCOME"]
+    assert not [c for c in calls if "-X POST" in c], calls
+    assert "labelled: devteam:reviewed" not in out
 
 
 def test_v2_labels_nothing_on_an_informational_run(labels_script, fake_gh, tmp_path):
