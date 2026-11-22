@@ -3293,6 +3293,20 @@ def test_unchanged_sha_round_mode_reuses_the_verdict(gate_tail_script, cap_gh, t
     assert "allowed=false" in out and "allowed=true" not in out
 
 
+def test_v2_verdict_reuse_restores_a_missing_reviewed_label(gate_tail_script, cap_gh, tmp_path, monkeypatch):
+    monkeypatch.setenv("LIFECYCLE", "v2")
+    _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="created",
+                          statuses=[_st("success", "1 finding [rk r=1 m=review]")])
+    assert "allowed=false" in out
+    assert any("-X POST" in c and "labels[]=devteam:reviewed" in c for c in calls), calls
+
+
+def test_v1_verdict_reuse_writes_no_label(gate_tail_script, cap_gh, tmp_path):
+    _, _, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="created",
+                        statuses=[_st("success", "1 finding [rk r=1 m=review]")])
+    assert not any("devteam:reviewed" in c for c in calls), calls
+
+
 @pytest.mark.parametrize("case", ["round", "mode", "failure", "pending", "eligible", "unstamped", "lookup"])
 def test_reuse_never_applies_when_any_key_part_differs_or_lookup_is_unsafe(
     gate_tail_script, cap_gh, tmp_path, case

@@ -649,12 +649,10 @@ jobs:
           # mid-fix-cycle (`devteam:awaiting-fixes` -> round 2, or
           # `devteam:needs-human` -> round needs-human).
           #
-          # `needs-human` admits a push for the same reason round 2 does,
-          # and v1.10.0 added it because refusing it was the worse of the
-          # two costs: the PR's `devteam/code-review` status is per-commit,
-          # so a silently-skipped synchronize leaves the PREVIOUS commit's
-          # pass on display, which reads as "the escalated finding is
-          # resolved" when nothing looked at the fix at all. The window is
+          # `needs-human` admits a push for the same reason round 2 does
+          # (v1.10.0): the status is per-commit, so a silently-skipped
+          # synchronize leaves the PREVIOUS commit's pass on display, which
+          # reads as "resolved" when nothing looked at the fix. The window is
           # self-closing — the first clean `blocks_merge` verdict removes
           # the label — and a still-blocking re-run posts no new escalate
           # event, so repeated pushes cost budget but never re-ping a human.
@@ -774,10 +772,9 @@ jobs:
           # later `/aw-review` on the unchanged head derives round
           # needs-human, and without this it would buy a second verdict with
           # the identical `blocks_merge` lens that could clear the hold. The
-          # match is on the most recent COMPLETED review-mode stamp, not only
-          # the newest status, so an intervening `/aw-improve`, a cancelled
-          # or errored run cannot reopen it. A new verdict needs a new head,
-          # or a human removing the labels (round 1, full lens). Round 1
+          # match is on the latest COMPLETED review-mode stamp, so an
+          # `/aw-improve`, cancelled or errored run cannot reopen it. A new
+          # verdict needs a new head or a human removing the labels. Round 1
           # keys stay exact: r=1 then `/aw-review` as round 2 is intended.
           if statuses="$(gh api "repos/${{ github.repository }}/commits/$sha/statuses?per_page=100" 2>/dev/null)"; then
             latest="$(printf '%s' "$statuses" | jq -r \
@@ -800,6 +797,7 @@ jobs:
             if [ "$eligible_seen" = "0" ] && [ "${latest%%|*}" = "success" ] \
                && printf '%s' "$latest" | grep -Fq "[rk r=$round m=$mode]"; then
               echo "verdict reused: sha $sha already has a completed review for round=$round mode=$mode — not dispatching again."
+              [ "${LIFECYCLE:-v1}$round$mode" = v21review ] && { gh api -X POST "$label_api" -f "labels[]=devteam:reviewed" --silent || true; }  # lost-response label restore
               echo "allowed=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
