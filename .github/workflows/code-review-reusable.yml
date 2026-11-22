@@ -733,6 +733,10 @@ jobs:
               echo "allowed=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+            if ! n="$(gh api --paginate "repos/${{ github.repository }}/commits/$sha/statuses" \
+                --jq '.[]|select(.context=="devteam/code-review" and (.description|contains("[rk r=1 ")))|1'|wc -l)" || [ "$n" != 0 ]; then
+              echo "allowed=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
             attempt_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}"
             gh api -X POST "repos/${{ github.repository }}/statuses/$sha" \
               -f state=success -f context=devteam/code-review \

@@ -4176,6 +4176,10 @@ def v2_gh(tmp_path):
         '  [ "${FAKE_TIMELINE:-0}" = "fail" ] && { echo boom >&2; exit 1; }\n'
         '  n=${FAKE_TIMELINE:-0}; for i in $(seq 1 $n); do echo devteam:reviewed; done; exit 0\n'
         "fi\n"
+        'if [[ "$*" == *"/commits/"* ]]; then\n'
+        '  [ "${FAKE_VERDICT:-0}" = "fail" ] && { echo boom >&2; exit 1; }\n'
+        '  n=${FAKE_VERDICT:-0}; for i in $(seq 1 $n); do echo success; done; exit 0\n'
+        "fi\n"
         'if [[ "$*" == *"/labels"* ]]; then exit 0; fi\n'
         "exit 0\n")
     gh.chmod(0o755)
@@ -4183,12 +4187,12 @@ def v2_gh(tmp_path):
 
 
 def _run_bypass(script, v2_gh, tmp_path, *, timeline="0", event="pull_request", mode="review",
-                draft="false"):
+                draft="false", verdict="0"):
     out = tmp_path / "out"
     out.write_text("")
     log = tmp_path / "ghlog"
     env = {**os.environ, "PATH": f"{v2_gh}{os.pathsep}{os.environ['PATH']}", "LIFECYCLE": "v2",
-           "GH_LOG": str(log), "FAKE_TIMELINE": timeline, "EVENT_NAME": event, "MODE_IN": mode,
+           "GH_LOG": str(log), "FAKE_TIMELINE": timeline, "FAKE_VERDICT": verdict, "EVENT_NAME": event, "MODE_IN": mode,
            "DRAFT": draft, "OUT": str(out), "GH_TOKEN": "x"}
     proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
     got = dict(l.split("=", 1) for l in out.read_text().splitlines() if "=" in l)
@@ -4205,6 +4209,20 @@ def test_v2_a_push_after_a_completed_review1_is_bypassed_with_matching_statuses(
     assert any("context=devteam/merge-eligible" in c and "state=success" in c for c in posts), posts
     urls = {re.search(r"target_url=(\S+)", c).group(1) for c in posts}
     assert len(urls) == 1, "merge-attempt needs ONE shared attempt URL on both statuses"
+
+
+def test_v2_reopen_on_a_head_that_already_has_a_round1_verdict_is_refused(bypass_script, v2_gh, tmp_path):
+    """Same SHA replayed (close+reopen / ready_for_review): the blocking review stands."""
+    proc, got, calls = _run_bypass(bypass_script, v2_gh, tmp_path, timeline="1", verdict="1")
+    assert proc.returncode == 0, proc.stderr
+    assert got.get("bypass") != "true" and got.get("allowed") == "false"
+    assert not [c for c in calls if "/statuses/" in c and "-X POST" in c]
+
+
+def test_v2_an_unreadable_status_list_fails_closed_no_clearance(bypass_script, v2_gh, tmp_path):
+    proc, got, calls = _run_bypass(bypass_script, v2_gh, tmp_path, timeline="1", verdict="fail")
+    assert got.get("bypass") != "true"
+    assert not [c for c in calls if "-X POST" in c and "/statuses/" in c]
 
 
 def test_v2_without_a_completed_review1_the_push_is_reviewed_not_bypassed(bypass_script, v2_gh, tmp_path):
