@@ -944,7 +944,23 @@ jobs:
           python3 - <<'PYEOF'
           import hashlib, hmac, json, os, subprocess
           TMP = os.environ["RUNNER_TEMP"]
+          def _pr_labels():
+              """Live PR label names, best effort: the platform links a PR to
+              its coder run from the aw-run:<id> label, so GitHub is only
+              asked here, by the workflow's own token."""
+              try:
+                  r = subprocess.run(
+                      ["gh", "api", f"repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/labels",
+                       "--jq", ".[].name"], capture_output=True, text=True, timeout=30)
+                  return [x for x in r.stdout.splitlines() if x] if r.returncode == 0 else []
+              except Exception:
+                  return []
+
+          _labels = _pr_labels()
+          _run_label = next((x for x in _labels if x.startswith("aw-run:")), "")
           payload = {
+              "labels": _labels,
+              "run_id": _run_label[len("aw-run:"):],
               "v": 1, "event": "escalate", "repo": os.environ["REPO"],
               "pr_number": int(os.environ["PR_NUMBER"]),
               "pr_url": os.environ["PR_URL"], "head_sha": os.environ["HEAD_SHA"],
@@ -1680,6 +1696,7 @@ jobs:
            needs.gate.outputs.round == 'needs-human')
         continue-on-error: true
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AW_DEVTEAM_EVENT_SECRET: ${{ secrets.AW_DEVTEAM_EVENT_SECRET }}
           EVENT_URL: ${{ inputs.event_url }}
           REPO: ${{ github.repository }}
@@ -1744,7 +1761,23 @@ jobs:
 
           event = sys.argv[1]
           base = os.environ["EVENT_URL"].rstrip("/")
+          def _pr_labels():
+              """Live PR label names, best effort: the platform links a PR to
+              its coder run from the aw-run:<id> label, so GitHub is only
+              asked here, by the workflow's own token."""
+              try:
+                  r = subprocess.run(
+                      ["gh", "api", f"repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/labels",
+                       "--jq", ".[].name"], capture_output=True, text=True, timeout=30)
+                  return [x for x in r.stdout.splitlines() if x] if r.returncode == 0 else []
+              except Exception:
+                  return []
+
+          _labels = _pr_labels()
+          _run_label = next((x for x in _labels if x.startswith("aw-run:")), "")
           payload = {
+              "labels": _labels,
+              "run_id": _run_label[len("aw-run:"):],
               "v": 1,
               "event": event,
               "repo": os.environ["REPO"],
@@ -2656,7 +2689,23 @@ jobs:
               return items[:50]
 
           base = os.environ["EVENT_URL"].rstrip("/")
+          def _pr_labels():
+              """Live PR label names, best effort: the platform links a PR to
+              its coder run from the aw-run:<id> label, so GitHub is only
+              asked here, by the workflow's own token."""
+              try:
+                  r = subprocess.run(
+                      ["gh", "api", f"repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/labels",
+                       "--jq", ".[].name"], capture_output=True, text=True, timeout=30)
+                  return [x for x in r.stdout.splitlines() if x] if r.returncode == 0 else []
+              except Exception:
+                  return []
+
+          _labels = _pr_labels()
+          _run_label = next((x for x in _labels if x.startswith("aw-run:")), "")
           payload = {
+              "labels": _labels,
+              "run_id": _run_label[len("aw-run:"):],
               "v": 1,
               "event": "merged",
               "repo": os.environ["REPO"],
