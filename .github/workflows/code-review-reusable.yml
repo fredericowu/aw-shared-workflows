@@ -298,6 +298,30 @@ on:
         required: false
         type: number
         default: 3
+      lifecycle:
+        description: >-
+          PR lifecycle (PR lifecycle v2, Kanban 41f5bf3b). `v1` (default) is
+          the two-round loop above, unchanged. `v2`: review 1 is the ONLY
+          review that can block (a finding at or above `block_severity` turns
+          the `code-review` job red and withholds merge eligibility); any push
+          after a COMPLETED review 1 is not re-reviewed and is cleared to
+          merge once CI is green; the merge itself is reported to the platform
+          by the org webhook (and, redundantly until the merged-event job is
+          retired, by that job -- the platform dedupes on one ledger key). The
+          nudge job is skipped. Round memory is the bot-written
+          `devteam:reviewed` label (or a bot-written legacy `devteam:fix-cycle`
+          so PRs in flight at rollout do not get a second review 1).
+        required: false
+        type: string
+        default: 'v1'
+      block_severity:
+        description: >-
+          lifecycle v2 only: lowest severity that blocks on review 1
+          (`low`, `medium`, `high`, `critical`). A finding with a missing or
+          unknown severity ALWAYS blocks (fail closed).
+        required: false
+        type: string
+        default: 'medium'
     secrets:
       # All `required: false`, deliberately. A caller missing one gets a
       # precise, fail-loud error from the step that needs it, naming the repo
@@ -403,6 +427,7 @@ jobs:
       round: ${{ steps.decide.outputs.round }}
       fix_push: ${{ steps.decide.outputs.fix_push }}
       is_draft: ${{ steps.decide.outputs.is_draft }}
+      bypass: ${{ steps.decide.outputs.bypass }}
     steps:
       - name: Decide
         id: decide
@@ -419,6 +444,7 @@ jobs:
           # documented in the KB).
           TRUSTED_AUTHORS: ${{ vars.AW_REVIEW_TRUSTED_AUTHORS }}
           MAX_REVIEWS: ${{ inputs.max_reviews }}
+          LIFECYCLE: ${{ inputs.lifecycle }}
           # Only used to avoid CHARGING the ceiling for a run whose reviewer
           # job will fail on a missing dispatch key before any request is sent.
           HAS_KEY: ${{ secrets.AW_CODEREVIEW_V1_KEY != '' }}
@@ -516,10 +542,49 @@ jobs:
           fi
           has_label() { printf '%s\n' "$labels" | grep -Fxq "$1"; }
 
+          # ---- lifecycle v2: is review 1 already COMPLETED on this PR? ----
+          # Bot-attested, like the ceiling below: a `labeled` timeline event
+          # by github-actions[bot] for `devteam:reviewed` (written by "Set
+          # round labels" on ANY completed round-1 verdict) or the legacy
+          # `devteam:fix-cycle` (so a PR in flight at rollout does not get a
+          # second review 1). A label a human hand-adds is not counted. An
+          # unreadable timeline fails CLOSED: no review, no bypass, the run is
+          # red and re-runnable -- never a silent second review 1.
+          reviewed=false
+          if [ "${LIFECYCLE:-v1}" = "v2" ] && [ "$mode" != "improve" ]; then
+            seen=""
+            for attempt in 1 2 3; do
+              if seen="$(gh api --paginate "repos/${{ github.repository }}/issues/$pr_number/timeline?per_page=100" \
+                           --jq '.[] | select(.event=="labeled" and .actor.login=="github-actions[bot]" and ((.label.name // "") | IN("devteam:reviewed","devteam:fix-cycle"))) | .label.name' \
+                           | wc -l | tr -d ' ')"; then
+                break
+              fi
+              seen="__FAILED__"
+              sleep $(( attempt * 3 ))
+            done
+            if [ "$seen" = "__FAILED__" ] || [ -z "$seen" ]; then
+              echo "::error::lifecycle v2: could not read PR #$pr_number's timeline after 3 attempts. Refusing to guess whether review 1 already ran; re-run this workflow."
+              exit 1
+            fi
+            [ "$seen" -gt 0 ] && reviewed=true
+          fi
+
           if [ "$mode" = "improve" ]; then
             # /aw-improve is a suggestion re-run, not a review round. It must
             # not consume round 1, must not set a label, and must not merge.
             round=informational
+          elif [ "${LIFECYCLE:-v1}" = "v2" ]; then
+            if [ "$reviewed" != "true" ]; then
+              round=1
+            elif [ "${{ github.event_name }}" = "pull_request" ]; then
+              # A push (or reopen / ready_for_review) after a completed
+              # review 1: never re-reviewed; cleared on green CI below.
+              round=bypass
+            else
+              # Manual /aw-review after review 1: an advisory rerun. It posts
+              # comments and never blocks, grants or removes eligibility.
+              round=informational
+            fi
           elif has_label "devteam:awaiting-fixes"; then
             # awaiting-fixes wins: the two labels are mutually exclusive and
             # awaiting-fixes means "the coder owes a push". A needs-human that
@@ -595,7 +660,8 @@ jobs:
           # push to a PR no review has ever run on, which is the
           # high-volume case this strictness was written for. `/aw-review`
           # still forces a review from any state.
-          if [ "${{ github.event.action }}" = "synchronize" ] \
+          if [ "${LIFECYCLE:-v1}" != "v2" ] \
+             && [ "${{ github.event.action }}" = "synchronize" ] \
              && [ "$round" != "2" ] && [ "$round" != "needs-human" ]; then
             echo "synchronize on a round-$round PR — not re-reviewing. \
             Automatic re-review is for the fix-cycle rounds only (labels \
@@ -653,6 +719,37 @@ jobs:
               echo "budget."
             } >> "$GITHUB_STEP_SUMMARY"
             echo "allowed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ---- lifecycle v2 bypass: review 1 is done, this push merges on green CI ----
+          # Reached only for a same-repo (fork PRs never pass the job `if`),
+          # TRUSTED-author pull_request event on a PR whose review 1 completed.
+          # Both statuses carry the SAME target_url: merge-attempt requires the
+          # latest successful devteam/code-review and devteam/merge-eligible to
+          # share one attempt URL, and this satisfies that check rather than
+          # weakening it. A draft is never cleared here (merge-attempt also
+          # re-checks live); ready_for_review re-enters this branch.
+          if [ "$round" = "bypass" ]; then
+            if [ "$is_draft" = "true" ]; then
+              echo "lifecycle v2: PR #$pr_number is a draft - no clearance written; ready_for_review will write it."
+              echo "allowed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            attempt_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}"
+            gh api -X POST "repos/${{ github.repository }}/statuses/$sha" \
+              -f state=success -f context=devteam/code-review \
+              -f "description=not re-reviewed: review 1 done [rk r=bypass m=review]" \
+              -f "target_url=$attempt_url" --silent
+            gh api -X POST "repos/${{ github.repository }}/statuses/$sha" \
+              -f state=success -f context=devteam/merge-eligible \
+              -f "description=review 1 done: cleared to merge once CI is green" \
+              -f "target_url=$attempt_url" --silent
+            echo "lifecycle v2: review 1 already completed - cleared $sha to merge on green CI without a new review"
+            {
+              echo "allowed=false"
+              echo "bypass=true"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -1097,6 +1194,8 @@ jobs:
           HEAD_SHA: ${{ needs.gate.outputs.sha }}
           ROUND: ${{ needs.gate.outputs.round }}
           IS_DRAFT: ${{ needs.gate.outputs.is_draft }}
+          LIFECYCLE: ${{ inputs.lifecycle }}
+          BLOCK_SEVERITY: ${{ inputs.block_severity }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
           AGENT_SLUG: ${{ inputs.agent_slug }}
         run: |
@@ -1347,7 +1446,18 @@ jobs:
                   elif f["blocks_merge"] is True:
                       blocking.append(f)
 
-          if round_ == "1":
+          if round_ == "1" and os.environ.get("LIFECYCLE", "v1") == "v2":
+              # lifecycle v2: review 1 blocks on `block_severity` and above.
+              # FAIL CLOSED: a missing or unknown severity counts as blocking.
+              order = ["info", "low", "medium", "high", "critical"]
+              floor = os.environ.get("BLOCK_SEVERITY", "medium").strip().lower()
+              floor_ix = order.index(floor) if floor in order else order.index("medium")
+              def _blocks(f):
+                  sev = str(f.get("severity") or "").strip().lower()
+                  return sev not in order or order.index(sev) >= floor_ix
+              blocking = [f for f in findings if _blocks(f)]
+              eligible = not blocking
+          elif round_ == "1":
               eligible = not findings
           elif round_ in ("2", "needs-human"):
               eligible = not blocking
@@ -1484,6 +1594,7 @@ jobs:
           FINDINGS_COUNT: ${{ steps.findings.outputs.findings_count }}
           BLOCKING_COUNT: ${{ steps.findings.outputs.blocking_count }}
           FIX_PUSH: ${{ needs.gate.outputs.fix_push }}
+          LIFECYCLE: ${{ inputs.lifecycle }}
         run: |
           set -euo pipefail
           add_label() {
@@ -1511,7 +1622,11 @@ jobs:
           # step's real outcome: the event step sends `escalate` only when
           # needs-human was actually written here.
           escalated=false
-          if [ "$ROUND" = "1" ] && [ "${FINDINGS_COUNT:-0}" -gt 0 ]; then
+          if [ "${LIFECYCLE:-v1}" = "v2" ]; then
+            # Round memory only: review 1 COMPLETED (any verdict). No
+            # awaiting-fixes / needs-human in v2.
+            if [ "$ROUND" = "1" ]; then add_label "devteam:reviewed"; fi
+          elif [ "$ROUND" = "1" ] && [ "${FINDINGS_COUNT:-0}" -gt 0 ]; then
             # fix-cycle first: if this write fails, set -e stops the step before
             # awaiting-fixes exists, so the PR never says "coder owes a push"
             # without the round memory behind it.
@@ -1579,6 +1694,7 @@ jobs:
           # pings, instead of reading as a real blocking finding.
           MISSING_BLOCKS_MERGE: ${{ steps.findings.outputs.missing_blocks_merge }}
           ELIGIBLE: ${{ steps.findings.outputs.eligible }}
+          LIFECYCLE: ${{ inputs.lifecycle }}
           PR_URL: ${{ github.server_url }}/${{ github.repository }}/pull/${{ needs.gate.outputs.pr_number }}
         run: |
           set -euo pipefail
@@ -1586,6 +1702,10 @@ jobs:
             echo "::warning::AW_DEVTEAM_EVENT_SECRET is not set — the coder cannot be woken."
             exit 0
           fi
+          # lifecycle v2: review 1 is the only round and only a BLOCKING
+          # finding wakes the coder (`findings`); anything else is `cleared`
+          # (carrying the LOW/INFO digest: stored, no wake).
+          if [ "${LIFECYCLE:-v1}" = "v2" ]; then FINDINGS_COUNT="${BLOCKING_COUNT:-0}"; fi
           round="$ROUND"
           if [ "$round" = "1" ] && [ "${FINDINGS_COUNT:-0}" -gt 0 ]; then
             event=findings
@@ -1639,6 +1759,9 @@ jobs:
               # wait; the platform only stores this digest.
               "nudge_follows": True,
           }
+          if os.environ.get("LIFECYCLE", "v1") == "v2":
+              # v2 has no nudge job: the platform must wake directly.
+              payload["nudge_follows"] = False
           # Sign the EXACT bytes that get posted — build once, write once,
           # sign the file's contents, send the file. Signed in python rather
           # than `openssl dgst -hmac "$SECRET"` so the secret never appears
@@ -1665,6 +1788,20 @@ jobs:
               print(f"::warning::devteam-review-event {event} returned HTTP {code}")
               sys.exit(1)
           PYEOF
+
+      # lifecycle v2: LAST step of the job, after the statuses, the round
+      # label and the event are all written. The job goes red; the
+      # `devteam/code-review` STATUS stays a success ("a verdict exists"), so
+      # the gate's reuse check never re-dispatches a paid review on this sha.
+      - name: Fail the job on a blocking review 1 (lifecycle v2)
+        if: >-
+          always() && inputs.lifecycle == 'v2' &&
+          needs.gate.outputs.round == '1' &&
+          steps.findings.outcome == 'success' &&
+          steps.findings.outputs.blocking_count != '0'
+        run: |
+          echo "::error::review 1 found ${{ steps.findings.outputs.blocking_count }} finding(s) at or above '${{ inputs.block_severity }}'. Fix them and push: the next push merges on green CI without a second deep review."
+          exit 1
 
   # ---------------------------------------------------------------------------
   # PROVENANCE: every Dev Team PR must carry which agent run created it,
@@ -1693,7 +1830,7 @@ jobs:
   # ---------------------------------------------------------------------------
   provenance-gate:
     needs: gate
-    if: needs.gate.outputs.allowed == 'true'
+    if: needs.gate.outputs.allowed == 'true' || needs.gate.outputs.bypass == 'true'
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 10
     steps:
@@ -2003,7 +2140,8 @@ jobs:
       always() &&
       (
         github.event_name == 'workflow_run' ||
-        needs.code-review.outputs.eligible == 'true'
+        needs.code-review.outputs.eligible == 'true' ||
+        needs.gate.outputs.bypass == 'true'
       )
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     outputs:
@@ -2408,6 +2546,11 @@ jobs:
           # posts its verdict reaches this code twice — and whichever loses
           # that race must not redden a PR that merged perfectly well.
           after = api(f"repos/{REPO}/pulls/{pr_number}")
+          if "merge already in progress" in (out.stderr or "").lower():
+              # Benign race (both entry points fired): re-read; merged or
+              # merging is success, the other attempt owns the merge.
+              print(f"#{pr_number}: merge already in progress (other entry point) - treating as success")
+              sys.exit(0)
           if after and after.get("merged"):
               print(f"#{pr_number} was already merged (the other entry point, or "
                     f"a human, got there first) — treating as success")
@@ -2677,6 +2820,7 @@ jobs:
     needs: [gate, code-review, provenance-gate, merge-attempt]
     if: >-
       always() &&
+      inputs.lifecycle != 'v2' &&
       github.event.action != 'closed' &&
       github.event.sender.type != 'Bot' &&
       (
