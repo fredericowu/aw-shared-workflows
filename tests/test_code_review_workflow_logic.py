@@ -4126,6 +4126,16 @@ def test_v2_every_completed_review1_writes_reviewed_and_nothing_else(
     assert not any("awaiting-fixes" in c or "needs-human" in c for c in calls)
 
 
+def test_v2_no_reviewed_label_when_the_round1_status_publish_failed(labels_script, fake_gh, tmp_path):
+    os.environ["PUBLISH_OUTCOME"] = "failure"
+    try:
+        out, calls = _v2_labels(labels_script, fake_gh, tmp_path, round_="1", findings_count=1, blocking_count=1)
+    finally:
+        del os.environ["PUBLISH_OUTCOME"]
+    assert not [c for c in calls if "-X POST" in c], calls
+    assert "labelled: devteam:reviewed" not in out
+
+
 def test_v2_labels_nothing_on_an_informational_run(labels_script, fake_gh, tmp_path):
     _, calls = _v2_labels(labels_script, fake_gh, tmp_path, round_="informational", findings_count=1)
     assert not [c for c in calls if "-X POST" in c]

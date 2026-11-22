@@ -1533,6 +1533,7 @@ jobs:
       # `pending` forever is indistinguishable from a queue backlog. A job
       # killed by `timeout-minutes` above still reaches this step.
       - name: Publish code-review status
+        id: publish
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1596,6 +1597,7 @@ jobs:
           BLOCKING_COUNT: ${{ steps.findings.outputs.blocking_count }}
           FIX_PUSH: ${{ needs.gate.outputs.fix_push }}
           LIFECYCLE: ${{ inputs.lifecycle }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
         run: |
           set -euo pipefail
           add_label() {
@@ -1626,7 +1628,16 @@ jobs:
           if [ "${LIFECYCLE:-v1}" = "v2" ]; then
             # Round memory only: review 1 COMPLETED (any verdict). No
             # awaiting-fixes / needs-human in v2.
-            if [ "$ROUND" = "1" ]; then add_label "devteam:reviewed"; fi
+            # Only when the round-1 status was actually published: the bypass
+            # gate clears a head by reading that status, so a label without it
+            # would let a replay of the same SHA skip a blocked review.
+            if [ "$ROUND" = "1" ]; then
+              if [ "${PUBLISH_OUTCOME:-success}" = "success" ]; then
+                add_label "devteam:reviewed"
+              else
+                echo "::warning::round-1 status publish ${PUBLISH_OUTCOME}; not writing devteam:reviewed so the next run reviews again"
+              fi
+            fi
           elif [ "$ROUND" = "1" ] && [ "${FINDINGS_COUNT:-0}" -gt 0 ]; then
             # fix-cycle first: if this write fails, set -e stops the step before
             # awaiting-fixes exists, so the PR never says "coder owes a push"
