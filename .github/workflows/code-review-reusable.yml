@@ -1148,11 +1148,24 @@ jobs:
                     fi
                     empty_retries=$((empty_retries + 1))
                     http_code=empty-reviewer-message
+                  elif jq -e '(.aw_status // "success") != "success"
+                      and ([.. | strings] | join(" ")
+                           | test("upstream unreachable|connection refused"))' \
+                      "$RUNNER_TEMP/dispatch_response.json" >/dev/null 2>&1; then
+                    # The platform answers 200 + aw_status=error when the
+                    # runner's own upstream is down (e.g. its core was
+                    # restarting). That answers in seconds and is the same
+                    # transient as a 502, so retry it on the same backoff. A
+                    # "no activity for 600s" death is NOT matched: it has
+                    # already burned ~10 min and a retry would breach the
+                    # job's 25-minute ceiling.
+                    echo "::warning::the runner upstream was unreachable"
+                    http_code=runner-unreachable
                   fi ;;
               esac
             fi
             case "$http_code" in
-              502|503|504|curl-failure|empty-reviewer-message) ;;
+              502|503|504|curl-failure|empty-reviewer-message|runner-unreachable) ;;
               *) break ;;
             esac
             if [ "$attempt" -ge "$max_tries" ]; then
