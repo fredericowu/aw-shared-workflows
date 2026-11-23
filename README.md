@@ -610,7 +610,16 @@ fails closed) writes `devteam/code-review` + `devteam/merge-eligible` success
 with one shared attempt URL and merges once CI is green, with no new deep
 review. Drafts get no clearance; forks and untrusted authors never reach it. A
 manual `/aw-review` or `/aw-improve` after review 1 is advisory only. The
-per-PR review ceiling (`max_reviews`, `review-count:N`) is unchanged.
+per-PR review ceiling (`max_reviews`, `review-count:N`) only counts reviews
+that returned a verdict: an attempt that errored (reviewer `aw_status=error`,
+invalid verdict, dispatch failure) is refunded with a `review-refund:N` label
+(budget used = charged - refunded), a completed review adds `review-ok`, and
+`max_errored_reviews` (default 3) bounds consecutive errored attempts so a
+broken reviewer cannot loop. An errored review comments once per head on the
+PR and wakes the opener coder (`review_error` trigger on the platform's
+`devteam-pr-nudge` door, once per head). Two triggers for the same head
+dedupe: the gate serialises per PR+head and a fresh in-flight
+`devteam/code-review` pending status refuses the second one.
 
 Labels: the gate writes only `devteam:reviewed` and `review-count:N`. It never
 writes or reads `devteam:needs-human` (human-needed state lives on the Kanban
