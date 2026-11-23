@@ -4407,6 +4407,21 @@ def test_full_reruns_of_one_run_each_advance_the_error_streak(tmp_path):
     assert any("labels[]=review-error:x-2" in c for c in calls), calls
 
 
+def test_an_uncharged_admitted_review_still_gets_an_attempt_id(gate_tail_script, ceil_gh, tmp_path, monkeypatch):
+    monkeypatch.setenv("HAS_KEY", "false")
+    _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0)
+    assert out["allowed"] == "true" and "charged" not in out and out["charge"] == "102-2"
+
+
+def test_failed_jobs_reruns_of_an_uncharged_review_do_not_advance_the_streak(tmp_path):
+    # the gate output (charge=9-1) is reused across failed-jobs attempts, so the
+    # error marker already on the timeline is found: no new marker
+    proc, _, calls = _run_refund(tmp_path, outcome="failure", charged="", slot="", charge="9-1",
+                                 timeline="review-error:9-1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not any("-X POST" in c for c in calls), calls
+
+
 def test_three_full_attempts_of_one_run_hit_the_error_cap(gate_tail_script, ceil_gh, tmp_path):
     tl = ["review-count:1", "review-error:9-1", "review-refund:1:9-1", "review-count:1",
           "review-error:9-2", "review-refund:1:9-2", "review-count:1", "review-error:9-3",
