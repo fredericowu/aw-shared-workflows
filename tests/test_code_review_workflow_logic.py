@@ -4524,7 +4524,37 @@ def test_a_rerun_of_the_same_failed_run_does_not_refund_twice(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "errored=true" in out  # the wake path still has its own once-per-head guard
     assert not any("-X POST" in c for c in calls), calls
-    assert "already recorded" in proc.stdout
+    assert "already recorded" in proc.stdout and "already refunded" in proc.stdout
+
+
+def test_replay_after_unreadable_timeline_completes_the_missing_refund_once(tmp_path):
+    # first attempt: timeline unreadable -> error marker written, no refund.
+    # replay sees review-error:x but no review-refund:2 -> must refund, not re-record.
+    proc, _, calls = _run_refund(tmp_path, outcome="failure",
+                                 timeline="review-count:2\nreview-error:x")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert [c for c in calls if "labels[]=review-refund:2" in c], calls
+    assert not any("labels[]=review-error:" in c for c in calls), calls
+    # replaying once more now sees both markers: nothing is written
+    _, _, calls = _run_refund(tmp_path, outcome="failure",
+                              timeline="review-count:2\nreview-error:x\nreview-refund:2")
+    assert not any("-X POST" in c for c in calls), calls
+
+
+def test_replay_after_failed_error_marker_write_records_it_without_double_refund(tmp_path):
+    # marker POST failed but refund landed: replay records the marker only
+    _, _, calls = _run_refund(tmp_path, outcome="failure",
+                              timeline="review-count:2\nreview-refund:2")
+    assert any("labels[]=review-error:" in c for c in calls), calls
+    assert not any("labels[]=review-refund" in c for c in calls), calls
+
+
+def test_refund_post_failure_after_error_marker_leaves_it_recoverable(tmp_path):
+    # refund POST fails (gh_fail) after the marker: no crash; a replay with
+    # marker-only timeline refunds (covered above)
+    proc, _, _ = _run_refund(tmp_path, outcome="failure", gh_fail=True,
+                             timeline="review-count:2\nreview-error:x")
+    assert proc.returncode == 0 and "still counts" in proc.stdout + proc.stderr
 
 
 def test_an_unreadable_timeline_records_the_error_but_never_refunds(tmp_path):
