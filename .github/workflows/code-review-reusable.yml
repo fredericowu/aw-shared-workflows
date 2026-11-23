@@ -707,7 +707,7 @@ jobs:
           # verdict, dispatch failure) is recorded by the `Refund` step in the
           # review job: a `review-error:<run id>` label (one bot-authored
           # `labeled` event per errored run, charged or not) and, when a unit
-          # was charged, a `review-refund:N` label; the budget used is
+          # was charged, a `review-refund:<run id>` label; the budget used is
           # charged - refunded. A completed review adds `review-ok`, which
           # resets the consecutive-errors streak (error events since the last
           # `review-ok`), bounded by `max_errored_reviews` independently of
@@ -1484,7 +1484,7 @@ jobs:
       # (dispatch failed, the platform answered 200 + aw_status=error such as
       # "400 temperature unsupported", an invalid verdict) spent nothing the
       # budget should remember: the gate charged `review-count:N` up front, so
-      # this adds `review-refund:N` (one more bot `labeled` event; the gate
+      # this adds `review-refund:<run id>` (one more bot `labeled` event; the gate
       # counts charged - refunded). Consecutive errors stay bounded by the
       # gate's `max_errored_reviews`. A completed review adds `review-ok`,
       # which resets that streak. Neither step may fail the job.
@@ -1544,20 +1544,22 @@ jobs:
             echo "no budget unit was charged for this attempt — nothing to refund"
             exit 0
           fi
-          # Slot numbers are reused (the next charge after a refund takes the
-          # refunded number), so an earlier run's `review-refund:$SLOT` must not
-          # suppress this run's. This run's refund is the one that follows ITS
-          # error marker in the timeline (marker is always written first).
-          if printf '%s\n' "$seen" | awk -v m="$err_label" -v r="review-refund:$SLOT" \
-               'f && $0==r {found=1} $0==m {f=1} END {exit !found}'; then
-            echo "budget unit $SLOT is already refunded for this run — not refunding again"
+          # The refund label is keyed by this RUN's id, not the slot number: slot
+          # numbers are reused (the next charge after a refund takes the
+          # refunded number), so a slot-keyed label cannot tell whose refund it
+          # is. `review-refund:<run id>` is still all digits, so the gate's
+          # charged - refunded count is unchanged; older `review-refund:<slot>`
+          # labels keep counting.
+          ref_label="review-refund:${{ github.run_id }}"
+          if printf '%s\n' "$seen" | grep -qxF "$ref_label"; then
+            echo "this run's charge is already refunded ($ref_label) — not refunding again"
             exit 0
           fi
-          gh api -X DELETE "$label_api/review-refund%3A$SLOT" --silent 2>/dev/null || true
-          if gh api -X POST "$label_api" -f "labels[]=review-refund:$SLOT" --silent; then
-            echo "review produced no verdict — refunded budget unit $SLOT (review-refund:$SLOT)"
+          gh api -X DELETE "$label_api/review-refund%3A${{ github.run_id }}" --silent 2>/dev/null || true
+          if gh api -X POST "$label_api" -f "labels[]=$ref_label" --silent; then
+            echo "review produced no verdict — refunded budget unit $SLOT ($ref_label)"
           else
-            echo "::warning::could not stamp review-refund:$SLOT; this errored attempt still counts"
+            echo "::warning::could not stamp $ref_label; this errored attempt still counts"
           fi
 
       # An errored review leaves the PR with no review coming. Tell a human on
