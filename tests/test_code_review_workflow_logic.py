@@ -2838,6 +2838,9 @@ def gate_tail_script(tmp_path_factory) -> Path:
         .replace("${{ github.repository }}", "tekflox/aw-app-template")
         .replace('"$GITHUB_OUTPUT"', '"$OUTF"')
         .replace("${{ github.event.action }}", "${ACTION}")
+        .replace("${{ github.server_url }}", "https://github.com")
+        .replace("${{ github.run_id }}", "1")
+        .replace("${{ github.run_attempt }}", "1")
     )
     path = tmp_path_factory.mktemp("wf") / "gate_tail.sh"
     path.write_text(
@@ -2961,7 +2964,7 @@ def ceil_gh(tmp_path_factory) -> Path:
         'if [[ "$*" == *"/statuses"* ]]; then echo "[]"; exit 0; fi\n'
         'if [[ "$*" == *"-X POST"* ]]; then\n'
         '  if [ "${LABEL_POST_FAIL:-0}" = "1" ]; then exit 1; fi\n'
-        '  if [[ ( "$*" == *"labels[]=devteam:review-"* || "$*" == *"labels[]=review-count:"* ) && "$*" != *"review-capped"* && "$*" != *"review-exhausted"* ]]; then echo ev >> "$TIMELINE_FILE"; fi\n'
+        '  if [[ ( "$*" == *"labels[]=devteam:review-"* || "$*" == *"labels[]=review-count:"* || "$*" == *"labels[]=review-refund:"* || "$*" == *"labels[]=review-error:"* || "$*" == *"labels[]=review-ok"* ) && "$*" != *"review-capped"* && "$*" != *"review-exhausted"* ]]; then echo "$*" | sed \'s/.*labels\\[\\]=//\' | awk \'{print $1}\' >> "$TIMELINE_FILE"; fi\n'
         "fi\n"
         "exit 0\n"
     )
@@ -2970,16 +2973,20 @@ def ceil_gh(tmp_path_factory) -> Path:
 
 
 def _ceil(script, ceil_gh, tmp_path, *, used=0, max_reviews="3", labels="", action="created",
-          round_="1", mode="review", timeline_fail=False, label_post_fail=False):
+          round_="1", mode="review", timeline_fail=False, label_post_fail=False,
+          timeline=None, max_errored="3"):
     tl = tmp_path / "timeline"
-    if not tl.exists():
-        tl.write_text("ev\n" * used)
+    if timeline is not None:
+        tl.write_text("".join(f"{n}\n" for n in timeline))
+    elif not tl.exists():
+        tl.write_text("".join(f"review-count:{i + 1}\n" for i in range(used)))
     out = tmp_path / "out"
     out.write_text("")
     env = {
         **os.environ,
         "PATH": f"{ceil_gh}{os.pathsep}{os.environ['PATH']}",
         "ACTION": action, "LABELS": labels, "MAX_REVIEWS": max_reviews,
+        "MAX_ERRORED_REVIEWS": max_errored,
         "TIMELINE_FILE": str(tl), "TIMELINE_FAIL": "1" if timeline_fail else "0",
         "LABEL_POST_FAIL": "1" if label_post_fail else "0",
         "GH_LOG": str(tmp_path / "calls.log"), "OUTF": str(out), "GH_TOKEN": "x",
@@ -3074,7 +3081,7 @@ def test_a_hand_added_label_cannot_dodge_the_count(gate_tail_script, ceil_gh, tm
     _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, used=0, labels=seeded)
     assert out["allowed"] == "true"
     assert any("-X DELETE" in c and "review-count%3A1" in c for c in calls)
-    assert (tmp_path / "timeline").read_text().count("ev") == 1
+    assert (tmp_path / "timeline").read_text().count("review-count:") == 1
 
 
 def test_unreadable_timeline_fails_open_loudly(gate_tail_script, ceil_gh, tmp_path):
@@ -3123,7 +3130,7 @@ def ceiling_gh(tmp_path):
     gh.write_text(
         "#!/bin/bash\n"
         'printf "%s\\n" "$*" >> "$GH_LOG"\n'
-        'if [[ "$*" == *"/timeline"* ]]; then printf "1\\n2\\n3\\n"; exit 0; fi\n'
+        'if [[ "$*" == *"/timeline"* ]]; then printf "review-count:1\\nreview-count:2\\nreview-count:3\\n"; exit 0; fi\n'
         "exit 0\n"
     )
     gh.chmod(0o755)
@@ -3440,7 +3447,7 @@ def test_legacy_review_n_events_carry_forward_without_double_charge(gate_tail_sc
 
 def test_ceiling_jq_counts_both_label_families():
     src = (Path(__file__).resolve().parent.parent / ".github/workflows/code-review-reusable.yml").read_text()
-    assert 'test("^(devteam:review-|review-count:)[0-9]+$")' in src
+    assert 'test("^((devteam:review-|review-count:|review-refund:|review-error:)[0-9]+|review-ok)$")' in src
 
 # --------------------------------------------------------------------------
 # QA rework (card 41e5bf3b): escalation delivery is tracked apart from the
@@ -4348,3 +4355,300 @@ def test_a_failed_checks_lookup_is_reported_not_read_as_nothing_failing(
     assert posted == []
     assert "could not read PR #7's checks" in proc.stdout
     assert "no non-advisory check is failing" not in proc.stdout
+
+
+# --------------------------------------------------------------------------
+# card 4215bf3b: errored reviews are refunded, same-head runs dedupe, errored
+# review wakes the opener coder
+# --------------------------------------------------------------------------
+
+
+def test_refunded_attempts_do_not_count_toward_the_ceiling(gate_tail_script, ceil_gh, tmp_path):
+    # 3 charged, 2 refunded -> 1 used (error streak 2 < 3): allowed, next slot is 2
+    tl = ["review-count:1", "review-error:1", "review-refund:1", "review-count:2",
+          "review-error:2", "review-refund:2", "review-count:3"]
+    proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl)
+    assert out.get("allowed") == "true" and "capped" not in out, proc.stdout + proc.stderr
+    assert out["charged"] == "true" and out["slot"] == "2"
+    assert any("labels[]=review-count:2" in c for c in calls), calls
+
+
+def test_pr185_three_errored_reviews_with_zero_verdicts_is_not_the_budget_ceiling(
+        gate_tail_script, ceil_gh, tmp_path):
+    # The incident: 3 dispatches, all errored. Budget used is 0, so it is NOT
+    # a budget refusal; the separate errored-streak bound is what speaks.
+    tl = ["review-count:1", "review-error:11", "review-refund:1", "review-count:1",
+          "review-error:12", "review-refund:1", "review-count:1", "review-error:13",
+          "review-refund:1"]
+    _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl)
+    assert out["capped"] == "true" and out["cap_kind"] == "errors"
+    assert out["review_count"] == "3" and out["max_reviews"] == "3"
+    # with the streak bound off, the same PR is simply allowed: 0 of 3 used
+    (tmp_path / "timeline").unlink()
+    _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl, max_errored="0")
+    assert out["allowed"] == "true" and out["slot"] == "1" and "capped" not in out
+
+
+def test_a_completed_review_resets_the_error_streak(gate_tail_script, ceil_gh, tmp_path):
+    tl = ["review-count:1", "review-error:11", "review-refund:1", "review-count:1",
+          "review-error:12", "review-refund:1", "review-count:1", "review-ok",
+          "review-count:2", "review-error:13", "review-refund:2"]
+    proc, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl)
+    assert out["allowed"] == "true" and "capped" not in out, proc.stdout + proc.stderr
+
+
+def test_real_verdicts_still_hit_the_budget_ceiling(gate_tail_script, ceil_gh, tmp_path):
+    tl = ["review-count:1", "review-ok", "review-count:2", "review-ok", "review-count:3", "review-ok"]
+    _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl)
+    assert out["capped"] == "true" and out["cap_kind"] == "budget" and out["review_count"] == "3"
+
+
+def _fresh(minutes_ago):
+    import datetime as _dt
+    t = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=minutes_ago)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_a_fresh_pending_review_of_the_same_head_dedupes_a_second_trigger(
+        gate_tail_script, cap_gh, tmp_path):
+    pending = {**_st("pending", "Dev Team deep review in progress"), "updated_at": _fresh(1)}
+    proc, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="opened",
+                             statuses=[pending])
+    assert "allowed=false" in out and "allowed=true" not in out, proc.stdout + proc.stderr
+    assert "already in flight" in proc.stdout
+    # refused before the budget: nothing was charged, no pending rewritten
+    assert not any("labels[]=review-count" in c for c in calls), calls
+
+
+def test_a_stale_pending_status_does_not_block_the_head(gate_tail_script, cap_gh, tmp_path):
+    pending = {**_st("pending", "Dev Team deep review in progress"), "updated_at": _fresh(90)}
+    _, out, _ = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="opened",
+                      statuses=[pending])
+    assert "allowed=true" in out
+
+
+def test_the_gate_claims_the_head_with_a_pending_status_when_it_admits_a_review(
+        gate_tail_script, cap_gh, tmp_path):
+    _, out, calls = _gate(gate_tail_script, cap_gh, tmp_path, round_="1", action="opened")
+    assert "allowed=true" in out
+    assert any("state=pending" in c and "context=devteam/code-review" in c for c in calls), calls
+
+
+def test_the_error_streak_is_bounded_even_with_the_paid_ceiling_off_and_without_refunds(
+        gate_tail_script, ceil_gh, tmp_path):
+    # review finding: max_reviews=0 skipped the streak check, and an uncharged
+    # error (missing key) left no event. Error events alone must stop dispatch.
+    tl = ["review-error:11", "review-error:12", "review-error:13"]
+    _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl, max_reviews="0")
+    assert out["allowed"] == "false" and out["cap_kind"] == "errors", out
+    (tmp_path / "timeline").unlink()
+    _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl[:2], max_reviews="0")
+    assert out["allowed"] == "true" and "charged" not in out
+    assert not any("labels[]=review-count" in c for c in calls)
+
+
+def test_the_gate_serialises_per_pr_for_pr_and_comment_events():
+    text = WORKFLOW.read_text()
+    gate = text[text.index("\n  gate:\n"):text.index("\n    steps:\n", text.index("\n  gate:\n"))]
+    group = [l for l in gate.splitlines() if l.strip().startswith("group:")][0]
+    # a comment event has no head sha: the key must not depend on it, or an
+    # opened event and an /aw-review comment for one head get different locks
+    assert "head.sha" not in group and "'comment'" not in group
+    assert "issue.number" in group and "pull_request.number" in group
+
+
+# ---- the refund + wake steps of the review job ----
+
+_REFUND_STEP = "- name: Refund the review budget on an errored review, or reset the error streak"
+_ERR_STEP = "- name: Tell the PR and wake the opener coder on an errored review"
+
+
+def _run_refund(tmp_path, *, outcome, charged="true", slot="2", gh_fail=False,
+                timeline="", timeline_fail=False):
+    d = tmp_path / "refund"
+    d.mkdir(exist_ok=True)
+    (d / "calls.log").write_text("")
+    gh = d / "gh"
+    gh.write_text("#!/bin/bash\n"
+                  'printf "%s\\n" "$*" >> "' + str(d / "calls.log") + '"\n'
+                  + ('if [[ "$*" == *"/timeline"* ]]; then ' + ("exit 1" if timeline_fail else
+                     "printf '%s\\n' '" + timeline + "'; exit 0") + "; fi\n")
+                  + ('if [[ "$*" == *"-X POST"* ]]; then exit 1; fi\n' if gh_fail else "")
+                  + "exit 0\n")
+    gh.chmod(0o755)
+    out = d / "out"
+    out.write_text("")
+    script = d / "refund.sh"
+    script.write_text(_extract_run(_REFUND_STEP.replace("- name: ", "")))
+    env = {**os.environ, "PATH": f"{d}{os.pathsep}{os.environ['PATH']}", "GH_TOKEN": "t",
+           "FINDINGS_OUTCOME": outcome, "CHARGED": charged, "SLOT": slot, "PR_NUMBER": "7",
+           "GITHUB_OUTPUT": str(out)}
+    proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    return proc, out.read_text(), (d / "calls.log").read_text().splitlines()
+
+
+def test_an_errored_review_refunds_the_charged_slot(tmp_path):
+    proc, out, calls = _run_refund(tmp_path, outcome="failure")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "errored=true" in out
+    delete = [i for i, c in enumerate(calls) if "-X DELETE" in c and "review-refund%3A2" in c]
+    post = [i for i, c in enumerate(calls) if "labels[]=review-refund:2" in c]
+    assert delete and post and delete[0] < post[0], calls
+
+
+@pytest.mark.parametrize("outcome", ["failure", "skipped", "cancelled"])
+def test_every_no_verdict_outcome_is_refunded(tmp_path, outcome):
+    _, out, calls = _run_refund(tmp_path, outcome=outcome)
+    assert "errored=true" in out and any("review-refund:2" in c for c in calls)
+
+
+def test_a_real_verdict_is_not_refunded_and_resets_the_streak(tmp_path):
+    _, out, calls = _run_refund(tmp_path, outcome="success")
+    assert "errored" not in out
+    assert not any("review-refund" in c for c in calls)
+    assert any("labels[]=review-ok" in c for c in calls)
+
+
+def test_an_uncharged_attempt_has_nothing_to_refund_but_still_counts_as_errored(tmp_path):
+    _, out, calls = _run_refund(tmp_path, outcome="failure", charged="")
+    assert "errored=true" in out and not any("review-refund" in c for c in calls)
+    # ...and still advances the gate's error streak (missing key, max_reviews=0)
+    assert any("labels[]=review-error:" in c for c in calls), calls
+
+
+def test_a_rerun_of_the_same_failed_run_does_not_refund_twice(tmp_path):
+    # "Re-run failed jobs" reuses the gate's charged/slot outputs; the run's
+    # first failure already recorded review-error:<run id> (+ the refund).
+    proc, out, calls = _run_refund(tmp_path, outcome="failure",
+                                   timeline="review-count:2\nreview-error:x\nreview-refund:2")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "errored=true" in out  # the wake path still has its own once-per-head guard
+    assert not any("-X POST" in c for c in calls), calls
+    assert "already recorded" in proc.stdout
+
+
+def test_an_unreadable_timeline_records_the_error_but_never_refunds(tmp_path):
+    proc, _, calls = _run_refund(tmp_path, outcome="failure", timeline_fail=True)
+    assert proc.returncode == 0
+    assert any("labels[]=review-error:" in c for c in calls)
+    assert not any("review-refund" in c for c in calls), calls
+
+
+def test_a_failed_refund_write_never_fails_the_job(tmp_path):
+    proc, _, _ = _run_refund(tmp_path, outcome="failure", gh_fail=True)
+    assert proc.returncode == 0
+    assert "still counts" in proc.stdout + proc.stderr
+
+
+def test_refund_and_wake_steps_are_best_effort_and_skip_advisory_runs():
+    text = WORKFLOW.read_text()
+    for name in (_REFUND_STEP, _ERR_STEP):
+        step = text[text.index(name):]
+        head = step[: step.index("        run: |")]
+        assert "continue-on-error: true" in head and "always()" in head, name
+    errhead = text[text.index(_ERR_STEP):]
+    errhead = errhead[: errhead.index("        run: |")]
+    assert "informational" in errhead  # /aw-improve never wakes the coder
+
+
+@pytest.fixture(scope="module")
+def review_error_script(tmp_path_factory) -> Path:
+    src = _extract_heredoc(_ERR_STEP)
+    assert "review_error" in src, "extracted the wrong block"
+    path = tmp_path_factory.mktemp("wf") / "review_error.py"
+    path.write_text(src)
+    return path
+
+
+def _run_review_error(review_error_script, ci_red_bin, tmp_path, *, response=None, labels="aw-run:abc\n",
+                      head=_RED_SHA, comments="", curl_code="200", secret="s3cret"):
+    d = tmp_path / "rerr"
+    d.mkdir(exist_ok=True)
+    for f in d.iterdir():
+        f.unlink()
+    (d / "labels.txt").write_text(labels)
+    (d / "view.json").write_text(json.dumps(
+        {"state": "OPEN", "headRefOid": head, "url": "https://github.com/o/r/pull/7",
+         "statusCheckRollup": []}))
+    (d / "comments.txt").write_text(comments)
+    if response is not None:
+        (d / "dispatch_response.json").write_text(json.dumps(response))
+    # a gh that serves the three reads and records comment POSTs
+    gb = tmp_path / "rerrbin"
+    gb.mkdir(exist_ok=True)
+    gh = gb / "gh"
+    gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "a = ' '.join(sys.argv[1:]); d = os.environ['FAKE_GH_DIR']\n"
+        "if '-X POST' in a and '/comments' in a:\n"
+        "    open(os.path.join(d, 'comment_posts.log'), 'a').write(a + '\\n'); sys.exit(0)\n"
+        "if a.startswith('api') and a.endswith('--jq .[].body'): sys.stdout.write(open(os.path.join(d, 'comments.txt')).read()); sys.exit(0)\n"
+        "if a.startswith('api') and '/labels' in a: sys.stdout.write(open(os.path.join(d, 'labels.txt')).read()); sys.exit(0)\n"
+        "if a.startswith('pr view'): sys.stdout.write(open(os.path.join(d, 'view.json')).read()); sys.exit(0)\n"
+        "sys.exit(1)\n")
+    gh.chmod(0o755)
+    env = {**os.environ,
+           "PATH": f"{gb}{os.pathsep}{ci_red_bin}{os.pathsep}{os.environ['PATH']}",
+           "FAKE_GH_DIR": str(d), "FAKE_CURL_CODE": curl_code, "GH_TOKEN": "t", "REPO": "o/r",
+           "PR_NUMBER": "7", "HEAD_SHA": _RED_SHA, "EVENT_URL": "https://ap.invalid",
+           "AW_DEVTEAM_EVENT_SECRET": secret, "RUNNER_TEMP": str(d), "NUDGE_SLEEP_SCALE": "0",
+           "DISPATCH_OUTCOME": "success", "RUN_URL": "https://github.com/o/r/actions/runs/55"}
+    proc = subprocess.run([sys.executable, str(review_error_script)], capture_output=True,
+                          text=True, env=env)
+    posted = (d / "posted.jsonl").read_text().splitlines() if (d / "posted.jsonl").exists() else []
+    cp = ([x for x in (d / "comment_posts.log").read_text().splitlines() if x.startswith("api -X POST")]
+          if (d / "comment_posts.log").exists() else [])
+    return proc, [json.loads(x) for x in posted], cp
+
+
+_TEMP_400 = {"aw_status": "error", "choices": [{"message": {"content":
+             "Error code: 400 - Unsupported parameter: temperature is not supported with this model"}}]}
+
+
+def test_an_errored_review_wakes_the_opener_with_the_error_text_and_comments(
+        review_error_script, ci_red_bin, tmp_path):
+    proc, posted, comments = _run_review_error(review_error_script, ci_red_bin, tmp_path,
+                                               response=_TEMP_400)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(posted) == 1, proc.stdout
+    p = posted[0]
+    assert p["trigger"]["kind"] == "review_error" and p["head_sha"] == _RED_SHA
+    assert p["run_id"] == "abc" and p["pr_number"] == 7
+    assert "temperature is not supported" in p["review_error"]["text"]
+    assert "aw_status=error" in p["review_error"]["text"]
+    assert p["review_error"]["run_url"].endswith("/actions/runs/55")
+    assert (tmp_path / "rerr" / "sig_ok").read_text() == "1"
+    assert len(comments) == 1 and "review-error:" + _RED_SHA in comments[0]
+
+
+def test_the_pr_comment_is_posted_once_per_head(review_error_script, ci_red_bin, tmp_path):
+    proc, posted, comments = _run_review_error(
+        review_error_script, ci_red_bin, tmp_path, response=_TEMP_400,
+        comments=f"<!-- review-error:{_RED_SHA} -->\nold\n")
+    assert comments == [] and len(posted) == 1  # no second comment; the platform dedupes the wake
+
+
+@pytest.mark.parametrize("kw,why", [
+    ({"labels": "bug\n"}, "not an agent PR"),
+    ({"head": "d" * 40}, "head moved"),
+    ({"secret": ""}, "SECRET"),
+])
+def test_no_wake_when_the_opener_is_unknown_or_the_head_moved(
+        review_error_script, ci_red_bin, tmp_path, kw, why):
+    proc, posted, _ = _run_review_error(review_error_script, ci_red_bin, tmp_path,
+                                        response=_TEMP_400, **kw)
+    assert proc.returncode == 0 and posted == [], why
+
+
+def test_a_missing_response_file_still_reports_a_dispatch_failure(
+        review_error_script, ci_red_bin, tmp_path):
+    proc, posted, _ = _run_review_error(review_error_script, ci_red_bin, tmp_path, response=None)
+    assert posted and "dispatch failed" in posted[0]["review_error"]["text"]
+
+
+def test_the_wake_never_fails_the_pr_when_the_platform_is_down(
+        review_error_script, ci_red_bin, tmp_path):
+    proc, posted, _ = _run_review_error(review_error_script, ci_red_bin, tmp_path,
+                                        response=_TEMP_400, curl_code="503")
+    assert proc.returncode == 0 and "coder not woken" in proc.stdout + proc.stderr
