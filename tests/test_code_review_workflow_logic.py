@@ -4068,6 +4068,22 @@ def test_only_findings_events_retry_the_label_read():
 PARENT_DASHED = "e001220b-8867-44f4-a276-9e3c0c7ac96f"
 
 
+def test_parent_comes_from_the_commit_that_supplied_the_run_id(
+    provenance_script, provenance_gh, tmp_path
+):
+    """A newer root-run commit (no parent trailer) must not inherit an older child's parent."""
+    proc, outputs, _ = _run_provenance(
+        provenance_script, provenance_gh, tmp_path,
+        commits=[
+            _commit(f"AW-Run-Id: {'a' * 32}\nAW-Parent-Run-Id: {PARENT_DASHED}\n", sha="aaaaaaa"),
+            _commit(f"AW-Run-Id: {REAL_RUN_ID}\n", sha="bbbbbbb"),
+        ],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert outputs["run_id"] == REAL_RUN_ID
+    assert outputs["parent_run_id"] == ""
+
+
 def test_parent_run_trailer_dashed_uuid_is_normalised_newest_wins(
     provenance_script, provenance_gh, tmp_path
 ):
@@ -4147,6 +4163,13 @@ def test_merged_event_retries_twice_on_unresolved_link(tmp_path):
     proc, posts = _run_merged_step(tmp_path, [_UNRESOLVED, _UNRESOLVED, {"acted": True}])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert posts == 3
+
+
+def test_merged_event_retries_on_the_handlers_real_unresolved_response(tmp_path):
+    real = {"acted": False, "reason": "no PR->coder link for this URL"}
+    proc, posts = _run_merged_step(tmp_path, [real, {"acted": True}])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert posts == 2
 
 
 def test_merged_event_does_not_retry_when_acted(tmp_path):

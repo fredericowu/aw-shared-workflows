@@ -1522,7 +1522,8 @@ jobs:
               except Exception:
                   return False
               return (isinstance(d, dict) and d.get("acted") is False
-                      and "unresolved" in json.dumps(d.get("link_resolution", "")).lower())
+                      and (d.get("reason") == "no PR->coder link for this URL"
+                           or "unresolved" in json.dumps(d.get("link_resolution", "")).lower()))
 
           def _post(raw_bytes):
               with open(event_path, "wb") as fh:
@@ -1706,18 +1707,10 @@ jobs:
                       "session_id": first_match(SESSION_RE, message) or "",
                       "card_id": first_match(CARD_RE, message) or "",
                       "agent_slug": first_match(AGENT_RE, message) or "",
-                      "parent_run_id": "",
+                      "parent_run_id": (first_match(PARENT_RE, message) or "").replace("-", "").lower(),
                       "commit_sha": commit.get("sha", "")[:7],
                   }
                   break
-
-          if found is not None:
-              # Newest commit carrying a parent trailer wins (same rule as AW-Run-Id).
-              for commit in reversed(commits):
-                  pm = first_match(PARENT_RE, (commit.get("commit") or {}).get("message") or "")
-                  if pm:
-                      found["parent_run_id"] = pm.replace("-", "").lower()
-                      break
 
           if found is None:
               print(f"::warning::no commit on PR #{PR_NUMBER} carries a well-formed "
@@ -2494,7 +2487,8 @@ jobs:
               except Exception:
                   return False
               return (isinstance(d, dict) and d.get("acted") is False
-                      and "unresolved" in json.dumps(d.get("link_resolution", "")).lower())
+                      and (d.get("reason") == "no PR->coder link for this URL"
+                           or "unresolved" in json.dumps(d.get("link_resolution", "")).lower()))
 
           def _post(raw_bytes):
               with open(event_path, "wb") as fh:
