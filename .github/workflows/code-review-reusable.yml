@@ -820,8 +820,14 @@ jobs:
           PYEOF
 
   code-review:
-    needs: gate
-    if: needs.gate.outputs.allowed == 'true'
+    # `provenance-gate` is a needs ONLY so the aw-run/aw-card/aw-agent labels
+    # exist before the findings event below reads them (the platform links the
+    # PR to its coder run from `aw-run:<id>`; in parallel the label landed
+    # after the event and the wake was refused "aw-run label: absent").
+    # `!cancelled()` instead of the default success() so a FAILED or SKIPPED
+    # provenance-gate (no AW-Run-Id trailer, a human PR) never blocks the review.
+    needs: [gate, provenance-gate]
+    if: ${{ !cancelled() && needs.gate.outputs.allowed == 'true' }}
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     outputs:
       # Read by `merge-attempt`'s same-run entry point, purely to decide
@@ -1472,7 +1478,19 @@ jobs:
               except Exception:
                   return []
 
-          _labels = _pr_labels()
+          # Bounded retry on an unresolved link: `provenance-gate` is ordered
+          # before this job, but a label write can still lag. 4 reads, 10s
+          # apart (<= 30s). A PR that never gets an aw-run label (human PR)
+          # pays that 30s once and then proceeds with an empty run_id, as before.
+          import time
+          for _attempt in range(4):
+              _labels = _pr_labels()
+              # Only `findings` resolves a coder link; `cleared` is stored as-is.
+              if event != "findings" or any(x.startswith("aw-run:") for x in _labels):
+                  break
+              if _attempt < 3:
+                  print(f"aw-run label absent (read {_attempt + 1}/4); retrying in 10s")
+                  time.sleep(10)
           _run_label = next((x for x in _labels if x.startswith("aw-run:")), "")
           payload = {
               "labels": _labels,
@@ -1752,7 +1770,9 @@ jobs:
       # a failure mode even that can't anticipate (e.g. python3 itself
       # missing on the runner image).
       - name: Apply provenance labels
-        if: steps.provenance.outputs.run_id != ''
+        # `!cancelled()`: a failed footer PATCH above must not skip the labels
+        # the review's findings event depends on.
+        if: ${{ !cancelled() && steps.provenance.outputs.run_id != '' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

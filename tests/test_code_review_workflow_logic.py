@@ -3026,7 +3026,7 @@ def test_a_missing_dispatch_key_does_not_charge_the_budget(gate_tail_script, cei
 
 def test_exhausted_marker_is_stamped_only_after_delivery():
     text = WORKFLOW.read_text()
-    step = text[text.index("      - name: Report review ceiling"):text.index("  code-review:\n    needs: gate")]
+    step = text[text.index("      - name: Report review ceiling"):text.index("\n  code-review:\n")]
     assert step.index("/comments") < step.index("labels[]=devteam:review-exhausted")
     assert step.index("context=devteam/review-cap") < step.index("labels[]=devteam:review-exhausted")
 
@@ -3035,7 +3035,7 @@ def test_the_ceiling_escalate_event_does_not_promise_a_nudge():
     # No nudge job exists any more. nudge_follows=true makes the platform only
     # STORE an escalate event, so nobody would ever be told the budget ran out.
     text = WORKFLOW.read_text()
-    step = text[text.index("      - name: Report review ceiling"):text.index("  code-review:\n    needs: gate")]
+    step = text[text.index("      - name: Report review ceiling"):text.index("\n  code-review:\n")]
     assert '"event": "escalate"' in step
     assert '"nudge_follows": False' in step and '"nudge_follows": True' not in step
 
@@ -3107,7 +3107,7 @@ def test_the_ceiling_status_is_advisory_to_the_merge_job():
 
 def test_report_step_runs_only_on_a_cap_and_marks_the_head():
     text = WORKFLOW.read_text()
-    step = text[text.index("      - name: Report review ceiling"):text.index("  code-review:\n    needs: gate")]
+    step = text[text.index("      - name: Report review ceiling"):text.index("\n  code-review:\n")]
     assert "steps.decide.outputs.capped == 'true'" in step
     assert "context=devteam/review-cap" in step and "state=failure" in step
     assert "review_budget_exhausted" in step
@@ -3460,7 +3460,7 @@ def test_gate_reports_whether_the_escalation_was_already_delivered(gate_tail_scr
 def report_script(tmp_path_factory) -> Path:
     text = WORKFLOW.read_text()
     i = text.index("      - name: Report review ceiling")
-    seg = text[i:text.index("  code-review:\n    needs: gate")]
+    seg = text[i:text.index("\n  code-review:\n")]
     body = seg[seg.index("        run: |\n") + len("        run: |\n"):]
     path = tmp_path_factory.mktemp("rep") / "report.sh"
     path.write_text(textwrap.dedent(body))
@@ -4033,3 +4033,29 @@ def test_the_nudge_payload_no_longer_reads_the_needs_human_label(nudge_script, n
                                  labels=("aw-run:" + "r" * 32, "devteam:needs-human"))
     assert posts[0]["needs_human_actor"] is None
     assert "/events" not in (state / "gh.log").read_text()
+
+
+def test_code_review_runs_after_provenance_gate_without_being_blocked_by_it():
+    """Labels must exist before the findings event reads them, but a failed or
+    skipped provenance-gate must not block the review."""
+    import yaml
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["code-review"]
+    assert "provenance-gate" in job["needs"]
+    cond = job["if"]
+    assert "!cancelled()" in cond and "needs.gate.outputs.allowed == 'true'" in cond
+
+
+def test_findings_event_retries_an_absent_aw_run_label_bounded():
+    text = WORKFLOW.read_text()
+    assert "for _attempt in range(4):" in text and "time.sleep(10)" in text
+
+
+def test_label_step_runs_after_a_failed_footer_step():
+    import yaml
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["provenance-gate"]["steps"]
+    step = next(s for s in steps if s.get("name") == "Apply provenance labels")
+    assert "!cancelled()" in step["if"] and "run_id != ''" in step["if"]
+
+
+def test_only_findings_events_retry_the_label_read():
+    assert 'if event != "findings" or any(x.startswith("aw-run:")' in WORKFLOW.read_text()
