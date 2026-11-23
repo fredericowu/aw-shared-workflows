@@ -614,7 +614,7 @@ per-PR review ceiling (`max_reviews`, `review-count:N`) only counts reviews
 that returned a verdict: an attempt that errored (reviewer `aw_status=error`,
 invalid verdict, dispatch failure) records a `review-error:<run id>` label
 (once per run, so a failed-job rerun cannot double count) and, if a unit was
-charged, is refunded with a `review-refund:N` label (budget used = charged -
+charged, is refunded with a `review-refund:N:<run id>` label (budget used = charged -
 refunded). A completed review adds `review-ok`, and `max_errored_reviews`
 (default 3) bounds the error events since the last `review-ok`, independently
 of `max_reviews`, so a broken reviewer cannot loop. An errored review comments once per head on the

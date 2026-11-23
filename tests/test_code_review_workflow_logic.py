@@ -3447,7 +3447,7 @@ def test_legacy_review_n_events_carry_forward_without_double_charge(gate_tail_sc
 
 def test_ceiling_jq_counts_both_label_families():
     src = (Path(__file__).resolve().parent.parent / ".github/workflows/code-review-reusable.yml").read_text()
-    assert 'test("^((devteam:review-|review-count:|review-refund:|review-error:)[0-9]+|review-ok)$")' in src
+    assert 'test("^((devteam:review-|review-count:|review-error:)[0-9]+|review-refund:[0-9]+(:[0-9]+)?|review-ok)$")' in src
 
 # --------------------------------------------------------------------------
 # QA rework (card 41e5bf3b): escalation delivery is tracked apart from the
@@ -4520,7 +4520,7 @@ def test_a_rerun_of_the_same_failed_run_does_not_refund_twice(tmp_path):
     # "Re-run failed jobs" reuses the gate's charged/slot outputs; the run's
     # first failure already recorded review-error:<run id> (+ the refund).
     proc, out, calls = _run_refund(tmp_path, outcome="failure",
-                                   timeline="review-count:2\nreview-error:x\nreview-refund:2")
+                                   timeline="review-count:2\nreview-error:x\nreview-refund:2:x")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "errored=true" in out  # the wake path still has its own once-per-head guard
     assert not any("-X POST" in c for c in calls), calls
@@ -4533,11 +4533,11 @@ def test_replay_after_unreadable_timeline_completes_the_missing_refund_once(tmp_
     proc, _, calls = _run_refund(tmp_path, outcome="failure",
                                  timeline="review-count:2\nreview-error:x")
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert [c for c in calls if "labels[]=review-refund:2" in c], calls
+    assert [c for c in calls if "labels[]=review-refund:2:x" in c], calls
     assert not any("labels[]=review-error:" in c for c in calls), calls
     # replaying once more now sees both markers: nothing is written
     _, _, calls = _run_refund(tmp_path, outcome="failure",
-                              timeline="review-count:2\nreview-error:x\nreview-refund:2")
+                              timeline="review-count:2\nreview-error:x\nreview-refund:2:x")
     assert not any("-X POST" in c for c in calls), calls
 
 
@@ -4552,13 +4552,28 @@ def test_replay_after_failed_error_marker_write_records_it_without_double_refund
 def test_an_earlier_runs_refund_of_a_reused_slot_does_not_suppress_this_runs(tmp_path):
     # run A errored on slot 2 and was refunded; run x was then charged slot 2 too
     proc, _, calls = _run_refund(tmp_path, outcome="failure",
-                                 timeline="review-count:2\nreview-error:A\nreview-refund:2\nreview-count:2")
+                                 timeline="review-count:2\nreview-error:A\nreview-refund:2:A\nreview-count:2")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert any("labels[]=review-error:" in c for c in calls), calls
-    assert any("labels[]=review-refund:2" in c for c in calls), calls
+    assert any("labels[]=review-refund:2:x" in c for c in calls), calls
     # and a replay of x (marker + its own refund after it) writes nothing
     _, _, calls = _run_refund(tmp_path, outcome="failure",
-                              timeline="review-error:A\nreview-refund:2\nreview-count:2\nreview-error:x\nreview-refund:2")
+                              timeline="review-error:A\nreview-refund:2\nreview-count:2\nreview-error:x\nreview-refund:2:x")
+    assert not any("-X POST" in c for c in calls), calls
+
+
+def test_a_different_runs_later_refund_of_the_same_slot_does_not_hide_a_missing_refund(tmp_path):
+    # QA rework: x (slot 3) errored, both of its writes after the marker failed;
+    # run 11 (slot 2) was replayed and refunded, then run 13 took slot 3 and
+    # refunded it. On a replay x must still refund its OWN charge.
+    tl = ("review-count:1\nreview-ok\nreview-count:2\nreview-error:11\nreview-count:3\n"
+          "review-error:x\nreview-refund:2:11\nreview-count:3\nreview-error:13\nreview-refund:3:13")
+    proc, _, calls = _run_refund(tmp_path, outcome="failure", slot="3", timeline=tl)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert any("labels[]=review-refund:3:x" in c for c in calls), calls
+    assert not any("labels[]=review-error:" in c for c in calls), calls
+    # once x's own refund exists, a further replay writes nothing
+    _, _, calls = _run_refund(tmp_path, outcome="failure", slot="3", timeline=tl + "\nreview-refund:3:x")
     assert not any("-X POST" in c for c in calls), calls
 
 
