@@ -395,6 +395,7 @@ jobs:
       bypass: ${{ steps.decide.outputs.bypass }}
       charged: ${{ steps.decide.outputs.charged }}
       slot: ${{ steps.decide.outputs.slot }}
+      charge: ${{ steps.decide.outputs.charge }}
     # Same-head dedupe, part 1: two triggers for ONE head (opened + a quick
     # synchronize, a comment racing a push) must not both pass the gate at the
     # same instant. The caller's own group is keyed per PR but a caller can
@@ -720,7 +721,7 @@ jobs:
             names=""
             for attempt in 1 2 3; do
               if names="$(gh api --paginate "repos/${{ github.repository }}/issues/$pr_number/timeline?per_page=100" \
-                           --jq '.[] | select(.event=="labeled" and .actor.login=="github-actions[bot]" and ((.label.name // "") | test("^((devteam:review-|review-count:|review-refund:|review-error:)[0-9]+|review-ok)$"))) | .label.name')"; then
+                           --jq '.[] | select(.event=="labeled" and .actor.login=="github-actions[bot]" and ((.label.name // "") | test("^((devteam:review-|review-count:|review-error:)[0-9]+|review-refund:[0-9]+(:[0-9]+(-[0-9]+)?)?|review-ok)$"))) | .label.name')"; then
                 break
               fi
               names="__FAILED__"
@@ -730,7 +731,7 @@ jobs:
             streak=0
             if [ "$names" != "__FAILED__" ]; then
               charged_n="$(printf '%s\n' "$names" | grep -Ec '^(devteam:review-|review-count:)[0-9]+$' || true)"
-              refunded_n="$(printf '%s\n' "$names" | grep -Ec '^review-refund:[0-9]+$' || true)"
+              refunded_n="$(printf '%s\n' "$names" | grep -Ec '^review-refund:[0-9]+(:[0-9]+(-[0-9]+)?)?$' || true)"
               used=$(( ${charged_n:-0} - ${refunded_n:-0} ))
               [ "$used" -lt 0 ] && used=0
               while IFS= read -r n; do
@@ -789,6 +790,9 @@ jobs:
                   {
                     echo "charged=true"
                     echo "slot=$(( used + 1 ))"
+                    # Unique per gate execution: a full rerun (same run id, new
+                    # attempt) re-charges, a failed-jobs rerun reuses this.
+                    echo "charge=${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-1}"
                   } >> "$GITHUB_OUTPUT"
                 else
                   echo "::warning::could not stamp $next_label; reviewing anyway"
@@ -1497,6 +1501,7 @@ jobs:
           FINDINGS_OUTCOME: ${{ steps.findings.outcome }}
           CHARGED: ${{ needs.gate.outputs.charged }}
           SLOT: ${{ needs.gate.outputs.slot }}
+          CHARGE: ${{ needs.gate.outputs.charge }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
         run: |
           set -uo pipefail
@@ -1545,19 +1550,21 @@ jobs:
             exit 0
           fi
           # Slot numbers are reused (the next charge after a refund takes the
-          # refunded number), so an earlier run's `review-refund:$SLOT` must not
-          # suppress this run's. This run's refund is the one that follows ITS
-          # error marker in the timeline (marker is always written first).
-          if printf '%s\n' "$seen" | awk -v m="$err_label" -v r="review-refund:$SLOT" \
-               'f && $0==r {found=1} $0==m {f=1} END {exit !found}'; then
+          # refunded number), so a bare `review-refund:$SLOT` cannot be
+          # attributed to one charged run: another run may refund the same slot
+          # in between. The refund label therefore carries the run id
+          # (`review-refund:<slot>:<run id>-<attempt>`, the gate's `charge` output); the gate counts it like the
+          # legacy `review-refund:<slot>`.
+          refund_label="review-refund:$SLOT:${CHARGE:-${{ github.run_id }}}"
+          if printf '%s\n' "$seen" | grep -qxF "$refund_label"; then
             echo "budget unit $SLOT is already refunded for this run — not refunding again"
             exit 0
           fi
-          gh api -X DELETE "$label_api/review-refund%3A$SLOT" --silent 2>/dev/null || true
-          if gh api -X POST "$label_api" -f "labels[]=review-refund:$SLOT" --silent; then
-            echo "review produced no verdict — refunded budget unit $SLOT (review-refund:$SLOT)"
+          gh api -X DELETE "$label_api/review-refund%3A$SLOT%3A${CHARGE:-${{ github.run_id }}}" --silent 2>/dev/null || true
+          if gh api -X POST "$label_api" -f "labels[]=$refund_label" --silent; then
+            echo "review produced no verdict — refunded budget unit $SLOT ($refund_label)"
           else
-            echo "::warning::could not stamp review-refund:$SLOT; this errored attempt still counts"
+            echo "::warning::could not stamp $refund_label; this errored attempt still counts"
           fi
 
       # An errored review leaves the PR with no review coming. Tell a human on
