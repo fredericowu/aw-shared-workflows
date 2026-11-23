@@ -4222,6 +4222,10 @@ def ci_red_bin(tmp_path_factory) -> Path:
         "    sys.stdout.write(open(p).read()); sys.exit(0)\n"
         "if a.startswith('api') and a.endswith('/pulls') and '/commits/' in a: emit('pulls.json')\n"
         "if a.startswith('api') and '/labels' in a: emit('labels.txt')\n"
+        "if a.startswith('pr checks') and '--required' in a:\n"
+        "    p = os.path.join(d, 'required.json')\n"
+        "    if not os.path.exists(p): sys.stderr.write('no required checks reported'); sys.exit(1)\n"
+        "    sys.stdout.write(open(p).read()); sys.exit(0)\n"
         "if a.startswith('pr checks'):\n"
         "    p = os.path.join(d, 'checks.json')\n"
         "    if not os.path.exists(p): sys.stderr.write('HTTP 502'); sys.exit(1)\n"
@@ -4248,7 +4252,7 @@ def ci_red_bin(tmp_path_factory) -> Path:
 
 def _run_ci_red(ci_red_script, ci_red_bin, tmp_path, *, labels="aw-run:abc\n",
                 checks=None, pulls=None, view=None, secret="s3cret",
-                log="line1\nlint error: unused var\n", curl_code="200"):
+                log="line1\nlint error: unused var\n", curl_code="200", required=None):
     d = tmp_path / "cired"
     d.mkdir(exist_ok=True)
     for f in d.iterdir():
@@ -4264,6 +4268,8 @@ def _run_ci_red(ci_red_script, ci_red_bin, tmp_path, *, labels="aw-run:abc\n",
         {"state": "OPEN", "headRefOid": _RED_SHA, "url": "https://github.com/o/r/pull/7",
          "statusCheckRollup": []} if view is None else view))
     (d / "log.txt").write_text(log)
+    if required is not None:
+        (d / "required.json").write_text(json.dumps(required))
     env = {**os.environ, "PATH": f"{ci_red_bin}{os.pathsep}{os.environ['PATH']}",
            "FAKE_GH_DIR": str(d), "FAKE_CURL_CODE": curl_code, "GH_TOKEN": "t",
            "REPO": "o/r", "EVENT_URL": "https://ap.invalid", "AW_DEVTEAM_EVENT_SECRET": secret,
@@ -4348,3 +4354,25 @@ def test_a_failed_checks_lookup_is_reported_not_read_as_nothing_failing(
     assert posted == []
     assert "could not read PR #7's checks" in proc.stdout
     assert "no non-advisory check is failing" not in proc.stdout
+
+
+def test_an_optional_check_failing_does_not_wake_the_coder_when_required_checks_exist(
+    ci_red_script, ci_red_bin, tmp_path
+):
+    """The repo defines required checks and they pass; an optional
+    `experimental-lint` is red. No wake."""
+    proc, posted = _run_ci_red(
+        ci_red_script, ci_red_bin, tmp_path,
+        checks=[{"name": "experimental-lint", "state": "FAILURE", "bucket": "fail", "link": ""}],
+        required=[{"name": "pytest", "state": "SUCCESS", "bucket": "pass", "link": ""}])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert posted == []
+
+
+def test_the_failing_required_check_is_the_one_reported(ci_red_script, ci_red_bin, tmp_path):
+    proc, posted = _run_ci_red(
+        ci_red_script, ci_red_bin, tmp_path,
+        checks=[{"name": "experimental-lint", "state": "FAILURE", "bucket": "fail", "link": ""}],
+        required=[{"name": "lint", "state": "FAILURE", "bucket": "fail",
+                   "link": "https://github.com/o/r/actions/runs/9/job/77"}])
+    assert [c["name"] for c in posted[0]["ci_failure"]["checks"]] == ["lint"], proc.stdout

@@ -2471,11 +2471,21 @@ jobs:
               # `gh pr checks` exits non-zero (8) when any check is failing,
               # which is exactly the case here: the exit code is not an error
               # signal, only unparseable/empty stdout is.
-              cr = gh("pr", "checks", pr, "--repo", REPO, "--json", "name,state,bucket,link")
-              try:
-                  rows = json.loads(cr.stdout) if cr is not None and cr.stdout.strip() else None
-              except ValueError:
-                  rows = None
+              def read_checks(*extra):
+                  cr = gh("pr", "checks", pr, "--repo", REPO, *extra,
+                          "--json", "name,state,bucket,link")
+                  try:
+                      return json.loads(cr.stdout) if cr is not None and cr.stdout.strip() else None
+                  except ValueError:
+                      return None
+
+              # Required checks only when the repo defines any (branch protection
+              # or a ruleset): an optional check failing must not wake the coder.
+              # `--required` lists nothing on a repo with no required checks
+              # (most consumers), so then fall back to every non-advisory check.
+              rows = read_checks("--required")
+              if not rows:
+                  rows = read_checks()
               if rows is None:
                   warn(f"could not read PR #{pr}'s checks; no nudge sent")
                   return
