@@ -4182,3 +4182,155 @@ def test_merged_event_retry_is_bounded(tmp_path):
     proc, posts = _run_merged_step(tmp_path, [_UNRESOLVED])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert posts == 3
+
+
+# --------------------------------------------------------------------------
+# merge-attempt: a red required check wakes the opener coder (ci_done nudge)
+# --------------------------------------------------------------------------
+
+_CI_RED_STEP = "- name: Wake the opener coder on a red check"
+_RED_SHA = "c" * 40
+_RED_CHECKS = [
+    {"name": "lint", "state": "FAILURE", "bucket": "fail",
+     "link": "https://github.com/o/r/actions/runs/9/job/77"},
+    {"name": "review / provenance-gate", "state": "FAILURE", "bucket": "fail", "link": ""},
+]
+
+
+@pytest.fixture(scope="module")
+def ci_red_script(tmp_path_factory) -> Path:
+    src = _extract_heredoc(_CI_RED_STEP)
+    assert "ci_failure" in src, "extracted the wrong block"
+    path = tmp_path_factory.mktemp("wf") / "ci_red.py"
+    path.write_text(src)
+    return path
+
+
+@pytest.fixture(scope="module")
+def ci_red_bin(tmp_path_factory) -> Path:
+    """Fake `gh` (answers from `$FAKE_GH_DIR` JSON) and fake `curl` (records the
+    POSTed body and answers `$FAKE_CURL_CODE`)."""
+    b = tmp_path_factory.mktemp("cibin")
+    gh = b / "gh"
+    gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "a = ' '.join(sys.argv[1:]); d = os.environ['FAKE_GH_DIR']\n"
+        "def emit(n):\n"
+        "    p = os.path.join(d, n)\n"
+        "    if not os.path.exists(p): sys.exit(1)\n"
+        "    sys.stdout.write(open(p).read()); sys.exit(0)\n"
+        "if a.startswith('api') and a.endswith('/pulls') and '/commits/' in a: emit('pulls.json')\n"
+        "if a.startswith('api') and '/labels' in a: emit('labels.txt')\n"
+        "if a.startswith('pr checks'): emit('checks.json')\n"
+        "if a.startswith('pr view'): emit('view.json')\n"
+        "if a.startswith('run view'): emit('log.txt')\n"
+        "sys.exit(1)\n")
+    gh.chmod(0o755)
+    curl = b / "curl"
+    curl.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "a = sys.argv[1:]; d = os.environ['FAKE_GH_DIR']\n"
+        "body = open(a[a.index('--data-binary') + 1][1:]).read()\n"
+        "open(os.path.join(d, 'posted.jsonl'), 'a').write(body + '\\n')\n"
+        "import hashlib, hmac\n"
+        "want = 'X-Hub-Signature-256: sha256=' + hmac.new(b's3cret', body.encode(), hashlib.sha256).hexdigest()\n"
+        "open(os.path.join(d, 'sig_ok'), 'a').write('1' if want in a else '0')\n"
+        "open(a[a.index('-o') + 1], 'w').write('{}')\n"
+        "sys.stdout.write(os.environ.get('FAKE_CURL_CODE', '200'))\n")
+    curl.chmod(0o755)
+    return b
+
+
+def _run_ci_red(ci_red_script, ci_red_bin, tmp_path, *, labels="aw-run:abc\n",
+                checks=None, pulls=None, view=None, secret="s3cret",
+                log="line1\nlint error: unused var\n", curl_code="200"):
+    d = tmp_path / "cired"
+    d.mkdir(exist_ok=True)
+    for f in d.iterdir():
+        f.unlink()
+    pr = {"number": 7, "state": "open",
+          "head": {"sha": _RED_SHA, "repo": {"full_name": "o/r"}}}
+    (d / "pulls.json").write_text(json.dumps([pr] if pulls is None else pulls))
+    if labels is not None:
+        (d / "labels.txt").write_text(labels)
+    (d / "checks.json").write_text(json.dumps(_RED_CHECKS if checks is None else checks))
+    (d / "view.json").write_text(json.dumps(
+        {"state": "OPEN", "headRefOid": _RED_SHA, "url": "https://github.com/o/r/pull/7",
+         "statusCheckRollup": []} if view is None else view))
+    (d / "log.txt").write_text(log)
+    env = {**os.environ, "PATH": f"{ci_red_bin}{os.pathsep}{os.environ['PATH']}",
+           "FAKE_GH_DIR": str(d), "FAKE_CURL_CODE": curl_code, "GH_TOKEN": "t",
+           "REPO": "o/r", "EVENT_URL": "https://ap.invalid", "AW_DEVTEAM_EVENT_SECRET": secret,
+           "WORKFLOW_RUN_HEAD_SHA": _RED_SHA, "RUNNER_TEMP": str(d),
+           "NUDGE_SLEEP_SCALE": "0"}
+    proc = subprocess.run([sys.executable, str(ci_red_script)], capture_output=True,
+                          text=True, env=env)
+    posted = (d / "posted.jsonl").read_text().splitlines() if (d / "posted.jsonl").exists() else []
+    return proc, [json.loads(x) for x in posted]
+
+
+def test_a_red_required_check_posts_a_ci_done_nudge_with_job_url_and_log_tail(
+    ci_red_script, ci_red_bin, tmp_path
+):
+    proc, posted = _run_ci_red(ci_red_script, ci_red_bin, tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(posted) == 1, proc.stdout
+    p = posted[0]
+    assert p["trigger"]["kind"] == "ci_done" and p["trigger"]["actor_type"] == "Bot"
+    assert p["head_sha"] == _RED_SHA and p["run_id"] == "abc" and p["pr_number"] == 7
+    # only the non-advisory failing check is reported, with its job URL
+    assert p["ci_failure"]["checks"] == [
+        {"name": "lint", "url": "https://github.com/o/r/actions/runs/9/job/77"}]
+    assert "unused var" in p["ci_failure"]["log_tail"]
+
+
+def test_the_ci_nudge_is_signed_with_the_event_secret(ci_red_script, ci_red_bin, tmp_path):
+    proc, posted = _run_ci_red(ci_red_script, ci_red_bin, tmp_path)
+    assert posted, proc.stdout + proc.stderr
+    # the fake curl recomputes the HMAC over the body it received
+    assert (tmp_path / "cired" / "sig_ok").read_text() == "1"
+
+
+@pytest.mark.parametrize("kw,why", [
+    ({"labels": "bug\n"}, "no aw-run/aw-card label: opener unknown"),
+    ({"checks": [{"name": "review / provenance-gate", "state": "FAILURE",
+                  "bucket": "fail", "link": ""}]}, "only advisory checks are red"),
+    ({"checks": [{"name": "lint", "state": "SUCCESS", "bucket": "pass", "link": ""}]},
+     "nothing is red"),
+    ({"pulls": []}, "no PR owns the sha (push to master)"),
+    ({"pulls": [{"number": 7, "state": "open",
+                 "head": {"sha": _RED_SHA, "repo": {"full_name": "fork/r"}}}]}, "fork PR"),
+    ({"view": {"state": "OPEN", "headRefOid": "d" * 40, "url": "u"}}, "head moved"),
+    ({"view": {"state": "MERGED", "headRefOid": _RED_SHA, "url": "u"}}, "not open"),
+    ({"secret": ""}, "no secret configured"),
+])
+def test_the_ci_nudge_stays_silent_and_green_when_it_has_nothing_to_say(
+    ci_red_script, ci_red_bin, tmp_path, kw, why
+):
+    proc, posted = _run_ci_red(ci_red_script, ci_red_bin, tmp_path, **kw)
+    assert proc.returncode == 0, why + proc.stdout + proc.stderr
+    assert posted == [], why
+
+
+@pytest.mark.parametrize("kw", [{"curl_code": "500"}, {"curl_code": "404"}, {"log": ""}])
+def test_the_ci_nudge_never_fails_the_pr(ci_red_script, ci_red_bin, tmp_path, kw):
+    proc, _ = _run_ci_red(ci_red_script, ci_red_bin, tmp_path, **kw)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_the_ci_nudge_step_is_isolated_from_the_merge_and_review_flow():
+    text = WORKFLOW.read_text()
+    start = text.index(_CI_RED_STEP)
+    step = text[start:text.index("\n  merged-event:", start)]
+    code = _code_only(step)
+    assert "continue-on-error: true" in step
+    assert "workflow_run.conclusion == 'failure'" in step
+    # never touches the merge or the review: no merge call, no /aw-review, no
+    # review-event POST
+    assert "pr merge" not in code and "aw-review" not in code
+    assert "devteam-review-event" not in code
+    assert "devteam-pr-nudge" in code
+    # and the existing merge step is still the one the merge tests extract
+    assert text.index(_MERGE_STEP) < start
