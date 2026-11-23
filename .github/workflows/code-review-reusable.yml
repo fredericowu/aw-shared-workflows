@@ -2468,8 +2468,18 @@ jobs:
                   print("skip: not an agent PR (no aw-run:/aw-card: label), opener unknown")
                   return
 
-              rows = gh_json("pr", "checks", pr, "--repo", REPO, "--json", "name,state,bucket,link")
-              failed = [c for c in (rows or [])
+              # `gh pr checks` exits non-zero (8) when any check is failing,
+              # which is exactly the case here: the exit code is not an error
+              # signal, only unparseable/empty stdout is.
+              cr = gh("pr", "checks", pr, "--repo", REPO, "--json", "name,state,bucket,link")
+              try:
+                  rows = json.loads(cr.stdout) if cr is not None and cr.stdout.strip() else None
+              except ValueError:
+                  rows = None
+              if rows is None:
+                  warn(f"could not read PR #{pr}'s checks; no nudge sent")
+                  return
+              failed = [c for c in rows
                         if c.get("bucket") == "fail" and not is_advisory(c.get("name"))]
               if not failed:
                   print("skip: no non-advisory check is failing on this head")

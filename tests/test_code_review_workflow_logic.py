@@ -4222,7 +4222,10 @@ def ci_red_bin(tmp_path_factory) -> Path:
         "    sys.stdout.write(open(p).read()); sys.exit(0)\n"
         "if a.startswith('api') and a.endswith('/pulls') and '/commits/' in a: emit('pulls.json')\n"
         "if a.startswith('api') and '/labels' in a: emit('labels.txt')\n"
-        "if a.startswith('pr checks'): emit('checks.json')\n"
+        "if a.startswith('pr checks'):\n"
+        "    p = os.path.join(d, 'checks.json')\n"
+        "    if not os.path.exists(p): sys.stderr.write('HTTP 502'); sys.exit(1)\n"
+        "    sys.stdout.write(open(p).read()); sys.exit(8)\n"
         "if a.startswith('pr view'): emit('view.json')\n"
         "if a.startswith('run view'): emit('log.txt')\n"
         "sys.exit(1)\n")
@@ -4255,7 +4258,8 @@ def _run_ci_red(ci_red_script, ci_red_bin, tmp_path, *, labels="aw-run:abc\n",
     (d / "pulls.json").write_text(json.dumps([pr] if pulls is None else pulls))
     if labels is not None:
         (d / "labels.txt").write_text(labels)
-    (d / "checks.json").write_text(json.dumps(_RED_CHECKS if checks is None else checks))
+    if checks is not _MISSING:
+        (d / "checks.json").write_text(json.dumps(_RED_CHECKS if checks is None else checks))
     (d / "view.json").write_text(json.dumps(
         {"state": "OPEN", "headRefOid": _RED_SHA, "url": "https://github.com/o/r/pull/7",
          "statusCheckRollup": []} if view is None else view))
@@ -4334,3 +4338,13 @@ def test_the_ci_nudge_step_is_isolated_from_the_merge_and_review_flow():
     assert "devteam-pr-nudge" in code
     # and the existing merge step is still the one the merge tests extract
     assert text.index(_MERGE_STEP) < start
+
+
+def test_a_failed_checks_lookup_is_reported_not_read_as_nothing_failing(
+    ci_red_script, ci_red_bin, tmp_path
+):
+    proc, posted = _run_ci_red(ci_red_script, ci_red_bin, tmp_path, checks=_MISSING)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert posted == []
+    assert "could not read PR #7's checks" in proc.stdout
+    assert "no non-advisory check is failing" not in proc.stdout
