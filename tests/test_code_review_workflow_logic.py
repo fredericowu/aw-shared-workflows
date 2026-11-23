@@ -4542,11 +4542,24 @@ def test_replay_after_unreadable_timeline_completes_the_missing_refund_once(tmp_
 
 
 def test_replay_after_failed_error_marker_write_records_it_without_double_refund(tmp_path):
-    # marker POST failed but refund landed: replay records the marker only
-    _, _, calls = _run_refund(tmp_path, outcome="failure",
-                              timeline="review-count:2\nreview-refund:2")
-    assert any("labels[]=review-error:" in c for c in calls), calls
+    # marker POST failure: no refund in that run (a replay completes both)
+    proc, _, calls = _run_refund(tmp_path, outcome="failure", gh_fail=True,
+                                 timeline="review-count:2")
+    assert proc.returncode == 0
     assert not any("labels[]=review-refund" in c for c in calls), calls
+
+
+def test_an_earlier_runs_refund_of_a_reused_slot_does_not_suppress_this_runs(tmp_path):
+    # run A errored on slot 2 and was refunded; run x was then charged slot 2 too
+    proc, _, calls = _run_refund(tmp_path, outcome="failure",
+                                 timeline="review-count:2\nreview-error:A\nreview-refund:2\nreview-count:2")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert any("labels[]=review-error:" in c for c in calls), calls
+    assert any("labels[]=review-refund:2" in c for c in calls), calls
+    # and a replay of x (marker + its own refund after it) writes nothing
+    _, _, calls = _run_refund(tmp_path, outcome="failure",
+                              timeline="review-error:A\nreview-refund:2\nreview-count:2\nreview-error:x\nreview-refund:2")
+    assert not any("-X POST" in c for c in calls), calls
 
 
 def test_refund_post_failure_after_error_marker_leaves_it_recoverable(tmp_path):
@@ -4567,7 +4580,7 @@ def test_an_unreadable_timeline_records_the_error_but_never_refunds(tmp_path):
 def test_a_failed_refund_write_never_fails_the_job(tmp_path):
     proc, _, _ = _run_refund(tmp_path, outcome="failure", gh_fail=True)
     assert proc.returncode == 0
-    assert "still counts" in proc.stdout + proc.stderr
+    assert "no refund was made" in proc.stdout + proc.stderr
 
 
 def test_refund_and_wake_steps_are_best_effort_and_skip_advisory_runs():
