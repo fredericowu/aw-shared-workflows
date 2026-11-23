@@ -3449,7 +3449,7 @@ def test_legacy_review_n_events_carry_forward_without_double_charge(gate_tail_sc
 
 def test_ceiling_jq_counts_both_label_families():
     src = (Path(__file__).resolve().parent.parent / ".github/workflows/code-review-reusable.yml").read_text()
-    assert 'test("^((devteam:review-|review-count:|review-error:)[0-9]+|review-refund:[0-9]+(:[0-9]+(-[0-9]+)?)?|review-ok)$")' in src
+    assert 'test("^((devteam:review-|review-count:|review-error:)[0-9]+(-[0-9]+)?|review-refund:[0-9]+(:[0-9]+(-[0-9]+)?)?|review-ok)$")' in src
 
 # --------------------------------------------------------------------------
 # QA rework (card 41e5bf3b): escalation delivery is tracked apart from the
@@ -4389,7 +4389,7 @@ def test_run_scoped_refunds_count_and_each_charge_gets_a_unique_id(gate_tail_scr
 def test_a_full_rerun_that_errors_again_refunds_its_own_new_charge(tmp_path):
     # attempt 1 charged+refunded slot 1; a full rerun (same run id, attempt 2)
     # re-charged slot 1 and errored: its refund must not be mistaken for attempt 1's.
-    tl = "review-count:1\nreview-error:x\nreview-refund:1:x-1\nreview-count:1"
+    tl = "review-count:1\nreview-error:x-1\nreview-refund:1:x-1\nreview-count:1\nreview-error:x-2"
     proc, _, calls = _run_refund(tmp_path, outcome="failure", slot="1", charge="x-2", timeline=tl)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert any("labels[]=review-refund:1:x-2" in c for c in calls), calls
@@ -4397,6 +4397,22 @@ def test_a_full_rerun_that_errors_again_refunds_its_own_new_charge(tmp_path):
     _, _, calls = _run_refund(tmp_path, outcome="failure", slot="1", charge="x-2",
                               timeline=tl + "\nreview-refund:1:x-2")
     assert not any("-X POST" in c for c in calls), calls
+
+
+def test_full_reruns_of_one_run_each_advance_the_error_streak(tmp_path):
+    # QA: attempts 2 and 3 of the same run id must write their own error marker
+    proc, _, calls = _run_refund(tmp_path, outcome="failure", slot="1", charge="x-2",
+                                 timeline="review-count:1\nreview-error:x-1\nreview-refund:1:x-1\nreview-count:1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert any("labels[]=review-error:x-2" in c for c in calls), calls
+
+
+def test_three_full_attempts_of_one_run_hit_the_error_cap(gate_tail_script, ceil_gh, tmp_path):
+    tl = ["review-count:1", "review-error:9-1", "review-refund:1:9-1", "review-count:1",
+          "review-error:9-2", "review-refund:1:9-2", "review-count:1", "review-error:9-3",
+          "review-refund:1:9-3"]
+    _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl)
+    assert out["capped"] == "true" and out["cap_kind"] == "errors", out
 
 
 def test_pr185_three_errored_reviews_with_zero_verdicts_is_not_the_budget_ceiling(

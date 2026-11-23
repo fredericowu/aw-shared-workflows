@@ -706,7 +706,7 @@ jobs:
           # `Report review ceiling` step, never silent.
           # A review attempt that produced NO verdict (reviewer errored, invalid
           # verdict, dispatch failure) is recorded by the `Refund` step in the
-          # review job: a `review-error:<run id>` label (one bot-authored
+          # review job: a `review-error:<run id>-<attempt>` label (one bot-authored
           # `labeled` event per errored run, charged or not) and, when a unit
           # was charged, a `review-refund:N` label; the budget used is
           # charged - refunded. A completed review adds `review-ok`, which
@@ -721,7 +721,7 @@ jobs:
             names=""
             for attempt in 1 2 3; do
               if names="$(gh api --paginate "repos/${{ github.repository }}/issues/$pr_number/timeline?per_page=100" \
-                           --jq '.[] | select(.event=="labeled" and .actor.login=="github-actions[bot]" and ((.label.name // "") | test("^((devteam:review-|review-count:|review-error:)[0-9]+|review-refund:[0-9]+(:[0-9]+(-[0-9]+)?)?|review-ok)$"))) | .label.name')"; then
+                           --jq '.[] | select(.event=="labeled" and .actor.login=="github-actions[bot]" and ((.label.name // "") | test("^((devteam:review-|review-count:|review-error:)[0-9]+(-[0-9]+)?|review-refund:[0-9]+(:[0-9]+(-[0-9]+)?)?|review-ok)$"))) | .label.name')"; then
                 break
               fi
               names="__FAILED__"
@@ -1519,7 +1519,10 @@ jobs:
           # dispatch that never charged (missing key). It also makes the refund
           # idempotent: "Re-run failed jobs" reuses the gate's `charged`/`slot`
           # outputs, so a second failure of the same run must not refund again.
-          err_label="review-error:${{ github.run_id }}"
+          # Keyed to the gate's charge id (run id + attempt), so every full rerun
+          # advances the streak; a failed-jobs rerun reuses it and stays one event.
+          attempt_id="${CHARGE:-${{ github.run_id }}-${{ github.run_attempt }}}"
+          err_label="review-error:$attempt_id"
           read_ok=true
           seen=""
           if ! seen="$(gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUMBER/timeline?per_page=100" \
@@ -1534,7 +1537,7 @@ jobs:
             echo "this run's error is already recorded — not recording again"
           else
             # DELETE first: re-adding a present label emits no `labeled` event.
-            gh api -X DELETE "$label_api/review-error%3A${{ github.run_id }}" --silent 2>/dev/null || true
+            gh api -X DELETE "$label_api/review-error%3A$attempt_id" --silent 2>/dev/null || true
             if ! gh api -X POST "$label_api" -f "labels[]=$err_label" --silent; then
               # No marker means "refund not done" to a replay, so do not refund
               # now: a refund without its marker could be repeated.
