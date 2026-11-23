@@ -1522,19 +1522,35 @@ jobs:
             read_ok=false
             echo "::warning::could not read the PR timeline; recording the error but not refunding"
           fi
+          # The error marker and the refund are two independent writes: a replay
+          # (rerun, or a transient failure of either write) completes whichever
+          # one is missing, each exactly once.
           if [ "$read_ok" = true ] && printf '%s\n' "$seen" | grep -qxF "$err_label"; then
-            echo "this run's error is already recorded — not recording or refunding again"
-            exit 0
+            echo "this run's error is already recorded — not recording again"
+          else
+            # DELETE first: re-adding a present label emits no `labeled` event.
+            gh api -X DELETE "$label_api/review-error%3A${{ github.run_id }}" --silent 2>/dev/null || true
+            if ! gh api -X POST "$label_api" -f "labels[]=$err_label" --silent; then
+              # No marker means "refund not done" to a replay, so do not refund
+              # now: a refund without its marker could be repeated.
+              echo "::warning::could not stamp $err_label; the error streak was not advanced and no refund was made"
+              exit 0
+            fi
           fi
-          # DELETE first: re-adding a present label emits no `labeled` event.
-          gh api -X DELETE "$label_api/review-error%3A${{ github.run_id }}" --silent 2>/dev/null || true
-          gh api -X POST "$label_api" -f "labels[]=$err_label" --silent \
-            || echo "::warning::could not stamp $err_label; the error streak was not advanced"
           if [ "$read_ok" != true ]; then
             exit 0
           fi
           if [ "$CHARGED" != "true" ] || [ -z "${SLOT:-}" ]; then
             echo "no budget unit was charged for this attempt — nothing to refund"
+            exit 0
+          fi
+          # Slot numbers are reused (the next charge after a refund takes the
+          # refunded number), so an earlier run's `review-refund:$SLOT` must not
+          # suppress this run's. This run's refund is the one that follows ITS
+          # error marker in the timeline (marker is always written first).
+          if printf '%s\n' "$seen" | awk -v m="$err_label" -v r="review-refund:$SLOT" \
+               'f && $0==r {found=1} $0==m {f=1} END {exit !found}'; then
+            echo "budget unit $SLOT is already refunded for this run — not refunding again"
             exit 0
           fi
           gh api -X DELETE "$label_api/review-refund%3A$SLOT" --silent 2>/dev/null || true

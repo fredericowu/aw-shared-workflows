@@ -4524,7 +4524,50 @@ def test_a_rerun_of_the_same_failed_run_does_not_refund_twice(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "errored=true" in out  # the wake path still has its own once-per-head guard
     assert not any("-X POST" in c for c in calls), calls
-    assert "already recorded" in proc.stdout
+    assert "already recorded" in proc.stdout and "already refunded" in proc.stdout
+
+
+def test_replay_after_unreadable_timeline_completes_the_missing_refund_once(tmp_path):
+    # first attempt: timeline unreadable -> error marker written, no refund.
+    # replay sees review-error:x but no review-refund:2 -> must refund, not re-record.
+    proc, _, calls = _run_refund(tmp_path, outcome="failure",
+                                 timeline="review-count:2\nreview-error:x")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert [c for c in calls if "labels[]=review-refund:2" in c], calls
+    assert not any("labels[]=review-error:" in c for c in calls), calls
+    # replaying once more now sees both markers: nothing is written
+    _, _, calls = _run_refund(tmp_path, outcome="failure",
+                              timeline="review-count:2\nreview-error:x\nreview-refund:2")
+    assert not any("-X POST" in c for c in calls), calls
+
+
+def test_replay_after_failed_error_marker_write_records_it_without_double_refund(tmp_path):
+    # marker POST failure: no refund in that run (a replay completes both)
+    proc, _, calls = _run_refund(tmp_path, outcome="failure", gh_fail=True,
+                                 timeline="review-count:2")
+    assert proc.returncode == 0
+    assert not any("labels[]=review-refund" in c for c in calls), calls
+
+
+def test_an_earlier_runs_refund_of_a_reused_slot_does_not_suppress_this_runs(tmp_path):
+    # run A errored on slot 2 and was refunded; run x was then charged slot 2 too
+    proc, _, calls = _run_refund(tmp_path, outcome="failure",
+                                 timeline="review-count:2\nreview-error:A\nreview-refund:2\nreview-count:2")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert any("labels[]=review-error:" in c for c in calls), calls
+    assert any("labels[]=review-refund:2" in c for c in calls), calls
+    # and a replay of x (marker + its own refund after it) writes nothing
+    _, _, calls = _run_refund(tmp_path, outcome="failure",
+                              timeline="review-error:A\nreview-refund:2\nreview-count:2\nreview-error:x\nreview-refund:2")
+    assert not any("-X POST" in c for c in calls), calls
+
+
+def test_refund_post_failure_after_error_marker_leaves_it_recoverable(tmp_path):
+    # refund POST fails (gh_fail) after the marker: no crash; a replay with
+    # marker-only timeline refunds (covered above)
+    proc, _, _ = _run_refund(tmp_path, outcome="failure", gh_fail=True,
+                             timeline="review-count:2\nreview-error:x")
+    assert proc.returncode == 0 and "still counts" in proc.stdout + proc.stderr
 
 
 def test_an_unreadable_timeline_records_the_error_but_never_refunds(tmp_path):
@@ -4537,7 +4580,7 @@ def test_an_unreadable_timeline_records_the_error_but_never_refunds(tmp_path):
 def test_a_failed_refund_write_never_fails_the_job(tmp_path):
     proc, _, _ = _run_refund(tmp_path, outcome="failure", gh_fail=True)
     assert proc.returncode == 0
-    assert "still counts" in proc.stdout + proc.stderr
+    assert "no refund was made" in proc.stdout + proc.stderr
 
 
 def test_refund_and_wake_steps_are_best_effort_and_skip_advisory_runs():
