@@ -4749,3 +4749,47 @@ def test_a_later_attempt_of_the_same_run_records_its_own_error(tmp_path):
     # attempt 1 of this run id is on the timeline; this attempt (x-x) must still be recorded
     _, _, calls = _run_refund(tmp_path, outcome="failure", timeline="review-count:2\nreview-error:x-1")
     assert any("labels[]=review-error:x-x" in c for c in calls), calls
+
+
+def _run_recheck(tmp_path, timeline, max_errored="3"):
+    d = tmp_path / "recheck"
+    d.mkdir(exist_ok=True)
+    gh = d / "gh"
+    gh.write_text("#!/bin/bash\nprintf '%s\\n' '" + timeline + "'\n")
+    gh.chmod(0o755)
+    script = d / "recheck.sh"
+    script.write_text(_extract_run("Recheck the error ceiling on a rerun"))
+    env = {**os.environ, "PATH": f"{d}{os.pathsep}{os.environ['PATH']}", "GH_TOKEN": "t",
+           "PR_NUMBER": "7", "MAX_ERRORED": max_errored}
+    return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+
+
+def test_a_failed_jobs_rerun_rechecks_the_error_ceiling_before_dispatching(tmp_path):
+    # review finding: Re-run failed jobs keeps the gate's saved allowed=true
+    p = _run_recheck(tmp_path, "review-error:11-1\nreview-error:11-2\nreview-error:11-3")
+    assert p.returncode == 1 and "not dispatching" in p.stdout, p.stdout + p.stderr
+    p = _run_recheck(tmp_path, "review-error:11-1\nreview-error:11-2")
+    assert p.returncode == 0, p.stdout + p.stderr
+    p = _run_recheck(tmp_path, "review-error:11-1\nreview-error:11-2\nreview-ok\nreview-error:12-1")
+    assert p.returncode == 0, p.stdout + p.stderr
+
+
+def test_the_recheck_step_runs_only_on_reruns_and_before_dispatch():
+    text = WORKFLOW.read_text()
+    i = text.index("- name: Recheck the error ceiling on a rerun")
+    assert "github.run_attempt > 1" in text[i:i + 200]
+    assert i < text.index("- name: Dispatch Code Reviewer")
+
+
+def test_the_timeline_filter_keeps_attempt_scoped_error_labels():
+    # review finding: the fake gh ignores --jq. Run the REAL filter from the gate.
+    text = WORKFLOW.read_text()
+    m = re.search(r"--jq '(\.\[\] \| select\(\.event==\"labeled\" and \.actor\.login==\"github-actions\[bot\]\" and \(\(\.label\.name\s*//\s*\"\"\)\s*\|\s*test\([^']*)'", text)
+    assert m, "gate jq filter not found"
+    events = [{"event": "labeled", "actor": {"login": "github-actions[bot]"}, "label": {"name": n}}
+              for n in ["review-error:11-1", "review-error:11-2", "review-refund:1:11-1", "review-count:1",
+                        "review-ok", "unrelated"]]
+    out = subprocess.run(["jq", "-r", m.group(1)], input=json.dumps(events),
+                         capture_output=True, text=True)
+    assert out.stdout.split() == ["review-error:11-1", "review-error:11-2", "review-refund:1:11-1",
+                                  "review-count:1", "review-ok"], out.stdout + out.stderr

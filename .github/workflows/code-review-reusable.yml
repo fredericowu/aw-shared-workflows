@@ -958,6 +958,34 @@ jobs:
     # no longer holds a runner for 45.
     timeout-minutes: 25
     steps:
+      # "Re-run failed jobs" keeps the gate's saved `allowed=true`, so the gate's
+      # error-streak check never re-runs for it. Recount here before dispatching
+      # again, or repeated partial reruns could exceed `max_errored_reviews`.
+      - name: Recheck the error ceiling on a rerun
+        if: ${{ github.run_attempt > 1 && inputs.max_errored_reviews > 0 }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          MAX_ERRORED: ${{ inputs.max_errored_reviews }}
+        run: |
+          set -uo pipefail
+          if ! names="$(gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUMBER/timeline?per_page=100" \
+                         --jq '.[] | select(.event=="labeled" and .actor.login=="github-actions[bot]") | .label.name')"; then
+            echo "::warning::could not read the PR timeline; not rechecking the error ceiling"
+            exit 0
+          fi
+          streak=0
+          while IFS= read -r n; do
+            case "$n" in
+              review-error:*) streak=$(( streak + 1 )) ;;
+              review-ok) streak=0 ;;
+            esac
+          done <<< "$names"
+          if [ "$streak" -ge "$MAX_ERRORED" ]; then
+            echo "::error::$streak consecutive errored reviews (max_errored_reviews=$MAX_ERRORED); not dispatching another on a rerun"
+            exit 1
+          fi
+
       - name: Mark code review pending
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
