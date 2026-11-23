@@ -399,10 +399,11 @@ jobs:
     # synchronize, a comment racing a push) must not both pass the gate at the
     # same instant. The caller's own group is keyed per PR but a caller can
     # key it differently (or not at all), so the gate serialises itself per
-    # PR+head here; part 2 (the `devteam/code-review` pending check in
+    # PR here (NOT per head: a comment event has no head sha in its context
+    # and would get a different key than the PR event it races); part 2 (the `devteam/code-review` pending check in
     # Decide) is what makes the second one refuse.
     concurrency:
-      group: code-review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event.pull_request.head.sha || 'comment' }}
+      group: code-review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: false
     steps:
       # DECIDE. Comments live HERE, not
@@ -703,21 +704,23 @@ jobs:
           # unreviewed; the refusal itself is made visible by the
           # `Report review ceiling` step, never silent.
           # A review attempt that produced NO verdict (reviewer errored, invalid
-          # verdict, dispatch failure) is refunded by the `Refund` step in the
-          # review job: it adds a `review-refund:N` label, which is one more
-          # bot-authored `labeled` event, and the budget used is
+          # verdict, dispatch failure) is recorded by the `Refund` step in the
+          # review job: a `review-error:<run id>` label (one bot-authored
+          # `labeled` event per errored run, charged or not) and, when a unit
+          # was charged, a `review-refund:N` label; the budget used is
           # charged - refunded. A completed review adds `review-ok`, which
-          # resets the consecutive-errors streak bounded by
-          # `max_errored_reviews` (otherwise a broken reviewer would loop).
+          # resets the consecutive-errors streak (error events since the last
+          # `review-ok`), bounded by `max_errored_reviews` independently of
+          # `max_reviews` (otherwise a broken reviewer would loop).
           max_reviews="${MAX_REVIEWS:-3}"
           case "$max_reviews" in ''|*[!0-9]*) max_reviews=3 ;; esac
           max_errored="${MAX_ERRORED_REVIEWS:-3}"
           case "$max_errored" in ''|*[!0-9]*) max_errored=3 ;; esac
-          if [ "$max_reviews" -gt 0 ]; then
+          if [ "$max_reviews" -gt 0 ] || [ "$max_errored" -gt 0 ]; then
             names=""
             for attempt in 1 2 3; do
               if names="$(gh api --paginate "repos/${{ github.repository }}/issues/$pr_number/timeline?per_page=100" \
-                           --jq '.[] | select(.event=="labeled" and .actor.login=="github-actions[bot]" and ((.label.name // "") | test("^((devteam:review-|review-count:|review-refund:)[0-9]+|review-ok)$"))) | .label.name')"; then
+                           --jq '.[] | select(.event=="labeled" and .actor.login=="github-actions[bot]" and ((.label.name // "") | test("^((devteam:review-|review-count:|review-refund:|review-error:)[0-9]+|review-ok)$"))) | .label.name')"; then
                 break
               fi
               names="__FAILED__"
@@ -732,7 +735,7 @@ jobs:
               [ "$used" -lt 0 ] && used=0
               while IFS= read -r n; do
                 case "$n" in
-                  review-refund:*) streak=$(( streak + 1 )) ;;
+                  review-error:*) streak=$(( streak + 1 )) ;;
                   review-ok) streak=0 ;;
                 esac
               done <<< "$names"
@@ -745,7 +748,7 @@ jobs:
               cap_kind=errors
               used="$streak"
               max_reviews="$max_errored"
-            elif [ "$used" -ge "$max_reviews" ]; then
+            elif [ "$max_reviews" -gt 0 ] && [ "$used" -ge "$max_reviews" ]; then
               echo "review ceiling reached: $used of $max_reviews reviews already dispatched on PR #$pr_number — refusing."
               cap_kind=budget
             fi
@@ -770,7 +773,7 @@ jobs:
                 echo "max_reviews=$max_reviews"
               } >> "$GITHUB_OUTPUT"
               exit 0
-            elif [ -n "$used" ]; then
+            elif [ -n "$used" ] && [ "$max_reviews" -gt 0 ]; then
               if [ "${HAS_KEY:-true}" != "true" ]; then
                 # The reviewer job fails loudly on the missing key before any
                 # request is sent: nothing is spent, so nothing is charged.
@@ -1506,11 +1509,34 @@ jobs:
             exit 0
           fi
           echo "errored=true" >> "$GITHUB_OUTPUT"
+          # One error event per workflow RUN, charged or not: it is what the gate's
+          # consecutive-error bound counts, so it works with max_reviews=0 and for a
+          # dispatch that never charged (missing key). It also makes the refund
+          # idempotent: "Re-run failed jobs" reuses the gate's `charged`/`slot`
+          # outputs, so a second failure of the same run must not refund again.
+          err_label="review-error:${{ github.run_id }}"
+          read_ok=true
+          seen=""
+          if ! seen="$(gh api --paginate "repos/${{ github.repository }}/issues/$PR_NUMBER/timeline?per_page=100" \
+                        --jq '.[] | select(.event=="labeled" and .actor.login=="github-actions[bot]") | .label.name')"; then
+            read_ok=false
+            echo "::warning::could not read the PR timeline; recording the error but not refunding"
+          fi
+          if [ "$read_ok" = true ] && printf '%s\n' "$seen" | grep -qxF "$err_label"; then
+            echo "this run's error is already recorded — not recording or refunding again"
+            exit 0
+          fi
+          # DELETE first: re-adding a present label emits no `labeled` event.
+          gh api -X DELETE "$label_api/review-error%3A${{ github.run_id }}" --silent 2>/dev/null || true
+          gh api -X POST "$label_api" -f "labels[]=$err_label" --silent \
+            || echo "::warning::could not stamp $err_label; the error streak was not advanced"
+          if [ "$read_ok" != true ]; then
+            exit 0
+          fi
           if [ "$CHARGED" != "true" ] || [ -z "${SLOT:-}" ]; then
             echo "no budget unit was charged for this attempt — nothing to refund"
             exit 0
           fi
-          # DELETE first, same reason as the charge: re-adding a present label emits no event.
           gh api -X DELETE "$label_api/review-refund%3A$SLOT" --silent 2>/dev/null || true
           if gh api -X POST "$label_api" -f "labels[]=review-refund:$SLOT" --silent; then
             echo "review produced no verdict — refunded budget unit $SLOT (review-refund:$SLOT)"
@@ -1586,7 +1612,7 @@ jobs:
                   body = (f"{marker}\n**The automatic review of `{SHA[:7]}` errored and produced no verdict.** "
                           f"It does not count toward the review budget. [Run log]({RUN_URL})\n\n"
                           f"```\n{text.replace('```', '~~~')[:1200]}\n```\n"
-                          "The opener coder has been woken. A push or `/aw-review` triggers a new attempt; "
+                          "A push or `/aw-review` triggers a new attempt; "
                           "repeated errors stop automatic review and ask a human.")
                   c = gh("api", "-X", "POST", f"repos/{REPO}/issues/{PR}/comments", "-f", f"body={body}", "--silent")
                   if c is None or c.returncode != 0:

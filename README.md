@@ -612,13 +612,15 @@ review. Drafts get no clearance; forks and untrusted authors never reach it. A
 manual `/aw-review` or `/aw-improve` after review 1 is advisory only. The
 per-PR review ceiling (`max_reviews`, `review-count:N`) only counts reviews
 that returned a verdict: an attempt that errored (reviewer `aw_status=error`,
-invalid verdict, dispatch failure) is refunded with a `review-refund:N` label
-(budget used = charged - refunded), a completed review adds `review-ok`, and
-`max_errored_reviews` (default 3) bounds consecutive errored attempts so a
-broken reviewer cannot loop. An errored review comments once per head on the
+invalid verdict, dispatch failure) records a `review-error:<run id>` label
+(once per run, so a failed-job rerun cannot double count) and, if a unit was
+charged, is refunded with a `review-refund:N` label (budget used = charged -
+refunded). A completed review adds `review-ok`, and `max_errored_reviews`
+(default 3) bounds the error events since the last `review-ok`, independently
+of `max_reviews`, so a broken reviewer cannot loop. An errored review comments once per head on the
 PR and wakes the opener coder (`review_error` trigger on the platform's
 `devteam-pr-nudge` door, once per head). Two triggers for the same head
-dedupe: the gate serialises per PR+head and a fresh in-flight
+dedupe: the gate serialises per PR and a fresh in-flight
 `devteam/code-review` pending status refuses the second one.
 
 Labels: the gate writes only `devteam:reviewed` and `review-count:N`. It never

@@ -2964,7 +2964,7 @@ def ceil_gh(tmp_path_factory) -> Path:
         'if [[ "$*" == *"/statuses"* ]]; then echo "[]"; exit 0; fi\n'
         'if [[ "$*" == *"-X POST"* ]]; then\n'
         '  if [ "${LABEL_POST_FAIL:-0}" = "1" ]; then exit 1; fi\n'
-        '  if [[ ( "$*" == *"labels[]=devteam:review-"* || "$*" == *"labels[]=review-count:"* || "$*" == *"labels[]=review-refund:"* || "$*" == *"labels[]=review-ok"* ) && "$*" != *"review-capped"* && "$*" != *"review-exhausted"* ]]; then echo "$*" | sed \'s/.*labels\\[\\]=//\' | awk \'{print $1}\' >> "$TIMELINE_FILE"; fi\n'
+        '  if [[ ( "$*" == *"labels[]=devteam:review-"* || "$*" == *"labels[]=review-count:"* || "$*" == *"labels[]=review-refund:"* || "$*" == *"labels[]=review-error:"* || "$*" == *"labels[]=review-ok"* ) && "$*" != *"review-capped"* && "$*" != *"review-exhausted"* ]]; then echo "$*" | sed \'s/.*labels\\[\\]=//\' | awk \'{print $1}\' >> "$TIMELINE_FILE"; fi\n'
         "fi\n"
         "exit 0\n"
     )
@@ -3447,7 +3447,7 @@ def test_legacy_review_n_events_carry_forward_without_double_charge(gate_tail_sc
 
 def test_ceiling_jq_counts_both_label_families():
     src = (Path(__file__).resolve().parent.parent / ".github/workflows/code-review-reusable.yml").read_text()
-    assert 'test("^((devteam:review-|review-count:|review-refund:)[0-9]+|review-ok)$")' in src
+    assert 'test("^((devteam:review-|review-count:|review-refund:|review-error:)[0-9]+|review-ok)$")' in src
 
 # --------------------------------------------------------------------------
 # QA rework (card 41e5bf3b): escalation delivery is tracked apart from the
@@ -4365,7 +4365,8 @@ def test_a_failed_checks_lookup_is_reported_not_read_as_nothing_failing(
 
 def test_refunded_attempts_do_not_count_toward_the_ceiling(gate_tail_script, ceil_gh, tmp_path):
     # 3 charged, 2 refunded -> 1 used (error streak 2 < 3): allowed, next slot is 2
-    tl = ["review-count:1", "review-refund:1", "review-count:2", "review-refund:2", "review-count:3"]
+    tl = ["review-count:1", "review-error:1", "review-refund:1", "review-count:2",
+          "review-error:2", "review-refund:2", "review-count:3"]
     proc, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl)
     assert out.get("allowed") == "true" and "capped" not in out, proc.stdout + proc.stderr
     assert out["charged"] == "true" and out["slot"] == "2"
@@ -4376,8 +4377,9 @@ def test_pr185_three_errored_reviews_with_zero_verdicts_is_not_the_budget_ceilin
         gate_tail_script, ceil_gh, tmp_path):
     # The incident: 3 dispatches, all errored. Budget used is 0, so it is NOT
     # a budget refusal; the separate errored-streak bound is what speaks.
-    tl = ["review-count:1", "review-refund:1", "review-count:1", "review-refund:1",
-          "review-count:1", "review-refund:1"]
+    tl = ["review-count:1", "review-error:11", "review-refund:1", "review-count:1",
+          "review-error:12", "review-refund:1", "review-count:1", "review-error:13",
+          "review-refund:1"]
     _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl)
     assert out["capped"] == "true" and out["cap_kind"] == "errors"
     assert out["review_count"] == "3" and out["max_reviews"] == "3"
@@ -4388,8 +4390,9 @@ def test_pr185_three_errored_reviews_with_zero_verdicts_is_not_the_budget_ceilin
 
 
 def test_a_completed_review_resets_the_error_streak(gate_tail_script, ceil_gh, tmp_path):
-    tl = ["review-count:1", "review-refund:1", "review-count:1", "review-refund:1",
-          "review-count:1", "review-ok", "review-count:2", "review-refund:2"]
+    tl = ["review-count:1", "review-error:11", "review-refund:1", "review-count:1",
+          "review-error:12", "review-refund:1", "review-count:1", "review-ok",
+          "review-count:2", "review-error:13", "review-refund:2"]
     proc, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl)
     assert out["allowed"] == "true" and "capped" not in out, proc.stdout + proc.stderr
 
@@ -4431,11 +4434,27 @@ def test_the_gate_claims_the_head_with_a_pending_status_when_it_admits_a_review(
     assert any("state=pending" in c and "context=devteam/code-review" in c for c in calls), calls
 
 
-def test_the_gate_serialises_per_pr_and_head():
+def test_the_error_streak_is_bounded_even_with_the_paid_ceiling_off_and_without_refunds(
+        gate_tail_script, ceil_gh, tmp_path):
+    # review finding: max_reviews=0 skipped the streak check, and an uncharged
+    # error (missing key) left no event. Error events alone must stop dispatch.
+    tl = ["review-error:11", "review-error:12", "review-error:13"]
+    _, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl, max_reviews="0")
+    assert out["allowed"] == "false" and out["cap_kind"] == "errors", out
+    (tmp_path / "timeline").unlink()
+    _, out, calls = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl[:2], max_reviews="0")
+    assert out["allowed"] == "true" and "charged" not in out
+    assert not any("labels[]=review-count" in c for c in calls)
+
+
+def test_the_gate_serialises_per_pr_for_pr_and_comment_events():
     text = WORKFLOW.read_text()
     gate = text[text.index("\n  gate:\n"):text.index("\n    steps:\n", text.index("\n  gate:\n"))]
-    assert "concurrency:" in gate and "cancel-in-progress: false" in gate
-    assert "pull_request.head.sha" in gate
+    group = [l for l in gate.splitlines() if l.strip().startswith("group:")][0]
+    # a comment event has no head sha: the key must not depend on it, or an
+    # opened event and an /aw-review comment for one head get different locks
+    assert "head.sha" not in group and "'comment'" not in group
+    assert "issue.number" in group and "pull_request.number" in group
 
 
 # ---- the refund + wake steps of the review job ----
@@ -4444,13 +4463,16 @@ _REFUND_STEP = "- name: Refund the review budget on an errored review, or reset 
 _ERR_STEP = "- name: Tell the PR and wake the opener coder on an errored review"
 
 
-def _run_refund(tmp_path, *, outcome, charged="true", slot="2", gh_fail=False):
+def _run_refund(tmp_path, *, outcome, charged="true", slot="2", gh_fail=False,
+                timeline="", timeline_fail=False):
     d = tmp_path / "refund"
     d.mkdir(exist_ok=True)
     (d / "calls.log").write_text("")
     gh = d / "gh"
     gh.write_text("#!/bin/bash\n"
                   'printf "%s\\n" "$*" >> "' + str(d / "calls.log") + '"\n'
+                  + ('if [[ "$*" == *"/timeline"* ]]; then ' + ("exit 1" if timeline_fail else
+                     "printf '%s\\n' '" + timeline + "'; exit 0") + "; fi\n")
                   + ('if [[ "$*" == *"-X POST"* ]]; then exit 1; fi\n' if gh_fail else "")
                   + "exit 0\n")
     gh.chmod(0o755)
@@ -4490,6 +4512,26 @@ def test_a_real_verdict_is_not_refunded_and_resets_the_streak(tmp_path):
 def test_an_uncharged_attempt_has_nothing_to_refund_but_still_counts_as_errored(tmp_path):
     _, out, calls = _run_refund(tmp_path, outcome="failure", charged="")
     assert "errored=true" in out and not any("review-refund" in c for c in calls)
+    # ...and still advances the gate's error streak (missing key, max_reviews=0)
+    assert any("labels[]=review-error:" in c for c in calls), calls
+
+
+def test_a_rerun_of_the_same_failed_run_does_not_refund_twice(tmp_path):
+    # "Re-run failed jobs" reuses the gate's charged/slot outputs; the run's
+    # first failure already recorded review-error:<run id> (+ the refund).
+    proc, out, calls = _run_refund(tmp_path, outcome="failure",
+                                   timeline="review-count:2\nreview-error:x\nreview-refund:2")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "errored=true" in out  # the wake path still has its own once-per-head guard
+    assert not any("-X POST" in c for c in calls), calls
+    assert "already recorded" in proc.stdout
+
+
+def test_an_unreadable_timeline_records_the_error_but_never_refunds(tmp_path):
+    proc, _, calls = _run_refund(tmp_path, outcome="failure", timeline_fail=True)
+    assert proc.returncode == 0
+    assert any("labels[]=review-error:" in c for c in calls)
+    assert not any("review-refund" in c for c in calls), calls
 
 
 def test_a_failed_refund_write_never_fails_the_job(tmp_path):
