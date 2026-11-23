@@ -4048,3 +4048,14 @@ def test_code_review_runs_after_provenance_gate_without_being_blocked_by_it():
 def test_findings_event_retries_an_absent_aw_run_label_bounded():
     text = WORKFLOW.read_text()
     assert "for _attempt in range(4):" in text and "time.sleep(10)" in text
+
+
+def test_label_step_runs_after_a_failed_footer_step():
+    import yaml
+    steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["provenance-gate"]["steps"]
+    step = next(s for s in steps if s.get("name") == "Apply provenance labels")
+    assert "!cancelled()" in step["if"] and "run_id != ''" in step["if"]
+
+
+def test_only_findings_events_retry_the_label_read():
+    assert 'if event != "findings" or any(x.startswith("aw-run:")' in WORKFLOW.read_text()

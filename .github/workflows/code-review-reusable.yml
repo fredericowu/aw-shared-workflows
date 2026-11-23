@@ -1485,7 +1485,8 @@ jobs:
           import time
           for _attempt in range(4):
               _labels = _pr_labels()
-              if any(x.startswith("aw-run:") for x in _labels):
+              # Only `findings` resolves a coder link; `cleared` is stored as-is.
+              if event != "findings" or any(x.startswith("aw-run:") for x in _labels):
                   break
               if _attempt < 3:
                   print(f"aw-run label absent (read {_attempt + 1}/4); retrying in 10s")
@@ -1769,7 +1770,9 @@ jobs:
       # a failure mode even that can't anticipate (e.g. python3 itself
       # missing on the runner image).
       - name: Apply provenance labels
-        if: steps.provenance.outputs.run_id != ''
+        # `!cancelled()`: a failed footer PATCH above must not skip the labels
+        # the review's findings event depends on.
+        if: ${{ !cancelled() && steps.provenance.outputs.run_id != '' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
