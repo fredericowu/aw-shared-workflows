@@ -2885,6 +2885,7 @@ def _gate(script, cap_gh, tmp_path, *, round_, action="synchronize", mode="revie
         "LABEL_POST_FAIL": "1" if label_post_fail else "0",
         "GH_LOG": str(tmp_path / "calls.log"), "OUTF": str(out), "GH_TOKEN": "x",
         "GITHUB_STEP_SUMMARY": "/dev/null",
+        "GITHUB_RUN_ID": "102", "GITHUB_RUN_ATTEMPT": "2",
     }
     proc = subprocess.run(["bash", "-c", f"round={round_}; mode={mode}; source {script}"],
                           capture_output=True, text=True, env=env)
@@ -2991,6 +2992,7 @@ def _ceil(script, ceil_gh, tmp_path, *, used=0, max_reviews="3", labels="", acti
         "LABEL_POST_FAIL": "1" if label_post_fail else "0",
         "GH_LOG": str(tmp_path / "calls.log"), "OUTF": str(out), "GH_TOKEN": "x",
         "GITHUB_STEP_SUMMARY": "/dev/null",
+        "GITHUB_RUN_ID": "102", "GITHUB_RUN_ATTEMPT": "2",
     }
     proc = subprocess.run(["bash", "-c", f"round={round_}; mode={mode}; source {script}"],
                           capture_output=True, text=True, env=env)
@@ -3447,7 +3449,7 @@ def test_legacy_review_n_events_carry_forward_without_double_charge(gate_tail_sc
 
 def test_ceiling_jq_counts_both_label_families():
     src = (Path(__file__).resolve().parent.parent / ".github/workflows/code-review-reusable.yml").read_text()
-    assert 'test("^((devteam:review-|review-count:|review-error:)[0-9]+|review-refund:[0-9]+(:[0-9]+)?|review-ok)$")' in src
+    assert 'test("^((devteam:review-|review-count:|review-error:)[0-9]+|review-refund:[0-9]+(:[0-9]+(-[0-9]+)?)?|review-ok)$")' in src
 
 # --------------------------------------------------------------------------
 # QA rework (card 41e5bf3b): escalation delivery is tracked apart from the
@@ -4373,6 +4375,30 @@ def test_refunded_attempts_do_not_count_toward_the_ceiling(gate_tail_script, cei
     assert any("labels[]=review-count:2" in c for c in calls), calls
 
 
+def test_run_scoped_refunds_count_and_each_charge_gets_a_unique_id(gate_tail_script, ceil_gh, tmp_path):
+    # three charges, one numeric run-scoped refund -> 2 used: slot 3 is allowed
+    tl = ["review-count:1", "review-count:2", "review-error:101", "review-refund:2:101-1",
+          "review-count:3"]
+    proc, out, _ = _ceil(gate_tail_script, ceil_gh, tmp_path, timeline=tl)
+    assert out.get("allowed") == "true" and "capped" not in out, proc.stdout + proc.stderr
+    assert out["slot"] == "3"
+    # the gate names this charge (run id + attempt) so a full rerun is distinct
+    assert out["charge"] == "102-2"
+
+
+def test_a_full_rerun_that_errors_again_refunds_its_own_new_charge(tmp_path):
+    # attempt 1 charged+refunded slot 1; a full rerun (same run id, attempt 2)
+    # re-charged slot 1 and errored: its refund must not be mistaken for attempt 1's.
+    tl = "review-count:1\nreview-error:x\nreview-refund:1:x-1\nreview-count:1"
+    proc, _, calls = _run_refund(tmp_path, outcome="failure", slot="1", charge="x-2", timeline=tl)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert any("labels[]=review-refund:1:x-2" in c for c in calls), calls
+    # a failed-jobs rerun reuses the gate output (same charge id): no double refund
+    _, _, calls = _run_refund(tmp_path, outcome="failure", slot="1", charge="x-2",
+                              timeline=tl + "\nreview-refund:1:x-2")
+    assert not any("-X POST" in c for c in calls), calls
+
+
 def test_pr185_three_errored_reviews_with_zero_verdicts_is_not_the_budget_ceiling(
         gate_tail_script, ceil_gh, tmp_path):
     # The incident: 3 dispatches, all errored. Budget used is 0, so it is NOT
@@ -4463,7 +4489,7 @@ _REFUND_STEP = "- name: Refund the review budget on an errored review, or reset 
 _ERR_STEP = "- name: Tell the PR and wake the opener coder on an errored review"
 
 
-def _run_refund(tmp_path, *, outcome, charged="true", slot="2", gh_fail=False,
+def _run_refund(tmp_path, *, outcome, charged="true", slot="2", charge="x", gh_fail=False,
                 timeline="", timeline_fail=False):
     d = tmp_path / "refund"
     d.mkdir(exist_ok=True)
@@ -4481,7 +4507,7 @@ def _run_refund(tmp_path, *, outcome, charged="true", slot="2", gh_fail=False,
     script = d / "refund.sh"
     script.write_text(_extract_run(_REFUND_STEP.replace("- name: ", "")))
     env = {**os.environ, "PATH": f"{d}{os.pathsep}{os.environ['PATH']}", "GH_TOKEN": "t",
-           "FINDINGS_OUTCOME": outcome, "CHARGED": charged, "SLOT": slot, "PR_NUMBER": "7",
+           "FINDINGS_OUTCOME": outcome, "CHARGED": charged, "SLOT": slot, "CHARGE": charge, "PR_NUMBER": "7",
            "GITHUB_OUTPUT": str(out)}
     proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
     return proc, out.read_text(), (d / "calls.log").read_text().splitlines()
