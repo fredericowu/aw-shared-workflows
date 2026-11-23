@@ -4059,3 +4059,126 @@ def test_label_step_runs_after_a_failed_footer_step():
 
 def test_only_findings_events_retry_the_label_read():
     assert 'if event != "findings" or any(x.startswith("aw-run:")' in WORKFLOW.read_text()
+
+
+# --------------------------------------------------------------------------
+# Parent run provenance + merged-event retry on an unresolved link
+# --------------------------------------------------------------------------
+
+PARENT_DASHED = "e001220b-8867-44f4-a276-9e3c0c7ac96f"
+
+
+def test_parent_comes_from_the_commit_that_supplied_the_run_id(
+    provenance_script, provenance_gh, tmp_path
+):
+    """A newer root-run commit (no parent trailer) must not inherit an older child's parent."""
+    proc, outputs, _ = _run_provenance(
+        provenance_script, provenance_gh, tmp_path,
+        commits=[
+            _commit(f"AW-Run-Id: {'a' * 32}\nAW-Parent-Run-Id: {PARENT_DASHED}\n", sha="aaaaaaa"),
+            _commit(f"AW-Run-Id: {REAL_RUN_ID}\n", sha="bbbbbbb"),
+        ],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert outputs["run_id"] == REAL_RUN_ID
+    assert outputs["parent_run_id"] == ""
+
+
+def test_parent_run_trailer_dashed_uuid_is_normalised_newest_wins(
+    provenance_script, provenance_gh, tmp_path
+):
+    proc, outputs, _ = _run_provenance(
+        provenance_script, provenance_gh, tmp_path,
+        commits=[
+            _commit(f"AW-Run-Id: {REAL_RUN_ID}\nAW-Parent-Run-Id: {'a' * 32}\n", sha="aaaaaaa"),
+            _commit(f"AW-Run-Id: {REAL_RUN_ID}\nAW-Parent-Run-Id: {PARENT_DASHED}\n", sha="bbbbbbb"),
+        ],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert outputs["parent_run_id"] == PARENT_DASHED.replace("-", "")
+
+
+def test_absent_parent_run_trailer_is_empty(provenance_script, provenance_gh, tmp_path):
+    proc, outputs, _ = _run_provenance(
+        provenance_script, provenance_gh, tmp_path,
+        commits=[_commit(f"AW-Run-Id: {REAL_RUN_ID}\n")],
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert outputs["parent_run_id"] == ""
+
+
+def test_parent_run_renders_inside_the_managed_footer(footer_script, footer_gh, tmp_path):
+    import os as _os
+    _os.environ["PARENT_RUN_ID"] = "c" * 32
+    try:
+        proc, state = _run_footer(footer_script, footer_gh, tmp_path, run_id="r" * 32,
+                                  agent_slug="coder")
+    finally:
+        del _os.environ["PARENT_RUN_ID"]
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    body = state["pr_body"]
+    start = body.index("<!-- devteam:provenance:start -->")
+    end = body.index("<!-- devteam:provenance:end -->")
+    assert f"**Parent run:** `{'c' * 32}`" in body[start:end]
+    assert "**Agent:** `coder`" in body[start:end]
+
+
+def _run_merged_step(tmp_path, responses):
+    """Run the merged-event heredoc with `gh` (label reads) and `curl`
+    stubbed. `responses` is the list of bodies curl returns in order."""
+    src = _extract_heredoc("- name: Report the merge to the platform")
+    script = tmp_path / "merged.py"
+    script.write_text(src.replace("time.sleep(5)", "pass"))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    state = tmp_path / "n"
+    state.write_text("0")
+    (tmp_path / "responses.json").write_text(json.dumps(responses))
+    (bin_dir / "gh").write_text(
+        "#!/bin/sh\necho 'aw-run:" + "d" * 32 + "'\n")
+    (bin_dir / "curl").write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,sys\n"
+        f"p='{state}'; n=int(open(p).read()); open(p,'w').write(str(n+1))\n"
+        f"r=json.load(open('{tmp_path}/responses.json'))[min(n,len(json.load(open('{tmp_path}/responses.json')))-1)]\n"
+        "a=sys.argv; open(a[a.index('-o')+1],'w').write(json.dumps(r)); print('200', end='')\n")
+    for f in ("gh", "curl"):
+        (bin_dir / f).chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "RUNNER_TEMP": str(tmp_path), "EVENT_URL": "https://ap.invalid",
+        "AW_DEVTEAM_EVENT_SECRET": "s", "REPO": "o/r", "PR_NUMBER": "42",
+        "PR_URL": "https://x/42", "MERGE_SHA": "a" * 40, "PR_HEAD_SHA": "b" * 40,
+        "PR_BODY": "", "ROUND": "1",
+    }
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env)
+    return proc, int(state.read_text())
+
+
+_UNRESOLVED = {"acted": False, "link_resolution": {"status": "unresolved"}}
+
+
+def test_merged_event_retries_twice_on_unresolved_link(tmp_path):
+    proc, posts = _run_merged_step(tmp_path, [_UNRESOLVED, _UNRESOLVED, {"acted": True}])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert posts == 3
+
+
+def test_merged_event_retries_on_the_handlers_real_unresolved_response(tmp_path):
+    real = {"acted": False, "reason": "no PR->coder link for this URL"}
+    proc, posts = _run_merged_step(tmp_path, [real, {"acted": True}])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert posts == 2
+
+
+def test_merged_event_does_not_retry_when_acted(tmp_path):
+    proc, posts = _run_merged_step(tmp_path, [{"acted": True}])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert posts == 1
+
+
+def test_merged_event_retry_is_bounded(tmp_path):
+    proc, posts = _run_merged_step(tmp_path, [_UNRESOLVED])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert posts == 3
